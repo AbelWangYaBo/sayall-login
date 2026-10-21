@@ -56,7 +56,6 @@ struct AccountLoginView: View {
                 TextField("3-32 位字母、数字或下划线", text: $username)
                     .textFieldStyle(.roundedBorder)
                     .disableAutocorrection(true)
-                    .textInputAutocapitalization(.never)
 
                 fieldLabel("密码 / Password")
                 SecureField(mode == .signUp ? "至少 8 位，含字母和数字" : "请输入密码", text: $password)
