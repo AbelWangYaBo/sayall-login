@@ -557,6 +557,17 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
         menu.addItem(menuItem("about.support.github", action: #selector(openGitHub)))
         menu.addItem(menuItem("about.support.website", action: #selector(openWebsite)))
         menu.addItem(.separator())
+        let accountItem = NSMenuItem(
+            title: accountAuthStore.isSignedIn
+                ? "账号 / Account: \(accountAuthStore.currentUsername ?? "-")"
+                : "未登录 / Not signed in",
+            action: nil,
+            keyEquivalent: ""
+        )
+        accountItem.isEnabled = false
+        menu.addItem(accountItem)
+        menu.addItem(menuItemDirect("退出登录 / Sign Out", action: #selector(signOutFromMenu)))
+        menu.addItem(.separator())
         menu.addItem(menuItem("common.action.quit", action: #selector(quit)))
         statusMenu = menu
         refreshMenuStatus()
@@ -678,6 +689,13 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
 
     private func menuItem(_ title: String, action: Selector) -> NSMenuItem {
         let item = NSMenuItem(title: localization.text(title), action: action, keyEquivalent: "")
+        item.target = self
+        return item
+    }
+
+    /// 不经过本地化表的菜单项（登录功能专属，双语硬编码）。
+    private func menuItemDirect(_ title: String, action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = self
         return item
     }
@@ -1376,5 +1394,21 @@ private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMen
 
     @objc private func quit() {
         NSApp.terminate(nil)
+    }
+
+    /// 退出登录：清理会话与运行时，重新进入登录门禁（换账号登录即完成切换）。
+    @objc private func signOutFromMenu() {
+        accountAuthStore.signOut()
+        AppLogger.shared.write("AUTH sign_out result=success")
+        model.privateFeature.hideHUDImmediately()
+        model.stop()
+        if let settingsWindowController {
+            settingsWindowController.close()
+        }
+        isSettingsWindowOpen = false
+        rebuildStatusMenu()
+        showLoginWindow { [weak self] in
+            self?.finishLaunchAfterAuth(completedUpdate: false)
+        }
     }
 }
