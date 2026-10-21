@@ -95,11 +95,11 @@
 	<key>SUAutomaticallyUpdate</key>
 	<false/>
 	<key>SUEnableAutomaticChecks</key>
-	<false/>
+	<true/>
 	<key>SUFeedURL</key>
 	<string>https://github.com/AbelWangYaBo/sayall-login/releases/latest/download/appcast.xml</string>
 	<key>SUPublicEDKey</key>
-	<string>8dWQovCnGPucjMcQuCHfrAv4PtjuDjJSbHNmItqYiyc=</string>
+	<string>HakGwylLbLKucO+v1nkUbRG8LajQha1VqCAqoNqgkUo=</string>
 	<key>SUScheduledCheckInterval</key>
 	<integer>86400</integer>
 </dict>
