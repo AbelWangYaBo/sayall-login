@@ -1,0 +1,299 @@
+import Foundation
+import Testing
+@testable import RemoteMic
+
+@Suite("Application localization")
+struct LocalizationTests {
+    @Test func onboardingCopyExplainsMembershipTrialAndActualMicrophoneNames() throws {
+        let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        for language in ["zh-Hans", "en"] {
+            let url = root.appendingPathComponent("Resources/\(language).lproj/Localizable.strings")
+            let copy = try #require(PropertyListSerialization.propertyList(
+                from: Data(contentsOf: url), format: nil
+            ) as? [String: String])
+            #expect(copy["onboarding.control_source.siri_remote.detail"]?.contains(language == "en" ? "membership" : "会员") == true)
+            #expect(copy["onboarding.complete.siri_membership"]?.isEmpty == false)
+            for key in ["onboarding.voice_tool.guide.screenshot.doubao_settings", "onboarding.voice_tool.guide.screenshot.vokie_step_2"] {
+                #expect(copy[key]?.contains("SayAll") == true)
+                #expect(copy[key]?.contains("MiRemoteV 2ch") == true)
+            }
+        }
+    }
+
+    @Test func screenshotResourceFallbackLoadsRepositoryLocalizations() throws {
+        let suiteName = "RemoteMicTests.Localization.ScreenshotFallback.(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettings(defaults: defaults)
+        settings.applicationLanguage = .simplifiedChinese
+        let localization = LocalizationStore(
+            settings: settings,
+            resourceBundle: RemoteMicResourceBundle.mainOrDevelopment
+        )
+
+        #expect(
+            localization.text("onboarding.control_source.detail") ==
+                "优先选择实体遥控器；只有当前安装包实际支持的设备和备用方式会显示。"
+        )
+    }
+
+    @Test func languageSelectionPersistsAndUpdatesTheLocaleImmediately() throws {
+        let suiteName = "RemoteMicTests.Localization.(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let settings = AppSettings(defaults: defaults)
+        let localization = LocalizationStore(settings: settings)
+
+        localization.select(.english)
+        #expect(localization.language == .english)
+        #expect(localization.locale.identifier == "en")
+        #expect(localization.localizedWebsiteURL.absoluteString == "https://sayall.app/en/")
+        #expect(AppSettings(defaults: defaults).applicationLanguage == .english)
+
+        localization.select(.simplifiedChinese)
+        #expect(localization.language == .simplifiedChinese)
+        #expect(localization.locale.identifier == "zh-Hans")
+        #expect(localization.localizedWebsiteURL.absoluteString == "https://sayall.app/")
+        #expect(AppSettings(defaults: defaults).applicationLanguage == .simplifiedChinese)
+    }
+
+    @Test func appStoreLinksFollowTheSelectedLanguage() {
+        #expect(AppLinks.iOSAppStore(for: Locale(identifier: "zh-Hans")).absoluteString ==
+            "https://apps.apple.com/app/%E6%97%A0%E7%BA%BF%E9%BA%A6/id6797208067")
+        #expect(AppLinks.iOSAppStore(for: Locale(identifier: "zh-Hant")).absoluteString ==
+            AppLinks.chineseIOSAppStore.absoluteString)
+        #expect(AppLinks.iOSAppStore(for: Locale(identifier: "en")).absoluteString ==
+            "https://apps.apple.com/app/sayall/id6797208067")
+    }
+
+    @Test func readmesUseVersionIndependentMacDownloadEntries() throws {
+        let stableURL = "https://download.sayall.app/mac"
+        let previewURL = "https://github.com/HD838A/remote-mic-app/releases"
+        let expectations = [
+            ("README.md", "## 下载与安装", "- 最新正式版（Apple Silicon）：", "- 最新预览版（Apple Silicon / Intel）："),
+            ("README.en.md", "## Download and install", "- Latest stable release (Apple Silicon):", "- Latest pre-release (Apple Silicon / Intel):"),
+        ]
+
+        for (readmeName, sectionHeading, stablePrefix, previewPrefix) in expectations {
+            let readme = try String(
+                contentsOf: repositoryRoot.appendingPathComponent(readmeName),
+                encoding: .utf8
+            )
+            let sectionStart = try #require(readme.range(of: sectionHeading))
+            let remainingReadme = readme[sectionStart.upperBound...]
+            let sectionEnd = remainingReadme.range(of: "\n## ")?.lowerBound ?? readme.endIndex
+            let downloadSection = readme[sectionStart.lowerBound..<sectionEnd]
+            let stableEntry = try #require(
+                downloadSection.split(separator: "\n").first { $0.hasPrefix(stablePrefix) }
+            )
+            let previewEntry = try #require(
+                downloadSection.split(separator: "\n").first { $0.hasPrefix(previewPrefix) }
+            )
+
+            #expect(stableEntry.contains("](\(stableURL))"))
+            #expect(!stableEntry.contains("/releases/"))
+            #expect(previewEntry.contains("](\(previewURL))"))
+            #expect(!previewEntry.contains("/releases/tag/"))
+        }
+    }
+
+    @Test func localizationFilesUseSemanticCompleteKeysAndMatchingFormats() throws {
+        let localizationDirectories = try sourceLocalizationDirectories()
+        let englishDirectory = try #require(
+            localizationDirectories.first { $0.lastPathComponent == "en.lproj" }
+        )
+        let simplifiedChineseDirectory = try #require(
+            localizationDirectories.first { $0.lastPathComponent == "zh-Hans.lproj" }
+        )
+        let english = try strings(at: englishDirectory.appendingPathComponent("Localizable.strings"))
+        let chinese = try strings(
+            at: simplifiedChineseDirectory.appendingPathComponent("Localizable.strings")
+        )
+        let englishInfo = try strings(at: englishDirectory.appendingPathComponent("InfoPlist.strings"))
+
+        #expect(english["action.command_delete"] == "Command-Delete")
+        #expect(english["button_mapping.action_filter.all"] == "All")
+        #expect(english["shortcut.editor.instructions"]?.contains("single key") == true)
+        #expect(english["shortcut.editor.instructions"]?.contains("recorded alone") == true)
+        #expect(english["action.scroll_up"] == "Scroll Up")
+        #expect(english["action.scroll_down"] == "Scroll Down")
+        #expect(english["keyboard.key.delete"] == "Delete")
+        #expect(english["keyboard.key.left"] == "Left")
+        #expect(english["keyboard.key.right"] == "Right")
+        #expect(english["keyboard.key.up"] == "Up")
+        #expect(english["keyboard.key.down"] == "Down")
+        #expect(english["about.support.feedback"] == "Feedback")
+        #expect(english["onboarding.remote.first_pairing.wake"] == "Hold TV for about 2 seconds until the white light at the bottom starts flashing.")
+        #expect(english["onboarding.remote.first_pairing.pair"] == "Then hold Home + Menu together to enter Bluetooth pairing mode.")
+        #expect(english["onboarding.remote.button_waiting_detail"] == "Press the center OK button or an arrow button. Do not press the microphone/voice button.")
+        #expect(english["onboarding.remote.voice_button_mistake.title"] == "That was the voice button")
+        #expect(english["onboarding.remote.voice_button_mistake.detail"] == "This step checks button controls. Press the center OK button or an arrow button instead.")
+        #expect(english["onboarding.voice_tool.doubao.title"] == "Doubao")
+        #expect(english["onboarding.voice_tool.weixin.title"] == "WeType")
+        #expect(english["onboarding.voice_tool.other.title"] == "Other Voice App")
+        #expect(english["onboarding.controls.siri.detail"]?.contains("Apple Remote") == true)
+        #expect(english["onboarding.controls.siri.detail"]?.contains("Siri Remote") == false)
+        #expect(chinese["onboarding.controls.siri.detail"]?.contains("苹果遥控器") == true)
+        #expect(chinese["onboarding.controls.siri.detail"]?.contains("Siri Remote") == false)
+        #expect(english["onboarding.voice_tool.detail"]?.contains("voice typing") == true)
+        #expect(english.values.contains { $0.contains("WeChat Input Method") } == false)
+        #expect(english.values.contains { $0.contains("Doubao Input Method") } == false)
+        #expect(english.contains { entry in
+            entry.key.hasPrefix("onboarding.") &&
+                entry.value.localizedCaseInsensitiveContains("voice tool")
+        } == false)
+        #expect(english["onboarding.voice_tool.system_fn.conflict"] == "The macOS Fn action needs to be changed")
+        #expect(english["remote.device.model.apple_siri_remote_a2854"] == "Apple Remote (7th Generation)")
+        #expect(english["remote.device.model.apple_siri_remote_a2540"] == "Apple Remote (6th Generation)")
+        #expect(english["siri_remote.activation.open_membership"] == "Unlock membership feature")
+        #expect(english["remote.button.full.play_pause"] == "Play/Pause")
+        #expect(english["connection.web.title"] == "WeChat Mini Program SayAll")
+        #expect(
+            english["connection.web.help_short"]?.contains("WeChat") == true
+        )
+
+        #expect(!english.isEmpty)
+        for (key, value) in english {
+            #expect(key.range(of: #"^[a-z0-9]+(?:[._][a-z0-9]+)*$"#, options: .regularExpression) != nil)
+            #expect(!value.isEmpty)
+            #expect(value != key)
+        }
+
+        for directory in localizationDirectories {
+            let localized = try strings(at: directory.appendingPathComponent("Localizable.strings"))
+            let localizedInfo = try strings(at: directory.appendingPathComponent("InfoPlist.strings"))
+            if directory.lastPathComponent == "zh-Hans.lproj" {
+                #expect(localized["action.command_delete"] == "Command-Delete")
+                #expect(localized["button_mapping.action_filter.all"] == "全部")
+                #expect(localized["shortcut.editor.instructions"]?.contains("单个按键") == true)
+                #expect(localized["shortcut.editor.instructions"]?.contains("单独录入") == true)
+                #expect(localized["action.scroll_up"] == "向上滚动")
+                #expect(localized["action.scroll_down"] == "向下滚动")
+                #expect(localized["about.support.feedback"] == "问题反馈")
+                #expect(localized["onboarding.remote.first_pairing.wake"] == "长按 TV 键约 2 秒，直到遥控器底部白灯开始闪烁。")
+                #expect(localized["onboarding.remote.first_pairing.pair"] == "同时长按 Home（主页）+ Menu（菜单）键，进入蓝牙配对模式。")
+                #expect(localized["onboarding.remote.button_waiting_detail"] == "请短按圆盘中间的确定键或任意方向键，不要按麦克风/语音键。")
+                #expect(localized["onboarding.remote.voice_button_mistake.title"] == "刚才按的是语音键")
+                #expect(localized["onboarding.remote.voice_button_mistake.detail"] == "这一步检查普通控制键。请改为短按圆盘中间的确定键或任意方向键。")
+                #expect(localized["onboarding.voice_tool.weixin.title"] == "微信输入法")
+                #expect(localized["onboarding.voice_tool.system_fn.conflict"] == "系统仍在使用 Fn")
+                #expect(localized["remote.device.model.apple_siri_remote_a2854"] == "苹果遥控器第 7 代")
+                #expect(localized["remote.device.model.apple_siri_remote_a2540"] == "苹果遥控器第 6 代")
+                #expect(localized["siri_remote.activation.open_membership"] == "点击开通会员功能")
+                #expect(localized["connection.web.title"] == "无线麦 SayAll 微信小程序")
+                #expect(localized["connection.web.help_short"]?.contains("微信小程序") == false)
+            }
+            #expect(Set(localized.keys) == Set(english.keys))
+            #expect(Set(localizedInfo.keys) == Set(englishInfo.keys))
+
+            for key in english.keys {
+                let englishValue = try #require(english[key])
+                let localizedValue = try #require(localized[key])
+                #expect(!localizedValue.isEmpty)
+                #expect(localizedValue != key)
+                #expect(formatPlaceholders(in: localizedValue) == formatPlaceholders(in: englishValue))
+                #expect(!containsRestrictedUserTerm(localizedValue))
+            }
+        }
+    }
+
+    @Test func glossaryResourcesContainTheDocumentedTechnicalTerms() throws {
+        for localization in ["en", "zh-Hans"] {
+            let glossaryURL = repositoryRoot
+                .appendingPathComponent("Resources")
+                .appendingPathComponent("\(localization).lproj")
+                .appendingPathComponent("Glossary.md")
+            let glossary = try String(contentsOf: glossaryURL, encoding: .utf8)
+            for term in ["RC003", "ATVV", "HID", "UUID", "Core Audio", "DMG", "PKG"] {
+                #expect(glossary.contains(term))
+            }
+        }
+    }
+
+    @Test func localizedDocumentsFallBackToEnglish() throws {
+        let fileManager = FileManager.default
+        let temporaryRoot = fileManager.temporaryDirectory
+            .appendingPathComponent("RemoteMicLocalizationTests-\(UUID().uuidString)")
+        let bundleURL = temporaryRoot.appendingPathComponent("Localization.bundle")
+        let contentsURL = bundleURL.appendingPathComponent("Contents")
+        let resourcesURL = contentsURL.appendingPathComponent("Resources")
+        let englishURL = resourcesURL.appendingPathComponent("en.lproj")
+        let chineseURL = resourcesURL.appendingPathComponent("zh-Hans.lproj")
+        defer { try? fileManager.removeItem(at: temporaryRoot) }
+
+        try fileManager.createDirectory(at: englishURL, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: chineseURL, withIntermediateDirectories: true)
+        let info: [String: Any] = [
+            "CFBundleDevelopmentRegion": "en",
+            "CFBundleIdentifier": "com.hd838a.RemoteMic.LocalizationTests",
+            "CFBundlePackageType": "BNDL"
+        ]
+        let infoData = try PropertyListSerialization.data(
+            fromPropertyList: info,
+            format: .xml,
+            options: 0
+        )
+        try infoData.write(to: contentsURL.appendingPathComponent("Info.plist"))
+        try Data("English glossary".utf8).write(to: englishURL.appendingPathComponent("Glossary.md"))
+
+        let bundle = try #require(Bundle(url: bundleURL))
+        let suiteName = "RemoteMicTests.LocalizationFallback.\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let settings = AppSettings(defaults: defaults)
+        settings.applicationLanguage = .simplifiedChinese
+        let localization = LocalizationStore(settings: settings, resourceBundle: bundle)
+        let localizedURL = try #require(
+            localization.localizedURL(forResource: "Glossary", withExtension: "md")
+        )
+
+        #expect(try String(contentsOf: localizedURL, encoding: .utf8) == "English glossary")
+    }
+}
+
+private var repositoryRoot: URL {
+    URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+}
+
+private func sourceLocalizationDirectories() throws -> [URL] {
+    let resourcesURL = repositoryRoot.appendingPathComponent("Resources")
+    return try FileManager.default.contentsOfDirectory(
+        at: resourcesURL,
+        includingPropertiesForKeys: [.isDirectoryKey],
+        options: [.skipsHiddenFiles]
+    )
+    .filter { $0.pathExtension == "lproj" }
+    .sorted { $0.lastPathComponent < $1.lastPathComponent }
+}
+
+private func strings(at url: URL) throws -> [String: String] {
+    let data = try Data(contentsOf: url)
+    let propertyList = try PropertyListSerialization.propertyList(
+        from: data,
+        options: [],
+        format: nil
+    )
+    return try #require(propertyList as? [String: String])
+}
+
+private func formatPlaceholders(in value: String) -> [String] {
+    let expression = try! NSRegularExpression(pattern: #"%(?:[0-9]+\$)?[a-zA-Z@]"#)
+    let range = NSRange(value.startIndex..., in: value)
+    return expression.matches(in: value, range: range).compactMap { match in
+        guard let range = Range(match.range, in: value) else { return nil }
+        return String(value[range])
+    }.sorted()
+}
+
+private func containsRestrictedUserTerm(_ value: String) -> Bool {
+    value.range(
+        of: #"RC003|ATVV|\bHID\b|\bUUID\b|virtual[ -]transport"#,
+        options: [.regularExpression, .caseInsensitive]
+    ) != nil
+}

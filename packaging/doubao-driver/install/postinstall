@@ -1,0 +1,307 @@
+#!/bin/zsh
+set -euo pipefail
+
+TARGET_VOLUME="${3:-/}"
+SCRIPT_DIR="${0:A:h}"
+RELEASE_CONFIG="$SCRIPT_DIR/release-variant.plist"
+LEGACY_APP_TRASH_HELPER="$SCRIPT_DIR/trash-legacy-app.zsh"
+DESTINATION="${TARGET_VOLUME%/}/Library/Audio/Plug-Ins/HAL/MiRemoteV2ch.driver"
+PLIST="$DESTINATION/Contents/Info.plist"
+BINARY="$DESTINATION/Contents/MacOS/MiRemoteV2ch"
+
+APP_DESTINATION="${TARGET_VOLUME%/}/Applications/SayAll.app"
+APP_PLIST="$APP_DESTINATION/Contents/Info.plist"
+APP_BINARY="$APP_DESTINATION/Contents/MacOS/RemoteMic"
+MCP_HELPER="$APP_DESTINATION/Contents/Helpers/SayAllMCP"
+APPLE_REMOTE_AUDIO_HELPER="$APP_DESTINATION/Contents/Helpers/SayAllAppleRemoteAudioCapture"
+APPLE_REMOTE_HCI_BUNDLED_HELPER="$APP_DESTINATION/Contents/Helpers/SayAllAppleRemoteHCIService"
+SPARKLE_VERSION_DIR="$APP_DESTINATION/Contents/Frameworks/Sparkle.framework/Versions/B"
+APP_EXECUTABLES=(
+  "$APP_BINARY"
+  "$MCP_HELPER"
+  "$APPLE_REMOTE_AUDIO_HELPER"
+  "$APPLE_REMOTE_HCI_BUNDLED_HELPER"
+  "$SPARKLE_VERSION_DIR/Sparkle"
+  "$SPARKLE_VERSION_DIR/Autoupdate"
+  "$SPARKLE_VERSION_DIR/Updater.app/Contents/MacOS/Updater"
+  "$SPARKLE_VERSION_DIR/XPCServices/Installer.xpc/Contents/MacOS/Installer"
+  "$SPARKLE_VERSION_DIR/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"
+)
+LEGACY_REMOTE_MIC_APP_DESTINATION="${TARGET_VOLUME%/}/Applications/Remote Mic.app"
+LEGACY_REMOTE_MIC_APP_PLIST="$LEGACY_REMOTE_MIC_APP_DESTINATION/Contents/Info.plist"
+LEGACY_CHINESE_APP_DESTINATION="${TARGET_VOLUME%/}/Applications/无线麦.app"
+LEGACY_CHINESE_APP_PLIST="$LEGACY_CHINESE_APP_DESTINATION/Contents/Info.plist"
+
+uses_chinese_locale() {
+  local locale="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+  [[ "$locale" == zh* ]]
+}
+
+installer_message() {
+  if uses_chinese_locale; then
+    print "$1"
+  else
+    print "$2"
+  fi
+}
+
+source "$SCRIPT_DIR/driver-naming.zsh"
+NAMING_SELECTION="$SCRIPT_DIR/driver-naming-selection.plist"
+[[ -f "$NAMING_SELECTION" && ! -L "$NAMING_SELECTION" && "$(/usr/bin/stat -f %u "$NAMING_SELECTION")" == 0 ]] || { driver_naming_failure missing_selection; exit 2; }
+SELECTED_NAMING="$(/usr/bin/plutil -extract Variant raw -o - "$NAMING_SELECTION" 2>/dev/null || true)"
+case "$SELECTED_NAMING" in
+  brand) DRIVER_DISPLAY_NAME="SayAll"; STAGED_SUFFIX="" ;;
+  legacy) DRIVER_DISPLAY_NAME="MiRemoteV 2ch"; STAGED_SUFFIX="/legacy" ;;
+  *) driver_naming_failure unknown_selection; exit 2 ;;
+esac
+SELECTION_BUILD="$(/usr/bin/plutil -extract PackageBuild raw -o - "$NAMING_SELECTION" 2>/dev/null || true)"
+EXPECTED_BUILD="$(/usr/bin/plutil -extract PackageBuild raw -o - "$RELEASE_CONFIG")"
+[[ "$SELECTION_BUILD" == "$EXPECTED_BUILD" ]] || { driver_naming_failure mismatched_selection; exit 2; }
+prepare_driver_naming_directory "$TARGET_VOLUME" || { driver_naming_failure unsafe_state_directory; exit 2; }
+check_driver_naming_duplicates "$TARGET_VOLUME" "$DESTINATION" || { driver_naming_failure duplicate_driver; exit 2; }
+STAGING_ROOT="${TARGET_VOLUME%/}/Library/Application Support/RemoteMic/Installer"
+[[ ! -L "$STAGING_ROOT" && ! -L "$STAGING_ROOT/legacy" ]] || { driver_naming_failure unsafe_payload; exit 2; }
+STAGED_DRIVER="$STAGING_ROOT$STAGED_SUFFIX/MiRemoteV2ch.driver"
+[[ "$(driver_naming_variant "$STAGED_DRIVER")" == "$SELECTED_NAMING" ]] || { driver_naming_failure invalid_payload; exit 2; }
+# Recheck evidence after payload deployment; never use the just-written receipt.
+CURRENT_NAMING=none
+if [[ -e "$DESTINATION" || -L "$DESTINATION" ]]; then
+  driver_naming_identity "$DESTINATION" || { driver_naming_failure unknown_identity; exit 2; }
+  CURRENT_NAMING="$(driver_naming_observed_variant "$DESTINATION" || print unknown)"
+fi
+RECORDED_NAMING="$(driver_naming_record)" || { driver_naming_failure invalid_state; exit 2; }
+POST_HISTORY=no
+if [[ "$SELECTED_NAMING" == legacy ]]; then POST_HISTORY=yes; fi
+[[ "$(resolve_driver_naming "$CURRENT_NAMING" "$RECORDED_NAMING" "$POST_HISTORY")" == "$SELECTED_NAMING" ]] || {
+  driver_naming_failure changed_evidence; exit 2
+}
+
+STAGED_PLIST="$STAGED_DRIVER/Contents/Info.plist"
+STAGED_BINARY="$STAGED_DRIVER/Contents/MacOS/MiRemoteV2ch"
+
+test -f "$LEGACY_APP_TRASH_HELPER"
+source "$LEGACY_APP_TRASH_HELPER"
+
+hardware_architecture() {
+  if [[ "$(/usr/sbin/sysctl -in hw.optional.arm64 2>/dev/null || print 0)" == "1" ]]; then
+    print "arm64"
+  else
+    print "x86_64"
+  fi
+}
+
+driver_architecture() {
+  local description
+  description="$(/usr/bin/file -b "$1" 2>/dev/null || true)"
+  case "$description" in
+    *arm64*) print "arm64" ;;
+    *x86_64*) print "x86_64" ;;
+    *) print "unknown" ;;
+  esac
+}
+
+driver_is_healthy_and_current() {
+  test -d "$DESTINATION" &&
+    test -f "$PLIST" &&
+    test -x "$BINARY" &&
+    test -f "$STAGED_PLIST" &&
+    test "$(driver_naming_variant "$DESTINATION")" = "$SELECTED_NAMING" &&
+    test "$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$PLIST" 2>/dev/null || true)" = \
+      "com.hd838a.MiRemoteV2ch" &&
+    test "$(/usr/bin/plutil -extract CFBundleName raw -o - "$PLIST" 2>/dev/null || true)" = \
+      "MiRemoteV2ch" &&
+    test "$(driver_architecture "$BINARY")" = "$EXPECTED_ARCHITECTURE" &&
+    test "$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$PLIST" 2>/dev/null || true)" = \
+      "$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$STAGED_PLIST" 2>/dev/null || true)" &&
+    /usr/bin/codesign --verify --deep --strict "$DESTINATION" >/dev/null 2>&1
+}
+
+test -f "$RELEASE_CONFIG"
+EXPECTED_ARCHITECTURE="$(/usr/bin/plutil -extract ExpectedArchitecture raw -o - "$RELEASE_CONFIG")"
+MINIMUM_SYSTEM_MAJOR="$(/usr/bin/plutil -extract MinimumSystemMajor raw -o - "$RELEASE_CONFIG")"
+MINIMUM_SYSTEM_VERSION="$(/usr/bin/plutil -extract MinimumSystemVersion raw -o - "$RELEASE_CONFIG")"
+
+test -d "$STAGED_DRIVER"
+test -f "$STAGED_PLIST"
+test -x "$STAGED_BINARY"
+test -d "$APP_DESTINATION"
+test -f "$APP_PLIST"
+test -x "$APP_BINARY"
+test "$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$APP_PLIST")" = "com.hd838a.RemoteMic"
+test "$(/usr/bin/plutil -extract LSMinimumSystemVersion raw -o - "$APP_PLIST")" = \
+  "$MINIMUM_SYSTEM_VERSION"
+CURRENT_ARCHITECTURE="$(hardware_architecture)"
+if [[ "$CURRENT_ARCHITECTURE" != "$EXPECTED_ARCHITECTURE" ]]; then
+  if [[ "$EXPECTED_ARCHITECTURE" == "arm64" ]]; then
+    installer_message \
+      "安装已停止：此安装包仅适用于 Apple 芯片 Mac；请下载文件名中带“Intel”的版本。" \
+      "Installation stopped: this installer is for Macs with Apple silicon. Download the Intel version whose file name includes 'Intel'." >&2
+  else
+    installer_message \
+      "安装已停止：此安装包仅适用于 Intel Mac；请下载文件名中不带“Intel”的 Apple Silicon 版本。" \
+      "Installation stopped: this installer is for Intel Macs. Download the Apple Silicon version whose file name does not include 'Intel'." >&2
+  fi
+  exit 2
+fi
+SYSTEM_MAJOR="$(/usr/bin/sw_vers -productVersion | /usr/bin/cut -d. -f1)"
+test "$SYSTEM_MAJOR" -ge "$MINIMUM_SYSTEM_MAJOR"
+DRIVER_CHANGED=0
+DRIVER_BACKUP=""
+
+restore_previous_driver() {
+  if [[ -n "$DRIVER_BACKUP" && -e "$DRIVER_BACKUP" ]]; then
+    /bin/mv -n -- "$DRIVER_BACKUP" "$DESTINATION" || \
+      installer_message \
+        "$DRIVER_DISPLAY_NAME 更新失败，且无法自动恢复旧驱动；旧驱动仍保留在 $DRIVER_BACKUP。" \
+        "$DRIVER_DISPLAY_NAME update failed and the previous driver could not be restored automatically. It remains at $DRIVER_BACKUP." >&2
+  fi
+}
+
+if driver_is_healthy_and_current; then
+  installer_message \
+    "已保留现有的 $DRIVER_DISPLAY_NAME，无需重复安装。" \
+    "The existing $DRIVER_DISPLAY_NAME is healthy and was kept in place."
+else
+  DRIVER_CHANGED=1
+  if [[ -e "$DESTINATION" || -L "$DESTINATION" ]]; then
+    DRIVER_BACKUP="${DESTINATION:h}/.MiRemoteV2ch.driver.install-backup-$(/bin/date -u +%Y%m%dT%H%M%SZ)-$$"
+    /bin/mv -n -- "$DESTINATION" "$DRIVER_BACKUP"
+  fi
+  /bin/mkdir -p "${DESTINATION:h}"
+  if ! /usr/bin/ditto --norsrc --noextattr --noqtn --noacl "$STAGED_DRIVER" "$DESTINATION" || \
+     ! /usr/sbin/chown -R root:wheel "$DESTINATION" || \
+     ! /usr/bin/find "$DESTINATION" -type d -exec /bin/chmod 755 {} \; || \
+     ! /usr/bin/find "$DESTINATION" -type f -exec /bin/chmod 644 {} \; || \
+     ! /bin/chmod 755 "$BINARY" || \
+     ! /usr/bin/codesign --verify --deep --strict "$DESTINATION" || \
+     [[ "$(driver_naming_variant "$DESTINATION")" != "$SELECTED_NAMING" ]] || \
+     ! commit_driver_naming_record "$SELECTED_NAMING"; then
+    if [[ -e "$DESTINATION" || -L "$DESTINATION" ]]; then
+      FAILED_DRIVER="${DESTINATION:h}/.MiRemoteV2ch.driver.failed-$(/bin/date -u +%Y%m%dT%H%M%SZ)-$$"
+      /bin/mv -n -- "$DESTINATION" "$FAILED_DRIVER" 2>/dev/null || true
+    fi
+    restore_previous_driver
+    print "DRIVER_NAMING phase=failed result=failed reason=driver_replacement_failed variant=$SELECTED_NAMING rollback=unknown"
+    installer_message \
+      "$DRIVER_DISPLAY_NAME 更新失败，安装已停止。" \
+      "$DRIVER_DISPLAY_NAME update failed and installation has stopped." >&2
+    exit 2
+  fi
+  if [[ -n "$DRIVER_BACKUP" ]]; then
+    DRIVER_BACKUP_TRASH_ROOT="${TARGET_VOLUME%/}/var/root/.Trash"
+    DRIVER_BACKUP_TRASH_DESTINATION="$DRIVER_BACKUP_TRASH_ROOT/MiRemoteV2ch (replaced $(/bin/date -u +%Y%m%dT%H%M%SZ)-$$).driver"
+    if /bin/mkdir -p -- "$DRIVER_BACKUP_TRASH_ROOT" && \
+       /usr/sbin/chown root:wheel "$DRIVER_BACKUP_TRASH_ROOT" && \
+       /bin/chmod 700 "$DRIVER_BACKUP_TRASH_ROOT" && \
+       /bin/mv -n -- "$DRIVER_BACKUP" "$DRIVER_BACKUP_TRASH_DESTINATION"; then
+      DRIVER_BACKUP=""
+    else
+      installer_message \
+        "$DRIVER_DISPLAY_NAME 已更新，但旧驱动无法移入废纸篓，已保留在 $DRIVER_BACKUP。" \
+        "$DRIVER_DISPLAY_NAME was updated, but the previous driver could not be moved to Trash and remains at $DRIVER_BACKUP." >&2
+    fi
+  fi
+  installer_message \
+    "已安装或更新 $DRIVER_DISPLAY_NAME。" \
+    "$DRIVER_DISPLAY_NAME was installed or updated."
+fi
+commit_driver_naming_record "$SELECTED_NAMING" || { driver_naming_failure state_commit_failed; exit 2; }
+print "DRIVER_NAMING phase=installed result=verified variant=$SELECTED_NAMING changed=$DRIVER_CHANGED audio_loaded=unknown"
+STAGED_DRIVER_TRASH_ROOT="${TARGET_VOLUME%/}/var/root/.Trash"
+STAGED_DRIVER_TRASH_DESTINATION="$STAGED_DRIVER_TRASH_ROOT/RemoteMic Installer Staging $(/bin/date -u +%Y%m%dT%H%M%SZ)-$$"
+if ! /bin/mkdir -p -- "$STAGED_DRIVER_TRASH_ROOT" || \
+   ! /usr/sbin/chown root:wheel "$STAGED_DRIVER_TRASH_ROOT" || \
+   ! /bin/chmod 700 "$STAGED_DRIVER_TRASH_ROOT" || \
+   ! /bin/mv -n -- "$STAGING_ROOT" "$STAGED_DRIVER_TRASH_DESTINATION"; then
+  installer_message \
+    "安装已完成，但临时驱动目录无法移入废纸篓，已保留在 $STAGING_ROOT。" \
+    "Installation completed, but the staged driver directory could not be moved to Trash and remains at $STAGING_ROOT." >&2
+fi
+/usr/sbin/chown -R root:wheel "$APP_DESTINATION"
+/usr/bin/find "$APP_DESTINATION" -type d -exec /bin/chmod 755 {} \;
+/usr/bin/find "$APP_DESTINATION" -type f -exec /bin/chmod 644 {} \;
+for app_executable in "${APP_EXECUTABLES[@]}"; do
+  test -f "$app_executable"
+  /bin/chmod 755 "$app_executable"
+  test -x "$app_executable"
+done
+/usr/bin/codesign --verify --deep --strict "$APP_DESTINATION"
+
+# Never abort here: the driver is already in place, so a failed audio-service
+# restart must not turn a successful install into an installer error. pgrep
+# decides the wording so a real failure is never reported as "was not running",
+# and killall's stderr reaches the installer log instead of being suppressed.
+# Deliberately not `|| true`, which would also swallow permission failures.
+restart_audio_service() {
+  if ! /usr/bin/pgrep -qx coreaudiod; then
+    installer_message \
+      "系统音频服务当前未运行，无需重启；驱动会在它启动时加载。" \
+      "The system audio service is not running; no restart was needed and the driver loads when it starts."
+  elif /usr/bin/killall coreaudiod; then
+    installer_message \
+      "已重启系统音频服务。" \
+      "Restarted the system audio service."
+  else
+    installer_message \
+      "驱动已安装，但重启系统音频服务失败；请重启 Mac 以加载驱动。" \
+      "The driver is installed, but the system audio service could not be restarted; restart your Mac to load it."
+  fi
+}
+
+if [[ "$DRIVER_CHANGED" -eq 1 ]]; then
+  restart_audio_service
+fi
+
+CONSOLE_USER="$(/usr/bin/stat -f '%Su' /dev/console)"
+if [[ "$CONSOLE_USER" != "root" && "$CONSOLE_USER" != "loginwindow" ]] && \
+   CONSOLE_UID="$(/usr/bin/id -u "$CONSOLE_USER" 2>/dev/null)"; then
+  USER_HOME="$(/usr/bin/dscl . -read "/Users/$CONSOLE_USER" NFSHomeDirectory \
+    2>/dev/null | /usr/bin/sed -n 's/^NFSHomeDirectory: //p')"
+else
+  CONSOLE_UID=0
+  USER_HOME=""
+fi
+if [[ "$TARGET_VOLUME" == "/" && "$USER_HOME" == /* && "$USER_HOME" != "/" && \
+      "$USER_HOME" != *'/../'* && "$USER_HOME" != *'/..' ]]; then
+  LEGACY_APP_TRASH_ROOT="${TARGET_VOLUME%/}$USER_HOME/.Trash"
+else
+  LEGACY_APP_TRASH_ROOT="${TARGET_VOLUME%/}/.Trashes/$CONSOLE_UID"
+fi
+LEGACY_APP_MIGRATION_TOKEN="$(/bin/date -u +%Y%m%dT%H%M%SZ)-$$"
+
+move_legacy_app_to_trash_if_owned \
+  "$LEGACY_REMOTE_MIC_APP_DESTINATION" \
+  "$LEGACY_REMOTE_MIC_APP_PLIST" \
+  "Remote Mic.app" \
+  "$LEGACY_APP_TRASH_ROOT" \
+  "$CONSOLE_UID" \
+  "$LEGACY_APP_MIGRATION_TOKEN"
+move_legacy_app_to_trash_if_owned \
+  "$LEGACY_CHINESE_APP_DESTINATION" \
+  "$LEGACY_CHINESE_APP_PLIST" \
+  "无线麦.app" \
+  "$LEGACY_APP_TRASH_ROOT" \
+  "$CONSOLE_UID" \
+  "$LEGACY_APP_MIGRATION_TOKEN"
+
+if [[ "$TARGET_VOLUME" != "/" ]]; then
+  installer_message \
+    "已完成安装；请从目标磁盘的“应用程序”目录手动打开无线麦SayAll.app。" \
+    "Installation is complete. Open SayAll from Applications on the target disk."
+elif [[ "$CONSOLE_USER" != "root" && "$CONSOLE_USER" != "loginwindow" ]]; then
+  /usr/bin/pkill -U "$CONSOLE_UID" -x RemoteMic 2>/dev/null || true
+  if /bin/launchctl asuser "$CONSOLE_UID" \
+    /usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/open "$APP_DESTINATION"; then
+    installer_message \
+      "已安装并启动无线麦SayAll.app；请在状态栏打开设置并选择 $DRIVER_DISPLAY_NAME。" \
+      "SayAll is installed and running. Open its menu bar settings and select $DRIVER_DISPLAY_NAME."
+  else
+    installer_message \
+      "已完成安装，但未能自动启动应用；请从“应用程序”手动打开无线麦SayAll.app。" \
+      "Installation is complete, but the app could not be launched automatically. Open SayAll from Applications."
+  fi
+else
+  installer_message \
+    "已完成安装；登录桌面后请从“应用程序”打开无线麦SayAll.app。" \
+    "Installation is complete. After signing in, open SayAll from Applications."
+fi

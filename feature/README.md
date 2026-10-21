@@ -1,0 +1,42 @@
+# 功能档案
+
+每个正式功能使用独立的 kebab-case 子目录，记录公开行为、实现范围、验证方式、人工测试步骤和已知限制。详细研究与长期计划仍保存在私有 marketing 仓库。
+
+## 功能索引
+
+| 功能 | 状态 | 说明 |
+| --- | --- | --- |
+| [加密诊断日志](./encrypted-diagnostic-logs/) | 候选代码完成，等待受控 Sentry/私钥验收 | 本地 `.rmlog` 使用公钥包裹的 AES-GCM 加密；用户主动发送时，Sentry 只接收公开白名单事件和可选私有 provider 的类型化安全事件。 |
+| [关于页版本中心](./about-update-center/) | 验证中 | 集中展示版本、更新内容、版本历史与正式/预发布更新通道。 |
+| [Apple Watch 直连遥控与收音](./apple-watch-direct-remote/) | 候选代码完成，等待真机验收 | Mac 提供独立 Watch 入口，并复用按需开启的附近连接、现有按键映射与移动语音链路。 |
+| [常用 macOS 快捷键](./common-mac-shortcuts/) | 已完成 | 常用固定快捷键与无线麦标准退出、关窗行为。 |
+| [常用语按键直发](./common-phrases/PRODUCT_SPEC.md) | macOS 会员功能；旧版验收见手册 | 实现位于私有会员 Package；公开宿主只保留动作 ID、入口和可选适配，显示和使用由会员服务决定。公开构建不承诺包含常用语实现。自动化与用户验收来源、各平台和硬件验证边界见 [测试手册](../Testing/CommonPhrases.md)。 |
+| [Mac 下载 Cloudflare CDN](./cloudflare-download-cdn/) | 候选修复完成，等待发布验收 | 官网固定入口与版本化资产继续走 Cloudflare；新增 stable/preview 双架构 appcast 通道，客户端不再直接请求 GitHub Releases API。 |
+| [私有功能组件集成](./private-feature-integration/) | 已完成 | 公开 App 只保留可选适配层；私有实现、资源、测试和内部文档由独立私有组件维护。 |
+| [组合动作私有模块集成](./quick-commands-private-integration/) | 代码完成，等待人工验收 | 通过可选私有 Swift Package 提供组合动作页面与遥控器绑定；模块存在时无需邀请码直接使用，公开构建保持独立。 |
+| [Intel Ventura 独立发行](./intel-ventura-release/) | 已完成 | Intel 使用 macOS 13、x86_64、独立安装包与更新源，并与 Apple Silicon 分别打包。 |
+| [本地语音转写记录](./local-transcript-history/) | 界面迭代完成，等待人工验收 | 默认关闭；独立侧边栏页面使用顶部可展开应用栏、可折叠日期时间线和真实 App 图标筛选，不依赖 AI 或 API Key。 |
+| [Mac 本地原始录音资产](./local-recording-assets/) | 候选代码完成，等待真实硬件验收 | 默认关闭；将 Mac 音频管线中的 PCM 保存为本地 M4A/AAC，并与回眸 session 关联，支持播放、导出、Finder 和可恢复删除。 |
+| [本地 Agent 访问集成](./sayall-mcp-integration/) | 候选代码完成，等待客户端验收 | App 内 Swift Helper 是唯一运行时；`GetSayAll/sayall-mcp` 提供公开契约，访问默认关闭且不需要 Node.js。 |
+| [首次使用成功率优化](./first-use-success/) | 候选代码完成，等待安装验收 | 设置卡点提供单一修复动作与脱敏诊断；普通 DMG 只保留一个安装入口并保留健康驱动。 |
+| [iPhone 二维码局域网直连](./iphone-qr-direct/) | 代码与自动化验证完成，等待真机验收 | iPhone 扫码优先直连当前 Mac 监听周期，Bonjour/P2P 与 Watch 原路径保持不变。 |
+| [延长语音录音与 iOS 点按录音](./extended-voice-recording/) | 部分撤回，等待人工验收 | 普通遥控器 `MIC_EXTEND` 延长方案已撤回；iOS 支持点按切换与按住说话。 |
+| [系统占用快捷键录入](./reserved-shortcut-capture/) | 等待人工验收 | 点击录入后短暂捕获被系统或其他 APP 占用的组合键，并显示明确成功或失败反馈。 |
+| [首次使用设置向导](./first-run-onboarding/) | 等待人工验收 | 仅全新安装通过不可跳过的实时门禁完成语音工具、优先实体遥控器或无遥控器时的 iPhone/网页版、对应权限、兼容麦克风、真实语音文字和普通按键检查；旧安装升级自动迁移。 |
+| [首选输入法自动准备](./preferred-input-source-switching/) | 候选修复完成，等待真实输入法验收 | 语音期间临时切换到已启用的豆包或微信输入法，结束后在安全条件满足时恢复原输入源；不拦截用户输入法快捷键。 |
+| [唤起目标后的首次语音就绪协调](./voice-input-destination-readiness/) | 等待人工验收 | 目标输入位置真正就绪后再启动第一次 Fn 语音，并在等待期间完整缓存短语音。 |
+| [问题反馈入口](./issue-feedback-link/) | 等待人工验收 | 从“关于”页打开 SayAll 工作台最低权限页面，不接入账号或设备认证。 |
+| [Mac 官网分享入口](./mac-app-sharing/) | 代码完成，等待人工验收 | 关于、统计和全局侧边栏复用同一官网二维码与复制链接，不上传 App 数据。 |
+
+## 新功能模板
+
+创建新目录时至少回答：
+
+1. 用户遇到了什么问题，为什么现在开发？
+2. 用户可以看到和操作什么？
+3. 本次明确做什么、不做什么？
+4. 数据会读到哪里、发送到哪里、保存在哪里？
+5. 修改了哪些文件和共享链路，为什么？
+6. 开发中遇到了什么关键问题，最终如何处理？
+7. 自动化、构建、真机和第三方 App 分别验证到什么边界？
+8. 用户应按照什么步骤测试，什么结果属于失败？

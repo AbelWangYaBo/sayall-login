@@ -1,0 +1,154 @@
+#!/bin/zsh
+set -euo pipefail
+
+ROOT="${0:A:h:h}"
+source "$ROOT/scripts/release-variant.sh"
+BLACKHOLE_TAG="v0.7.1"
+BLACKHOLE_COMMIT="e2b22aaaba4e507a097131704bf96dabc004d9cf"
+WORK_ROOT="$ROOT/.build/doubao-driver$RELEASE_WORK_SUFFIX"
+SOURCE_ROOT="$WORK_ROOT/BlackHole"
+PATCH="$ROOT/third_party/blackhole/blackhole-device-usb.patch"
+OUTPUT="$RELEASE_OUTPUT_DIR/MiRemoteV2ch.driver"
+LEGACY_OUTPUT="$RELEASE_OUTPUT_DIR/legacy/MiRemoteV2ch.driver"
+PRODUCT_NAME="MiRemoteV2ch"
+BUNDLE_ID="com.hd838a.MiRemoteV2ch"
+DEFINITIONS='$GCC_PREPROCESSOR_DEFINITIONS kDriver_Name=\"MiRemoteV\" kPlugIn_BundleID=\"com.hd838a.MiRemoteV2ch\" kNumber_Of_Channels=2'
+SIGNING_IDENTITY="${CODE_SIGN_IDENTITY:--}"
+REQUIRE_DEVELOPER_ID_SIGNING="${REQUIRE_DEVELOPER_ID_SIGNING:-0}"
+RELEASE_STAGE_TIMEOUTS="${RELEASE_STAGE_TIMEOUTS:-0}"
+RELEASE_DRIVER_BUILD_TIMEOUT_SECONDS="${RELEASE_DRIVER_BUILD_TIMEOUT_SECONDS:-150}"
+RELEASE_CODESIGN_TIMEOUT_SECONDS="${RELEASE_CODESIGN_TIMEOUT_SECONDS:-45}"
+RELEASE_STAGE_RUNNER="$ROOT/scripts/run-release-stage.sh"
+
+move_existing_path_to_trash() {
+  local source_path="$1"
+  local label="$2"
+  local developer_user developer_home trash_root destination counter=0
+  [[ -e "$source_path" || -L "$source_path" ]] || return 0
+  developer_user="$(/usr/bin/id -un)"
+  developer_home="$(/usr/bin/dscl . -read "/Users/$developer_user" NFSHomeDirectory \
+    2>/dev/null | /usr/bin/sed -n 's/^NFSHomeDirectory: //p')"
+  if [[ "$developer_home" != /* || "$developer_home" == "/" || \
+        "$developer_home" == *'/../'* || "$developer_home" == *'/..' ]]; then
+    print -u2 "refusing to move $label because the developer Trash path is invalid"
+    return 1
+  fi
+  trash_root="$developer_home/.Trash"
+  /bin/mkdir -p -- "$trash_root"
+  destination="$trash_root/$label-$(/bin/date -u +%Y%m%dT%H%M%SZ)-$$"
+  while [[ -e "$destination" || -L "$destination" ]]; do
+    counter=$((counter + 1))
+    destination="$trash_root/$label-$(/bin/date -u +%Y%m%dT%H%M%SZ)-$$-$counter"
+  done
+  /bin/mv -n -- "$source_path" "$destination"
+  print "Moved previous $label to Trash: $destination"
+}
+
+if ! command -v git >/dev/null 2>&1; then
+  print -u2 "Missing required command: git"
+  exit 1
+fi
+if ! command -v xcodebuild >/dev/null 2>&1; then
+  print -u2 "Missing required command: xcodebuild. Install Xcode before building the Doubao compatibility driver."
+  exit 1
+fi
+case "$REQUIRE_DEVELOPER_ID_SIGNING" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_DEVELOPER_ID_SIGNING must be 0 or 1"; exit 1 ;;
+esac
+case "$RELEASE_STAGE_TIMEOUTS" in
+  0|1) ;;
+  *) print -u2 "RELEASE_STAGE_TIMEOUTS must be 0 or 1"; exit 1 ;;
+esac
+if [[ "$RELEASE_STAGE_TIMEOUTS" == "1" && ! -x "$RELEASE_STAGE_RUNNER" ]]; then
+  print -u2 "release stage runner is unavailable"
+  exit 1
+fi
+
+run_release_stage() {
+  local stage="$1"
+  local timeout_seconds="$2"
+  shift 2
+  if [[ "$RELEASE_STAGE_TIMEOUTS" == "1" ]]; then
+    "$RELEASE_STAGE_RUNNER" "$RELEASE_VARIANT" "$stage" "$timeout_seconds" -- "$@"
+  else
+    "$@"
+  fi
+}
+if [[ "$REQUIRE_DEVELOPER_ID_SIGNING" == "1" && "$SIGNING_IDENTITY" == "-" ]]; then
+  print -u2 "Developer ID Application signing is required"
+  exit 1
+fi
+
+case "$WORK_ROOT" in
+  "$ROOT"/.build/doubao-driver|"$ROOT"/.build/doubao-driver-intel) ;;
+  *) print -u2 "refusing to clean unexpected work path: $WORK_ROOT"; exit 1 ;;
+esac
+case "$OUTPUT" in
+  "$ROOT"/dist/*.driver|"$ROOT"/dist/intel/*.driver) ;;
+  *) print -u2 "refusing to replace unexpected output path: $OUTPUT"; exit 1 ;;
+esac
+
+move_existing_path_to_trash "$WORK_ROOT" "sayall-driver-build"
+move_existing_path_to_trash "$OUTPUT" "MiRemoteV2ch.driver"
+move_existing_path_to_trash "$LEGACY_OUTPUT" "MiRemoteV2ch-legacy.driver"
+mkdir -p "${WORK_ROOT:h}" "${OUTPUT:h}"
+run_release_stage driver-source-clone 60 git clone --depth 1 --branch "$BLACKHOLE_TAG" \
+  https://github.com/ExistentialAudio/BlackHole.git "$SOURCE_ROOT"
+
+if [[ "$(git -C "$SOURCE_ROOT" rev-parse HEAD)" != "$BLACKHOLE_COMMIT" ]]; then
+  print -u2 "Unexpected BlackHole revision; expected $BLACKHOLE_COMMIT"
+  exit 1
+fi
+git -C "$SOURCE_ROOT" apply --check "$PATCH"
+git -C "$SOURCE_ROOT" apply "$PATCH"
+rg -U -q 'case kAudioDevicePropertyTransportType:(?s:.*?)kAudioDeviceTransportTypeUSB' \
+  "$SOURCE_ROOT/BlackHole/BlackHole.c"
+
+# kDriver_Name defines the historical Box/Device/Model UIDs. Override only
+# kDevice_Name; both signed payloads keep the same identity and endpoint count.
+for naming_variant in brand legacy; do
+  variant_definitions="$DEFINITIONS"
+  variant_output="$LEGACY_OUTPUT"
+  if [[ "$naming_variant" == "brand" ]]; then
+    variant_definitions+=' kDevice_Name=\"SayAll\"'
+    variant_output="$OUTPUT"
+  fi
+  run_release_stage "driver-$naming_variant-xcodebuild" "$RELEASE_DRIVER_BUILD_TIMEOUT_SECONDS" xcodebuild \
+    -project "$SOURCE_ROOT/BlackHole.xcodeproj" \
+    -target BlackHole \
+    -configuration Release \
+    -sdk macosx \
+    ARCHS="$RELEASE_ARCH" \
+    ONLY_ACTIVE_ARCH=NO \
+    MACOSX_DEPLOYMENT_TARGET="$RELEASE_MIN_SYSTEM_VERSION" \
+    CODE_SIGNING_ALLOWED=NO \
+    PRODUCT_NAME="$PRODUCT_NAME" \
+    PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID" \
+    GCC_PREPROCESSOR_DEFINITIONS="$variant_definitions" \
+    build
+
+  ditto --norsrc --noextattr --noqtn --noacl \
+    "$SOURCE_ROOT/build/Release/$PRODUCT_NAME.driver" "$variant_output"
+  /usr/bin/plutil -insert SayAllNamingVariant -string "$naming_variant" "$variant_output/Contents/Info.plist"
+  /usr/bin/strip -S "$variant_output/Contents/MacOS/$PRODUCT_NAME"
+  if [[ "$SIGNING_IDENTITY" == "-" ]]; then
+    codesign --force --deep --sign - --timestamp=none "$variant_output"
+  else
+    run_release_stage "driver-$naming_variant-codesign" "$RELEASE_CODESIGN_TIMEOUT_SECONDS" codesign \
+      --force \
+      --deep \
+      --options runtime \
+      --timestamp \
+      --sign "$SIGNING_IDENTITY" \
+      "$variant_output"
+  fi
+  "$ROOT/scripts/verify-doubao-driver.sh" "$variant_output" "$naming_variant"
+
+done
+
+print "Built: $OUTPUT"
+print "Built: $LEGACY_OUTPUT"
+print "RELEASE VARIANT: $RELEASE_VARIANT"
+print "SIGNING IDENTITY: $SIGNING_IDENTITY"
+print "Next: $ROOT/scripts/build-doubao-driver-pkg.sh"

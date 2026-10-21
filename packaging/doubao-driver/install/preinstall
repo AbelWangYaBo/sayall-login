@@ -1,0 +1,188 @@
+#!/bin/zsh
+set -euo pipefail
+
+TARGET_VOLUME="${3:-/}"
+SCRIPT_DIR="${0:A:h}"
+RELEASE_CONFIG="$SCRIPT_DIR/release-variant.plist"
+DESTINATION="${TARGET_VOLUME%/}/Library/Audio/Plug-Ins/HAL/MiRemoteV2ch.driver"
+PLIST="$DESTINATION/Contents/Info.plist"
+APP_DESTINATION="${TARGET_VOLUME%/}/Applications/SayAll.app"
+APP_PLIST="$APP_DESTINATION/Contents/Info.plist"
+LEGACY_REMOTE_MIC_APP_DESTINATION="${TARGET_VOLUME%/}/Applications/Remote Mic.app"
+LEGACY_REMOTE_MIC_APP_PLIST="$LEGACY_REMOTE_MIC_APP_DESTINATION/Contents/Info.plist"
+LEGACY_CHINESE_APP_DESTINATION="${TARGET_VOLUME%/}/Applications/无线麦.app"
+LEGACY_CHINESE_APP_PLIST="$LEGACY_CHINESE_APP_DESTINATION/Contents/Info.plist"
+OWNED_APP_FOUND=0
+source "$SCRIPT_DIR/driver-naming.zsh"
+
+uses_chinese_locale() {
+  local locale="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+  [[ "$locale" == zh* ]]
+}
+
+installer_message() {
+  if uses_chinese_locale; then
+    print "$1"
+  else
+    print "$2"
+  fi
+}
+
+hardware_architecture() {
+  if [[ "$(/usr/sbin/sysctl -in hw.optional.arm64 2>/dev/null || print 0)" == "1" ]]; then
+    print "arm64"
+  else
+    print "x86_64"
+  fi
+}
+
+test -f "$RELEASE_CONFIG"
+EXPECTED_ARCHITECTURE="$(/usr/bin/plutil -extract ExpectedArchitecture raw -o - "$RELEASE_CONFIG")"
+MINIMUM_SYSTEM_MAJOR="$(/usr/bin/plutil -extract MinimumSystemMajor raw -o - "$RELEASE_CONFIG")"
+PACKAGE_BUILD="$(/usr/bin/plutil -extract PackageBuild raw -o - "$RELEASE_CONFIG")"
+CURRENT_ARCHITECTURE="$(hardware_architecture)"
+CURRENT_SYSTEM_MAJOR="$(/usr/bin/sw_vers -productVersion | /usr/bin/cut -d. -f1)"
+[[ "$PACKAGE_BUILD" == <-> ]]
+if [[ "$CURRENT_ARCHITECTURE" != "$EXPECTED_ARCHITECTURE" ]]; then
+  if [[ "$EXPECTED_ARCHITECTURE" == "arm64" ]]; then
+    installer_message \
+      "未安装：此安装包仅适用于 Apple 芯片 Mac。当前 Mac 使用 Intel 处理器；请下载文件名中带“Intel”的版本。" \
+      "Installation stopped: this installer is for Macs with Apple silicon. This Mac has an Intel processor. Download the Intel version whose file name includes 'Intel'." >&2
+  else
+    installer_message \
+      "未安装：此安装包仅适用于 Intel Mac。当前 Mac 使用 Apple 芯片；请下载文件名中不带“Intel”的 Apple Silicon 版本。" \
+      "Installation stopped: this installer is for Intel Macs. This Mac has Apple silicon. Download the Apple Silicon version whose file name does not include 'Intel'." >&2
+  fi
+  exit 2
+fi
+if [[ "$CURRENT_SYSTEM_MAJOR" -lt "$MINIMUM_SYSTEM_MAJOR" ]]; then
+  installer_message \
+    "未安装：此安装包需要 macOS $MINIMUM_SYSTEM_MAJOR 或更高版本。" \
+    "Installation stopped: this package requires macOS $MINIMUM_SYSTEM_MAJOR or later." >&2
+  exit 2
+fi
+
+if [[ -e "$DESTINATION" ]]; then
+  if [[ ! -f "$PLIST" ]] || \
+     [[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$PLIST" 2>/dev/null || true)" != "com.hd838a.MiRemoteV2ch" ]]; then
+    installer_message \
+      "未安装：目标路径存在无法识别的音频驱动 $DESTINATION" \
+      "Installation stopped: an unrecognized audio driver exists at $DESTINATION." >&2
+    installer_message \
+      "为避免覆盖其他软件，安装器已停止。" \
+      "To avoid overwriting other software, the installer has stopped." >&2
+    exit 2
+  fi
+  installer_message \
+    "检测到已有兼容麦克风；安装后会检查它是否需要更新。" \
+    "An existing compatible microphone was found and will be checked before any update."
+fi
+
+if [[ -e "$APP_DESTINATION" || -L "$APP_DESTINATION" ]]; then
+  if [[ ! -f "$APP_PLIST" ]] || \
+     [[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$APP_PLIST" 2>/dev/null || true)" != "com.hd838a.RemoteMic" ]]; then
+    installer_message \
+      "未安装：目标路径存在不属于无线麦SayAll.app的应用 $APP_DESTINATION" \
+      "Installation stopped: an app not owned by SayAll exists at $APP_DESTINATION." >&2
+    installer_message \
+      "为避免覆盖其他软件，安装器已停止。" \
+      "To avoid overwriting other software, the installer has stopped." >&2
+    exit 2
+  fi
+  INSTALLED_BUILD="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$APP_PLIST" 2>/dev/null || true)"
+  if [[ "$INSTALLED_BUILD" == <-> && "$INSTALLED_BUILD" -gt "$PACKAGE_BUILD" ]]; then
+    installer_message \
+      "未安装：当前 SayAll 的构建号 $INSTALLED_BUILD 高于此测试包的构建号 $PACKAGE_BUILD。" \
+      "Installation stopped: the installed SayAll build $INSTALLED_BUILD is newer than this test package build $PACKAGE_BUILD." >&2
+    installer_message \
+      "现有应用已完整保留。请改用更新的安装包。" \
+      "The existing app was left intact. Use a newer installer." >&2
+    exit 2
+  fi
+  installer_message \
+    "检测到已有 SayAll.app；安装器会以原子方式更新它。" \
+    "An existing SayAll.app was found and will be updated atomically."
+  OWNED_APP_FOUND=1
+fi
+
+check_legacy_app() {
+  local legacy_path="$1"
+  local legacy_plist="$2"
+  local legacy_label="$3"
+  if [[ ! -e "$legacy_path" && ! -L "$legacy_path" ]]; then
+    return
+  fi
+  if [[ -f "$legacy_plist" ]] && \
+     [[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw -o - "$legacy_plist" 2>/dev/null || true)" == "com.hd838a.RemoteMic" ]]; then
+    local installed_build
+    installed_build="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$legacy_plist" 2>/dev/null || true)"
+    if [[ "$installed_build" == <-> && "$installed_build" -gt "$PACKAGE_BUILD" ]]; then
+      installer_message \
+        "未安装：旧路径中的 $legacy_label 构建号 $installed_build 高于此测试包的构建号 $PACKAGE_BUILD。" \
+        "Installation stopped: the legacy $legacy_label build $installed_build is newer than this test package build $PACKAGE_BUILD." >&2
+      installer_message \
+        "现有应用已完整保留。请改用更新的安装包。" \
+        "The existing app was left intact. Use a newer installer." >&2
+      exit 2
+    fi
+    installer_message \
+      "检测到旧路径中的 $legacy_label；成功安装 SayAll.app 后再安全迁移。" \
+      "The legacy $legacy_label was found and will be migrated only after SayAll.app is installed successfully."
+    OWNED_APP_FOUND=1
+  else
+    installer_message \
+      "旧路径中的 $legacy_label 不属于无线麦SayAll.app，安装器将保留它不作处理。" \
+      "The legacy $legacy_label path does not belong to SayAll and will be left untouched."
+  fi
+}
+
+check_legacy_app \
+  "$LEGACY_REMOTE_MIC_APP_DESTINATION" \
+  "$LEGACY_REMOTE_MIC_APP_PLIST" \
+  "Remote Mic.app"
+check_legacy_app \
+  "$LEGACY_CHINESE_APP_DESTINATION" \
+  "$LEGACY_CHINESE_APP_PLIST" \
+  "无线麦.app"
+
+# Decide before pkgbuild writes the new App or receipt. Pending selection lives
+# beside the extracted scripts, never in a payload path replaced by Installer.
+prepare_driver_naming_directory "$TARGET_VOLUME" || { driver_naming_failure unsafe_state_directory; exit 2; }
+check_driver_naming_duplicates "$TARGET_VOLUME" "$DESTINATION" || { driver_naming_failure duplicate_driver; exit 2; }
+RECORDED_NAMING="$(driver_naming_record)" || { driver_naming_failure invalid_state; exit 2; }
+INSTALLED_NAMING=none
+INSTALLED_HEALTH=none
+if [[ -e "$DESTINATION" || -L "$DESTINATION" ]]; then
+  driver_naming_identity "$DESTINATION" || { driver_naming_failure unknown_identity; exit 2; }
+  INSTALLED_NAMING="$(driver_naming_observed_variant "$DESTINATION" || print unknown)"
+  if [[ ! -x "$DESTINATION/Contents/MacOS/MiRemoteV2ch" ]]; then
+    INSTALLED_HEALTH=not_executable
+  elif /usr/bin/codesign --verify --deep --strict "$DESTINATION" >/dev/null 2>&1; then
+    INSTALLED_HEALTH=signature_verified
+  else
+    INSTALLED_HEALTH=signature_invalid
+  fi
+fi
+HISTORICAL_INSTALL=no
+if [[ "$INSTALLED_NAMING" != none ]] || has_driver_naming_history "$TARGET_VOLUME"; then HISTORICAL_INSTALL=yes; fi
+print "DRIVER_NAMING phase=observed result=ready installed=$INSTALLED_NAMING health=$INSTALLED_HEALTH recorded=$RECORDED_NAMING history=$HISTORICAL_INSTALL"
+SELECTED_NAMING="$(resolve_driver_naming "$INSTALLED_NAMING" "$RECORDED_NAMING" "$HISTORICAL_INSTALL")" || {
+  driver_naming_failure conflicting_evidence; exit 2
+}
+NAMING_SELECTION="$SCRIPT_DIR/driver-naming-selection.plist"
+[[ ! -e "$NAMING_SELECTION" && ! -L "$NAMING_SELECTION" ]] || { driver_naming_failure stale_selection; exit 2; }
+(umask 077; set -o noclobber; print -r -- '<?xml version="1.0"?><plist version="1.0"><dict/></plist>' > "$NAMING_SELECTION")
+/usr/bin/plutil -insert Variant -string "$SELECTED_NAMING" "$NAMING_SELECTION"
+/usr/bin/plutil -insert PackageBuild -string "$PACKAGE_BUILD" "$NAMING_SELECTION"
+# Preserve this decision before Installer writes the App/receipt. If payload
+# deployment fails or is cancelled, a retry must not treat its residue as a
+# historical legacy installation. This records a choice, not a loaded driver.
+commit_driver_naming_record "$SELECTED_NAMING" || { driver_naming_failure state_commit_failed; exit 2; }
+print "DRIVER_NAMING phase=selected result=ready variant=$SELECTED_NAMING history=$HISTORICAL_INSTALL record=verified"
+
+if [[ "$OWNED_APP_FOUND" -eq 1 ]]; then
+  /usr/bin/pkill -x RemoteMic 2>/dev/null || true
+  installer_message \
+    "已停止正在运行的无线麦进程，随后更新音频驱动。" \
+    "Stopped the running SayAll/Remote Mic process before updating the audio driver."
+fi

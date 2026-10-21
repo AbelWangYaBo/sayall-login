@@ -1,0 +1,453 @@
+#!/bin/zsh
+set -euo pipefail
+
+ROOT="${0:A:h:h}"
+source "$ROOT/scripts/release-variant.sh"
+PACKAGE="${1:?usage: verify-doubao-driver-pkg.sh PACKAGE install|uninstall}"
+MODE="${2:?usage: verify-doubao-driver-pkg.sh PACKAGE install|uninstall}"
+VERSION="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$ROOT/Resources/Info.plist")"
+BUILD="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$ROOT/Resources/Info.plist")"
+EXPECTED_DEVELOPER_TEAM_ID="${EXPECTED_DEVELOPER_TEAM_ID:-}"
+REQUIRE_DEVELOPER_ID_SIGNING="${REQUIRE_DEVELOPER_ID_SIGNING:-0}"
+REQUIRE_NOTARIZATION="${REQUIRE_NOTARIZATION:-0}"
+WORK_DIR="$(/usr/bin/mktemp -d /private/tmp/remote-mic-driver-package-verify.XXXXXX)"
+EXPANDED="$WORK_DIR/expanded"
+FULL_EXPANDED="$WORK_DIR/full-expanded"
+PAYLOAD_FILES="$WORK_DIR/payload-files"
+INSTALLER_CHOICES="$WORK_DIR/installer-choices.xml"
+INSTALLER_ERROR="$WORK_DIR/installer-error.txt"
+
+cleanup() {
+  local console_user user_home trash_root trash_destination counter=0
+  case "$WORK_DIR" in
+    /private/tmp/remote-mic-driver-package-verify.*) ;;
+    *) print -u2 "refusing to clean unexpected verification path: $WORK_DIR"; return ;;
+  esac
+  [[ -d "$WORK_DIR" ]] || return
+  console_user="$(/usr/bin/stat -f '%Su' /dev/console 2>/dev/null || true)"
+  if [[ -z "$console_user" || "$console_user" == "root" || "$console_user" == "loginwindow" ]]; then
+    print -u2 "verification workspace retained because no desktop Trash is available: $WORK_DIR"
+    return
+  fi
+  user_home="$(/usr/bin/dscl . -read "/Users/$console_user" NFSHomeDirectory \
+    2>/dev/null | /usr/bin/sed -n 's/^NFSHomeDirectory: //p')"
+  if [[ "$user_home" != /* || "$user_home" == "/" || "$user_home" == *'/../'* || \
+        "$user_home" == *'/..' ]]; then
+    print -u2 "verification workspace retained because the desktop Trash path is invalid: $WORK_DIR"
+    return
+  fi
+  trash_root="$user_home/.Trash"
+  [[ -d "$trash_root" ]] || {
+    print -u2 "verification workspace retained because Trash is unavailable: $WORK_DIR"
+    return
+  }
+  trash_destination="$trash_root/${WORK_DIR:t}"
+  while [[ -e "$trash_destination" || -L "$trash_destination" ]]; do
+    counter=$((counter + 1))
+    trash_destination="$trash_root/${WORK_DIR:t}-$counter"
+  done
+  if /bin/mv -n -- "$WORK_DIR" "$trash_destination"; then
+    print "Verification workspace moved to Trash: $trash_destination"
+  else
+    print -u2 "verification workspace retained after Trash move failed: $WORK_DIR"
+  fi
+}
+trap cleanup EXIT
+
+case "$REQUIRE_DEVELOPER_ID_SIGNING" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_DEVELOPER_ID_SIGNING must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_NOTARIZATION" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_NOTARIZATION must be 0 or 1"; exit 1 ;;
+esac
+if [[ "$REQUIRE_DEVELOPER_ID_SIGNING" == "1" && -z "$EXPECTED_DEVELOPER_TEAM_ID" ]]; then
+  print -u2 "EXPECTED_DEVELOPER_TEAM_ID is required for Developer ID verification"
+  exit 1
+fi
+if [[ "$REQUIRE_NOTARIZATION" == "1" && "$REQUIRE_DEVELOPER_ID_SIGNING" != "1" ]]; then
+  print -u2 "notarization verification requires Developer ID verification"
+  exit 1
+fi
+
+test -f "$PACKAGE"
+/usr/sbin/pkgutil --expand "$PACKAGE" "$EXPANDED"
+PACKAGE_INFO="$EXPANDED/PackageInfo"
+SCRIPTS_DIR="$EXPANDED/Scripts"
+COMPONENT_PACKAGE=""
+SIRI_REMOTE_COMPONENT_PACKAGE=""
+
+case "$MODE" in
+  install)
+    DISTRIBUTION="$EXPANDED/Distribution"
+    COMPONENT_PACKAGE="$EXPANDED/RemoteMicComponent.pkg"
+    SIRI_REMOTE_COMPONENT_PACKAGE="$EXPANDED/SiriRemoteComponent.pkg"
+    test -f "$DISTRIBUTION"
+    test -d "$COMPONENT_PACKAGE"
+    test -d "$SIRI_REMOTE_COMPONENT_PACKAGE"
+    COMPONENT_SIGNATURE_DETAILS="$(/usr/sbin/pkgutil --check-signature \
+      "$COMPONENT_PACKAGE" 2>&1 || true)"
+    print -r -- "$COMPONENT_SIGNATURE_DETAILS" | \
+      /usr/bin/grep -Fq 'Status: no signature'
+    SIRI_REMOTE_COMPONENT_SIGNATURE_DETAILS="$(/usr/sbin/pkgutil --check-signature \
+      "$SIRI_REMOTE_COMPONENT_PACKAGE" 2>&1 || true)"
+    print -r -- "$SIRI_REMOTE_COMPONENT_SIGNATURE_DETAILS" | \
+      /usr/bin/grep -Fq 'Status: no signature'
+    test -f "$EXPANDED/Resources/en.lproj/Localizable.strings"
+    test -f "$EXPANDED/Resources/zh-Hans.lproj/Localizable.strings"
+    /usr/bin/xmllint --noout "$DISTRIBUTION"
+    /usr/bin/plutil -lint "$EXPANDED/Resources/en.lproj/Localizable.strings"
+    /usr/bin/plutil -lint "$EXPANDED/Resources/zh-Hans.lproj/Localizable.strings"
+    /usr/bin/grep -Fq 'hostArchitectures="arm64,x86_64"' "$DISTRIBUTION"
+    /usr/bin/grep -Fq "system.sysctl('hw.optional.arm64')" "$DISTRIBUTION"
+    /usr/bin/grep -Fq "my.result.type = 'Fatal'" "$DISTRIBUTION"
+    /usr/bin/grep -Fq 'my.result.message = system.localizedString' "$DISTRIBUTION"
+    /usr/bin/grep -Fq '<installation-check script="installationCheck()"/>' "$DISTRIBUTION"
+    /usr/bin/grep -Fq 'RemoteMicComponent.pkg</pkg-ref>' "$DISTRIBUTION"
+    /usr/bin/grep -Fq 'SiriRemoteComponent.pkg</pkg-ref>' "$DISTRIBUTION"
+    /usr/bin/grep -Fq '<options customize="always"' "$DISTRIBUTION"
+    /usr/bin/grep -Fq 'id="siri-remote"' "$DISTRIBUTION"
+    /usr/bin/grep -Fq 'function siriRemoteSupportWasPreviouslyInstalled()' "$DISTRIBUTION"
+    /usr/bin/grep -Fq "my.target.receiptForIdentifier('com.hd838a.RemoteMic.siri-remote')" "$DISTRIBUTION"
+    if /usr/bin/grep -Eq 'system\.files\.|allow-external-scripts="true"' "$DISTRIBUTION"; then
+      print -u2 "Siri Remote detection must use Installer receipts without external-script access"
+      exit 1
+    fi
+    /usr/bin/grep -Fq 'start_selected="siriRemoteSupportWasPreviouslyInstalled()"' "$DISTRIBUTION"
+    case "$RELEASE_VARIANT" in
+      apple-silicon)
+        WRONG_ARCHITECTURE_KEY="wrong_architecture_apple_silicon"
+        UNSUPPORTED_SYSTEM_KEY="unsupported_system_apple_silicon"
+        ALTERNATE_PACKAGE_LABEL="Intel"
+        ;;
+      intel)
+        WRONG_ARCHITECTURE_KEY="wrong_architecture_intel"
+        UNSUPPORTED_SYSTEM_KEY="unsupported_system_intel"
+        ALTERNATE_PACKAGE_LABEL="Apple Silicon"
+        ;;
+    esac
+    for localization in en.lproj zh-Hans.lproj; do
+      LOCALIZABLE="$EXPANDED/Resources/$localization/Localizable.strings"
+      /usr/bin/grep -Fq "\"$WRONG_ARCHITECTURE_KEY\"" "$LOCALIZABLE"
+      /usr/bin/grep -Fq "\"$UNSUPPORTED_SYSTEM_KEY\"" "$LOCALIZABLE"
+      /usr/bin/grep -Fq "$ALTERNATE_PACKAGE_LABEL" "$LOCALIZABLE"
+    done
+    /usr/bin/grep -Fq "system.localizedString('$WRONG_ARCHITECTURE_KEY')" "$DISTRIBUTION"
+    /usr/bin/grep -Fq "system.localizedString('$UNSUPPORTED_SYSTEM_KEY')" "$DISTRIBUTION"
+
+    if [[ "$(/usr/sbin/sysctl -in hw.optional.arm64 2>/dev/null || print 0)" == "1" ]]; then
+      CURRENT_HARDWARE_ARCHITECTURE="arm64"
+    else
+      CURRENT_HARDWARE_ARCHITECTURE="x86_64"
+    fi
+    CURRENT_SYSTEM_MAJOR="$(/usr/bin/sw_vers -productVersion | /usr/bin/cut -d. -f1)"
+    if [[ "$CURRENT_HARDWARE_ARCHITECTURE" != "$RELEASE_ARCH" ]]; then
+      if /usr/sbin/installer -showChoicesXML -pkg "$PACKAGE" -target / \
+          > "$INSTALLER_CHOICES" 2> "$INSTALLER_ERROR"; then
+        print -u2 "wrong-architecture product package unexpectedly passed Installer evaluation"
+        exit 1
+      fi
+      /usr/bin/grep -Fq "$ALTERNATE_PACKAGE_LABEL" "$INSTALLER_ERROR"
+    elif [[ "$CURRENT_SYSTEM_MAJOR" -ge "$RELEASE_MIN_SYSTEM_MAJOR" ]]; then
+      /usr/sbin/installer -showChoicesXML -pkg "$PACKAGE" -target / \
+        > "$INSTALLER_CHOICES" 2> "$INSTALLER_ERROR"
+      /usr/bin/grep -Fq '<string>remote-mic</string>' "$INSTALLER_CHOICES"
+      EXPECTED_SIRI_REMOTE_SELECTION=0
+      if /usr/sbin/pkgutil --volume / --pkg-info com.hd838a.RemoteMic.siri-remote >/dev/null 2>&1; then
+        EXPECTED_SIRI_REMOTE_SELECTION=1
+      fi
+      test "$(/usr/bin/plutil -extract 0.childItems.1.choiceIdentifier raw -o - \
+        "$INSTALLER_CHOICES")" = "siri-remote"
+      test "$(/usr/bin/plutil -extract 0.childItems.1.choiceIsSelected raw -o - \
+        "$INSTALLER_CHOICES")" = "$EXPECTED_SIRI_REMOTE_SELECTION"
+    else
+      if /usr/sbin/installer -showChoicesXML -pkg "$PACKAGE" -target / \
+          > "$INSTALLER_CHOICES" 2> "$INSTALLER_ERROR"; then
+        print -u2 "unsupported-system product package unexpectedly passed Installer evaluation"
+        exit 1
+      fi
+      /usr/bin/grep -Fq "macOS $RELEASE_MIN_SYSTEM_MAJOR" "$INSTALLER_ERROR"
+    fi
+
+    PACKAGE_INFO="$COMPONENT_PACKAGE/PackageInfo"
+    SCRIPTS_DIR="$COMPONENT_PACKAGE/Scripts"
+    test -f "$PACKAGE_INFO"
+    /usr/bin/grep -Fq 'identifier="com.hd838a.RemoteMic.installer"' "$PACKAGE_INFO"
+    /usr/bin/grep -Fq '<payload ' "$PACKAGE_INFO"
+    test "$(/usr/bin/xmllint --xpath 'count(/pkg-info/relocate/bundle[@id="com.hd838a.MiRemoteV2ch"])' "$PACKAGE_INFO")" = 0
+    test "$(/usr/bin/xmllint --xpath 'count(/pkg-info/bundle-version/bundle[@id="com.hd838a.MiRemoteV2ch"])' "$PACKAGE_INFO")" = 0
+    /usr/bin/lsbom -s "$COMPONENT_PACKAGE/Bom" > "$PAYLOAD_FILES"
+    if /usr/bin/grep -q '^./Library/Audio/Plug-Ins/HAL/' "$PAYLOAD_FILES"; then
+      print -u2 "Installer payload must stage candidates, never deploy both to HAL"
+      exit 1
+    fi
+    /usr/bin/grep -qx './Applications/SayAll.app/Contents/Info.plist' "$PAYLOAD_FILES"
+    /usr/bin/grep -qx './Applications/SayAll.app/Contents/MacOS/RemoteMic' "$PAYLOAD_FILES"
+    if /usr/bin/grep -Eq '^\./Library/(LaunchDaemons/com\.hd838a\.SayAll\.AppleRemoteHCIService\.plist|PrivilegedHelperTools/com\.hd838a\.SayAll\.AppleRemoteHCIService)$' "$PAYLOAD_FILES"; then
+      print -u2 "base component must not contain Siri Remote system service"
+      exit 1
+    fi
+    /usr/bin/grep -qx './Library/Application Support/RemoteMic/Installer/MiRemoteV2ch.driver/Contents/Info.plist' "$PAYLOAD_FILES"
+    /usr/bin/grep -qx './Library/Application Support/RemoteMic/Installer/MiRemoteV2ch.driver/Contents/MacOS/MiRemoteV2ch' "$PAYLOAD_FILES"
+    test -x "$SCRIPTS_DIR/preinstall"
+    test -x "$SCRIPTS_DIR/postinstall"
+    test -f "$SCRIPTS_DIR/driver-naming.zsh"
+    for naming_script in preinstall postinstall driver-naming.zsh; do
+      /bin/zsh -n "$SCRIPTS_DIR/$naming_script"
+    done
+    /usr/bin/grep -Fq 'resolve_driver_naming' "$SCRIPTS_DIR/preinstall"
+    /usr/bin/grep -Fq 'commit_driver_naming_record' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq 'check_driver_naming_duplicates' "$SCRIPTS_DIR/preinstall"
+    /usr/bin/grep -qx './Library/Application Support/RemoteMic/Installer/legacy/MiRemoteV2ch.driver/Contents/Info.plist' "$PAYLOAD_FILES"
+    /usr/bin/grep -qx './Library/Application Support/RemoteMic/Installer/legacy/MiRemoteV2ch.driver/Contents/MacOS/MiRemoteV2ch' "$PAYLOAD_FILES"
+    test -f "$SCRIPTS_DIR/trash-legacy-app.zsh"
+    test -f "$SCRIPTS_DIR/release-variant.plist"
+    test "$(/usr/bin/plutil -extract ExpectedArchitecture raw -o - \
+      "$SCRIPTS_DIR/release-variant.plist")" = "$RELEASE_ARCH"
+    test "$(/usr/bin/plutil -extract MinimumSystemMajor raw -o - \
+      "$SCRIPTS_DIR/release-variant.plist")" = "$RELEASE_MIN_SYSTEM_MAJOR"
+    test "$(/usr/bin/plutil -extract MinimumSystemVersion raw -o - \
+      "$SCRIPTS_DIR/release-variant.plist")" = "$RELEASE_MIN_SYSTEM_VERSION"
+    test "$(/usr/bin/plutil -extract PackageBuild raw -o - \
+      "$SCRIPTS_DIR/release-variant.plist")" = "$BUILD"
+    /usr/bin/grep -Fqx 'DESTINATION="${TARGET_VOLUME%/}/Library/Audio/Plug-Ins/HAL/MiRemoteV2ch.driver"' "$SCRIPTS_DIR/preinstall"
+    /usr/bin/grep -Fqx 'APP_DESTINATION="${TARGET_VOLUME%/}/Applications/SayAll.app"' "$SCRIPTS_DIR/preinstall"
+    if /usr/bin/grep -Fq '/bin/rm -rf -- "$APP_DESTINATION"' "$SCRIPTS_DIR/preinstall"; then
+      print -u2 "preinstall must not delete an existing SayAll.app"
+      exit 1
+    fi
+    if /usr/bin/grep -Fq '/bin/rm -rf -- "$legacy_path"' "$SCRIPTS_DIR/preinstall"; then
+      print -u2 "preinstall must not delete a legacy app before SayAll.app is verified"
+      exit 1
+    fi
+    /usr/bin/grep -Fq 'will be updated atomically' "$SCRIPTS_DIR/preinstall"
+    /usr/bin/grep -Fq 'INSTALLED_BUILD=' "$SCRIPTS_DIR/preinstall"
+    /usr/bin/grep -Fq 'The existing app was left intact. Use a newer installer.' \
+      "$SCRIPTS_DIR/preinstall"
+    /usr/bin/grep -Fqx 'LEGACY_REMOTE_MIC_APP_DESTINATION="${TARGET_VOLUME%/}/Applications/Remote Mic.app"' "$SCRIPTS_DIR/preinstall"
+    /usr/bin/grep -Fqx 'LEGACY_CHINESE_APP_DESTINATION="${TARGET_VOLUME%/}/Applications/无线麦.app"' "$SCRIPTS_DIR/preinstall"
+    /usr/bin/grep -Fq 'check_legacy_app' "$SCRIPTS_DIR/preinstall"
+    /usr/bin/grep -Fq 'OWNED_APP_FOUND=1' "$SCRIPTS_DIR/preinstall"
+    /usr/bin/grep -Fq '/usr/bin/pkill -x RemoteMic' "$SCRIPTS_DIR/preinstall"
+    /usr/bin/grep -Fq 'before updating the audio driver' "$SCRIPTS_DIR/preinstall"
+    /usr/bin/grep -Fq 'driver_is_healthy_and_current()' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq '/usr/bin/file -b "$1"' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq 'The existing $DRIVER_DISPLAY_NAME is healthy and was kept in place.' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq '/usr/bin/codesign --verify --deep --strict "$DESTINATION"' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq 'DRIVER_BACKUP=' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq 'restore_previous_driver' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq '/bin/mv -n -- "$DESTINATION" "$DRIVER_BACKUP"' \
+      "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq 'DRIVER_BACKUP_TRASH_ROOT="${TARGET_VOLUME%/}/var/root/.Trash"' \
+      "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq 'STAGED_DRIVER_TRASH_ROOT="${TARGET_VOLUME%/}/var/root/.Trash"' \
+      "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq '/bin/mv -n -- "$STAGING_ROOT" "$STAGED_DRIVER_TRASH_DESTINATION"' \
+      "$SCRIPTS_DIR/postinstall"
+    if /usr/bin/grep -Fq '/bin/rm -rf -- "$DESTINATION"' "$SCRIPTS_DIR/postinstall"; then
+      print -u2 "installer must preserve the previous driver for rollback"
+      exit 1
+    fi
+    /usr/bin/grep -Fqx 'APP_DESTINATION="${TARGET_VOLUME%/}/Applications/SayAll.app"' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fqx 'LEGACY_REMOTE_MIC_APP_DESTINATION="${TARGET_VOLUME%/}/Applications/Remote Mic.app"' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fqx 'LEGACY_CHINESE_APP_DESTINATION="${TARGET_VOLUME%/}/Applications/无线麦.app"' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq 'move_legacy_app_to_trash_if_owned' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq 'LEGACY_APP_TRASH_ROOT' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq '/bin/mv -n -- "$legacy_path" "$trash_destination"' \
+      "$SCRIPTS_DIR/trash-legacy-app.zsh"
+    /usr/bin/grep -Fq 'where it can be restored if needed' \
+      "$SCRIPTS_DIR/trash-legacy-app.zsh"
+    if /usr/bin/grep -Fq '/bin/rm' "$SCRIPTS_DIR/trash-legacy-app.zsh"; then
+      print -u2 "legacy app migration helper must never permanently delete an app"
+      exit 1
+    fi
+    for sparkle_executable in \
+      '$SPARKLE_VERSION_DIR/Sparkle' \
+      '$SPARKLE_VERSION_DIR/Autoupdate' \
+      '$SPARKLE_VERSION_DIR/Updater.app/Contents/MacOS/Updater' \
+      '$SPARKLE_VERSION_DIR/XPCServices/Installer.xpc/Contents/MacOS/Installer' \
+      '$SPARKLE_VERSION_DIR/XPCServices/Downloader.xpc/Contents/MacOS/Downloader'; do
+      /usr/bin/grep -Fq "$sparkle_executable" "$SCRIPTS_DIR/postinstall"
+    done
+    for bundled_helper in \
+      '$APP_DESTINATION/Contents/Helpers/SayAllMCP' \
+      '$APP_DESTINATION/Contents/Helpers/SayAllAppleRemoteAudioCapture' \
+      '$APP_DESTINATION/Contents/Helpers/SayAllAppleRemoteHCIService'; do
+      /usr/bin/grep -Fq "$bundled_helper" "$SCRIPTS_DIR/postinstall"
+    done
+    /usr/bin/grep -Fqx 'for app_executable in "${APP_EXECUTABLES[@]}"; do' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fqx '  /bin/chmod 755 "$app_executable"' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fqx '  test -x "$app_executable"' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fqx '/usr/bin/codesign --verify --deep --strict "$APP_DESTINATION"' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq '/usr/sbin/sysctl -in hw.optional.arm64' "$SCRIPTS_DIR/preinstall"
+    /usr/bin/grep -Fq '/usr/sbin/sysctl -in hw.optional.arm64' "$SCRIPTS_DIR/postinstall"
+    if /usr/bin/grep -Fq '/usr/bin/uname -m' "$SCRIPTS_DIR/preinstall" "$SCRIPTS_DIR/postinstall"; then
+      print -u2 "package scripts must inspect hardware architecture without uname"
+      exit 1
+    fi
+    /usr/bin/grep -Fq 'if [[ "$CURRENT_ARCHITECTURE" != "$EXPECTED_ARCHITECTURE" ]]; then' \
+      "$SCRIPTS_DIR/preinstall"
+    /usr/bin/grep -Fq 'if [[ "$CURRENT_ARCHITECTURE" != "$EXPECTED_ARCHITECTURE" ]]; then' \
+      "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fqx 'if [[ "$DRIVER_CHANGED" -eq 1 ]]; then' "$SCRIPTS_DIR/postinstall"
+    # The audio-service restart must exist, and must be guarded so a missing or
+    # unresponsive coreaudiod cannot abort the installer after the driver was
+    # already written to disk.
+    /usr/bin/grep -Fq '/usr/bin/pgrep -qx coreaudiod' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq 'elif /usr/bin/killall coreaudiod; then' "$SCRIPTS_DIR/postinstall"
+    if /usr/bin/grep -Eq '^[[:space:]]*/usr/bin/killall coreaudiod[[:space:]]*$' \
+      "$SCRIPTS_DIR/postinstall"; then
+      print -u2 "postinstall must not call killall unguarded"
+      exit 1
+    fi
+    /usr/bin/grep -Fq '/bin/launchctl asuser "$CONSOLE_UID"' "$SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq '/usr/bin/sudo -u "$CONSOLE_USER" /usr/bin/open "$APP_DESTINATION"' "$SCRIPTS_DIR/postinstall"
+    SIRI_PACKAGE_INFO="$SIRI_REMOTE_COMPONENT_PACKAGE/PackageInfo"
+    SIRI_SCRIPTS_DIR="$SIRI_REMOTE_COMPONENT_PACKAGE/Scripts"
+    SIRI_PAYLOAD_FILES="$WORK_DIR/siri-payload-files"
+    test -f "$SIRI_PACKAGE_INFO"
+    /usr/bin/grep -Fq 'identifier="com.hd838a.RemoteMic.siri-remote"' "$SIRI_PACKAGE_INFO"
+    /usr/bin/grep -Fq '<payload ' "$SIRI_PACKAGE_INFO"
+    /usr/bin/lsbom -s "$SIRI_REMOTE_COMPONENT_PACKAGE/Bom" > "$SIRI_PAYLOAD_FILES"
+    /usr/bin/grep -qx './Library/LaunchDaemons/com.hd838a.SayAll.AppleRemoteHCIService.plist' "$SIRI_PAYLOAD_FILES"
+    /usr/bin/grep -qx './Library/PrivilegedHelperTools/com.hd838a.SayAll.AppleRemoteHCIService' "$SIRI_PAYLOAD_FILES"
+    test -x "$SIRI_SCRIPTS_DIR/preinstall"
+    test -x "$SIRI_SCRIPTS_DIR/postinstall"
+    test -f "$SIRI_SCRIPTS_DIR/release-variant.plist"
+    /bin/zsh -n "$SIRI_SCRIPTS_DIR/preinstall" "$SIRI_SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq 'launchctl bootstrap system' "$SIRI_SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq 'launchctl bootout' "$SIRI_SCRIPTS_DIR/preinstall" "$SIRI_SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq -- '--restore' "$SIRI_SCRIPTS_DIR/preinstall" "$SIRI_SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq 'com.hd838a.SayAll.AppleRemoteHCIService' "$SIRI_SCRIPTS_DIR/preinstall" "$SIRI_SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq '/usr/bin/codesign --verify --strict "$HCI_SERVICE_DESTINATION"' "$SIRI_SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq 'PlistBuddy -c "Print :MachServices:$HCI_SERVICE_LABEL"' "$SIRI_SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq 'plutil -extract ProgramArguments.0 raw' "$SIRI_SCRIPTS_DIR/postinstall"
+    /usr/bin/grep -Fq '/usr/sbin/sysctl -in hw.optional.arm64' "$SIRI_SCRIPTS_DIR/preinstall" "$SIRI_SCRIPTS_DIR/postinstall"
+    /usr/sbin/pkgutil --expand-full "$PACKAGE" "$FULL_EXPANDED"
+    PAYLOAD_APP="$(/usr/bin/find "$FULL_EXPANDED" -type d -path '*/Applications/SayAll.app' -print -quit)"
+    PAYLOAD_DRIVER="$(/usr/bin/find "$FULL_EXPANDED" -type d -path '*/Library/Application Support/RemoteMic/Installer/MiRemoteV2ch.driver' -print -quit)"
+    PAYLOAD_LEGACY_DRIVER="$(/usr/bin/find "$FULL_EXPANDED" -type d -path '*/Library/Application Support/RemoteMic/Installer/legacy/MiRemoteV2ch.driver' -print -quit)"
+    "$ROOT/scripts/verify-doubao-driver.sh" "$PAYLOAD_DRIVER" brand
+    "$ROOT/scripts/verify-doubao-driver.sh" "$PAYLOAD_LEGACY_DRIVER" legacy
+    PAYLOAD_HCI_SERVICE="$(/usr/bin/find "$FULL_EXPANDED" -type f -path '*/Library/PrivilegedHelperTools/com.hd838a.SayAll.AppleRemoteHCIService' -print -quit)"
+    PAYLOAD_HCI_PLIST="$(/usr/bin/find "$FULL_EXPANDED" -type f -path '*/Library/LaunchDaemons/com.hd838a.SayAll.AppleRemoteHCIService.plist' -print -quit)"
+    test -n "$PAYLOAD_APP"
+    test -n "$PAYLOAD_DRIVER"
+    test -n "$PAYLOAD_HCI_SERVICE"
+    test -n "$PAYLOAD_HCI_PLIST"
+    test "$(/usr/bin/lipo -archs "$PAYLOAD_APP/Contents/MacOS/RemoteMic")" = "$RELEASE_ARCH"
+    test "$(/usr/bin/lipo -archs "$PAYLOAD_DRIVER/Contents/MacOS/MiRemoteV2ch")" = "$RELEASE_ARCH"
+    test "$(/usr/bin/lipo -archs "$PAYLOAD_HCI_SERVICE")" = "$RELEASE_ARCH"
+    /usr/bin/codesign --verify --strict "$PAYLOAD_HCI_SERVICE"
+    test "$(/usr/bin/codesign -dvv "$PAYLOAD_HCI_SERVICE" 2>&1 | \
+      /usr/bin/sed -n 's/^Identifier=//p')" = "com.hd838a.SayAll.AppleRemoteHCIService"
+    test "$(/usr/bin/plutil -extract Label raw -o - "$PAYLOAD_HCI_PLIST")" = \
+      "com.hd838a.SayAll.AppleRemoteHCIService"
+    test "$(/usr/libexec/PlistBuddy -c \
+      'Print :MachServices:com.hd838a.SayAll.AppleRemoteHCIService' \
+      "$PAYLOAD_HCI_PLIST")" = "true"
+    test "$(/usr/bin/plutil -extract ProgramArguments.0 raw -o - "$PAYLOAD_HCI_PLIST")" = \
+      "/Library/PrivilegedHelperTools/com.hd838a.SayAll.AppleRemoteHCIService"
+    test "$(/usr/bin/plutil -extract ProgramArguments raw -o - "$PAYLOAD_HCI_PLIST" | \
+      /usr/bin/plutil -convert xml1 -o - -- - | /usr/bin/grep -c '<string>')" = "1"
+    HCI_MINIMUM_SYSTEM="$(/usr/bin/otool -l "$PAYLOAD_HCI_SERVICE" | \
+      /usr/bin/awk '/LC_BUILD_VERSION/{seen=1; next} seen && /minos/{print $2; exit}')"
+    autoload -Uz is-at-least
+    if [[ -z "$HCI_MINIMUM_SYSTEM" ]] || \
+       ! is-at-least "$HCI_MINIMUM_SYSTEM" "$RELEASE_MIN_SYSTEM_VERSION"; then
+      print -u2 "packaged Apple Remote HCI service requires a newer macOS than the app release floor"
+      exit 1
+    fi
+    test "$(/usr/bin/plutil -extract LSMinimumSystemVersion raw -o - \
+      "$PAYLOAD_APP/Contents/Info.plist")" = "$RELEASE_MIN_SYSTEM_VERSION"
+    test "$(/usr/bin/plutil -extract SUFeedURL raw -o - \
+      "$PAYLOAD_APP/Contents/Info.plist")" = "$RELEASE_FEED_URL"
+    test "$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - \
+      "$PAYLOAD_APP/Contents/Info.plist")" = "$VERSION"
+    test "$(/usr/bin/plutil -extract CFBundleVersion raw -o - \
+      "$PAYLOAD_APP/Contents/Info.plist")" = "$BUILD"
+    test "$(/usr/bin/plutil -extract CFBundleName raw -o - \
+      "$PAYLOAD_APP/Contents/Info.plist")" = "SayAll"
+    /usr/bin/grep -Fq '"CFBundleName" = "SayAll";' \
+      "$PAYLOAD_APP/Contents/Resources/en.lproj/InfoPlist.strings"
+    /usr/bin/grep -Fq '"CFBundleName" = "无线麦 SayAll";' \
+      "$PAYLOAD_APP/Contents/Resources/zh-Hans.lproj/InfoPlist.strings"
+    ;;
+  uninstall)
+    test -f "$PACKAGE_INFO"
+    /usr/bin/grep -Fq 'identifier="com.hd838a.MiRemoteV2ch.uninstaller"' "$PACKAGE_INFO"
+    if /usr/bin/grep -Fq '<payload ' "$PACKAGE_INFO"; then
+      print -u2 "uninstall package unexpectedly contains a payload declaration"
+      exit 1
+    fi
+    test -x "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fqx 'DRIVER_DESTINATION="${TARGET_VOLUME%/}/Library/Audio/Plug-Ins/HAL/MiRemoteV2ch.driver"' \
+      "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq '"${TARGET_VOLUME%/}/Applications/SayAll.app"' \
+      "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq '"${TARGET_VOLUME%/}/Applications/Remote Mic.app"' \
+      "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq '"${TARGET_VOLUME%/}/Applications/无线麦.app"' \
+      "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq 'queue_owned_app' "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq 'queue_owned_driver' "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq 'queue_owned_hci_service' "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq 'HCI_SERVICE_STATE=' "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq 'HCI_SERVICE_LABEL="com.hd838a.SayAll.AppleRemoteHCIService"' \
+      "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq '/bin/launchctl bootout "system/$HCI_SERVICE_LABEL"' \
+      "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq '"$HCI_SERVICE_DESTINATION" --restore' \
+      "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq 'HCI_SERVICE_OWNED=0' "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq 'if [[ "$HCI_SERVICE_OWNED" -eq 1 ]]; then' \
+      "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq 'prepare_trash_root' "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq 'rollback_moved_items' "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq 'hci_state' "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq '/bin/mv -n -- "${ITEM_SOURCES[$index]}" "${ITEM_DESTINATIONS[$index]}"' \
+      "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq 'BlackHole and local settings were not changed.' \
+      "$EXPANDED/Scripts/postinstall"
+    # Same guard as the installer: the audio-service restart after the driver
+    # was moved to Trash must never abort the uninstaller.
+    /usr/bin/grep -Fq '/usr/bin/pgrep -qx coreaudiod' "$EXPANDED/Scripts/postinstall"
+    /usr/bin/grep -Fq 'elif /usr/bin/killall coreaudiod; then' "$EXPANDED/Scripts/postinstall"
+    if /usr/bin/grep -Eq '^[[:space:]]*/usr/bin/killall coreaudiod[[:space:]]*$' \
+      "$EXPANDED/Scripts/postinstall"; then
+      print -u2 "uninstall postinstall must not call killall unguarded"
+      exit 1
+    fi
+    if /usr/bin/grep -Eq '(/bin/)?rm([[:space:]]|$)|unlink|find[[:space:]].*-delete' \
+        "$EXPANDED/Scripts/postinstall"; then
+      print -u2 "uninstaller must move recognized items to Trash instead of permanently deleting them"
+      exit 1
+    fi
+    ;;
+  *)
+    print -u2 "unknown package mode: $MODE"
+    exit 1
+    ;;
+esac
+
+/usr/bin/grep -Fq "version=\"$VERSION\"" "$PACKAGE_INFO"
+if [[ -d "$SCRIPTS_DIR" ]] && \
+   rg -n --pcre2 \
+     '(?<![[:alnum:]_.-])(?:/usr/bin/)?(?:lipo|vtool|xcrun|xcode-select|xcodebuild|swift|swiftc|clang)(?![[:alnum:]_.-])' \
+     "$SCRIPTS_DIR"; then
+  print -u2 "package scripts must not require Xcode or Command Line Tools"
+  exit 1
+fi
+if [[ "$REQUIRE_DEVELOPER_ID_SIGNING" == "1" ]]; then
+  # The deployable outer product archive is the Installer trust boundary.
+  SIGNATURE_DETAILS="$(/usr/sbin/pkgutil --check-signature "$PACKAGE" 2>&1)"
+  print -r -- "$SIGNATURE_DETAILS" | rg -q 'Status: signed by a developer certificate issued by Apple for distribution'
+  print -r -- "$SIGNATURE_DETAILS" | rg -q "Developer ID Installer: .*\\($EXPECTED_DEVELOPER_TEAM_ID\\)"
+fi
+if [[ "$REQUIRE_NOTARIZATION" == "1" ]]; then
+  xcrun stapler validate "$PACKAGE"
+  /usr/sbin/spctl -a -vv -t install "$PACKAGE"
+fi
+print "DOUBAO DRIVER PACKAGE VERIFY PASS: $PACKAGE ($MODE)"
+print "RELEASE VARIANT: $RELEASE_VARIANT"

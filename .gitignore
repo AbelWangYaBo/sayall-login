@@ -1,0 +1,40 @@
+.build/
+/.build-*/
+.build-private/
+.build-app-*/
+dist/
+.swiftpm/
+*.xcuserstate
+.DS_Store
+.codex-screenshots/
+.private-dependencies/
+/.worktrees/
+
+# Local credentials, signing identities, and notarization material.
+.env
+.env.*
+*.p12
+*.pfx
+*.p8
+*.key
+*.pem
+*.cer
+*.crt
+*.der
+*.csr
+*.mobileprovision
+*.provisionprofile
+*.keychain*
+*.age
+
+# Local project-control records are not part of the public source release.
+docs/
+/Research/
+/.workbuddy/
+
+# Local promotion copy is kept outside the public source release.
+marketing/
+
+# Mobile Web deployment inventory and infrastructure details stay local.
+/Apps/MobileWeb/.private/
+/Apps/MobileWeb/**/node_modules/

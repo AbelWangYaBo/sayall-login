@@ -1,0 +1,456 @@
+name: macOS Signed Release Staging
+run-name: mac-release ${{ inputs.mode }} ${{ inputs.source_branch }} ${{ inputs.expected_commit }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Protected staging mode
+        required: true
+        default: preview
+        type: choice
+        options:
+          - preview
+          - smoke
+      expected_commit:
+        description: Exact 40-character source commit to package
+        required: true
+        type: string
+      source_branch:
+        description: Exact source branch; main or hotfix/vX.Y.Z
+        required: true
+        default: main
+        type: string
+      include_ai:
+        description: Include the optional AI整理 package
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: mac-release-staging-${{ inputs.mode }}-${{ inputs.expected_commit }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+jobs:
+  validate:
+    name: Validate main-controlled release source
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Validate dispatch identity
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          TRIGGER_COMMIT: ${{ github.sha }}
+          TRIGGER_REF_NAME: ${{ github.ref_name }}
+          TRIGGER_REF_TYPE: ${{ github.ref_type }}
+          TRIGGER_REPOSITORY: ${{ github.repository }}
+          RELEASE_MODE: ${{ inputs.mode }}
+        run: |
+          case "$RELEASE_MODE" in
+            preview|smoke) ;;
+            *) echo "mode must be preview or smoke" >&2; exit 2 ;;
+          esac
+          [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$TRIGGER_REF_TYPE" = branch
+          test "$TRIGGER_REF_NAME" = main
+          test "$TRIGGER_REPOSITORY" = HD838A/remote-mic-app
+          [[ "$SOURCE_BRANCH" == main || "$SOURCE_BRANCH" =~ ^hotfix/v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          remote_main="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          test "$TRIGGER_COMMIT" = "$remote_main"
+
+      - name: Check out exact main release control plane
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Install validation tools
+        run: |
+          missing=()
+          command -v jq >/dev/null || missing+=(jq)
+          command -v rg >/dev/null || missing+=(ripgrep)
+          if (( ${#missing[@]} )); then
+            brew install "${missing[@]}"
+          fi
+
+      - name: Check out exact release source commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.expected_commit }}
+          path: release-source
+          persist-credentials: false
+
+      - name: Verify exact release source checkout
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ROOT: ${{ github.workspace }}/release-source
+          RELEASE_SOURCE_CHECKOUT_MODE: detached
+        run: ./scripts/verify-public-release-source.sh "${{ inputs.source_branch }}" "${{ inputs.expected_commit }}"
+
+      - name: Verify successful source-branch CI
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ROOT: ${{ github.workspace }}/release-source
+          RELEASE_CONTROL_PLANE_DIFF_BIN: ${{ github.workspace }}/scripts/verify-release-control-plane-diff.sh
+          GH_BIN: gh
+        run: ./scripts/verify-release-ready-main-ci.sh "${{ inputs.expected_commit }}" "${{ inputs.source_branch }}"
+
+      - name: Verify release dependency pins
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ROOT: ${{ github.workspace }}/release-source
+          RELEASE_CONTROL_ROOT: ${{ github.workspace }}
+        run: ./scripts/verify-release-dependency-pins.sh
+
+      - name: Verify explicit GitHub token bindings
+        env:
+          REPOSITORY_ROOT: ${{ github.workspace }}
+        run: ./scripts/verify-release-dependency-pins.sh tokens
+
+      - name: Verify release metadata
+        working-directory: release-source
+        run: |
+          version="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - Resources/Info.plist)"
+          build="$(/usr/bin/plutil -extract CFBundleVersion raw -o - Resources/Info.plist)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$build" =~ ^[1-9][0-9]*$ ]]
+          echo "RELEASE_VERSION=$version"
+          echo "RELEASE_BUILD=$build"
+
+  package:
+    name: Sign and notarize Apple Silicon and Intel packages
+    needs: validate
+    if: ${{ success() }}
+    runs-on: macos-15
+    timeout-minutes: 180
+    environment: mac-release
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      EXPECTED_DEVELOPER_TEAM_ID: L3QHLDRPAY
+      PARALLEL_RELEASE_VARIANTS: 1
+      PARALLEL_PACKAGE_NOTARIZATION: 1
+      RELEASE_STAGE_TIMEOUTS: 1
+      SIGNED_RELEASE_TIMEOUT_SECONDS: 1200
+      RELEASE_MODE: ${{ inputs.mode }}
+      INCLUDE_SAYALL_AI: ${{ inputs.include_ai && '1' || '0' }}
+
+    steps:
+      - name: Verify protected dispatch identity before credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          TRIGGER_COMMIT: ${{ github.sha }}
+          TRIGGER_REF_NAME: ${{ github.ref_name }}
+          TRIGGER_REF_TYPE: ${{ github.ref_type }}
+          TRIGGER_REPOSITORY: ${{ github.repository }}
+          RELEASE_MODE_INPUT: ${{ inputs.mode }}
+        run: |
+          case "$RELEASE_MODE_INPUT" in
+            preview|smoke) ;;
+            *) echo "mode must be preview or smoke" >&2; exit 2 ;;
+          esac
+          [[ "$EXPECTED_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          test "$TRIGGER_REF_TYPE" = branch
+          test "$TRIGGER_REF_NAME" = main
+          test "$TRIGGER_REPOSITORY" = HD838A/remote-mic-app
+          [[ "$SOURCE_BRANCH" == main || "$SOURCE_BRANCH" =~ ^hotfix/v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          remote_main="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          test "$TRIGGER_COMMIT" = "$remote_main"
+
+      - name: Check out exact main release control plane
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Preserve trusted release source verifier
+        run: /bin/cp scripts/verify-public-release-source.sh "$RUNNER_TEMP/verify-public-release-source.sh"
+
+      - name: Check out exact release source commit
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.expected_commit }}
+          persist-credentials: false
+
+      - name: Verify checked-out source identity
+        id: release-source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ROOT: ${{ github.workspace }}
+          RELEASE_SOURCE_CHECKOUT_MODE: detached
+        run: |
+          "$RUNNER_TEMP/verify-public-release-source.sh" \
+            "${{ inputs.source_branch }}" "${{ inputs.expected_commit }}"
+
+      - name: Read release metadata
+        id: release-meta
+        run: |
+          version="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - Resources/Info.plist)"
+          build="$(/usr/bin/plutil -extract CFBundleVersion raw -o - Resources/Info.plist)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$build" =~ ^[1-9][0-9]*$ ]]
+          {
+            echo "version=$version"
+            echo "build=$build"
+            echo "tag=v$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Resolve versioned release dependencies
+        id: release-dependencies
+        run: ./scripts/verify-release-dependency-pins.sh resolve github-output
+
+      - name: Install signing tools
+        run: |
+          missing=()
+          command -v age >/dev/null || missing+=(age)
+          command -v fastlane >/dev/null || missing+=(fastlane)
+          command -v rg >/dev/null || missing+=(ripgrep)
+          if (( ${#missing[@]} )); then
+            brew install "${missing[@]}"
+          fi
+
+      - name: Exclude ephemeral release inputs from source status
+        run: |
+          cat >> .git/info/exclude <<'EOF'
+          /.private-dependencies/
+          /.private-release/
+          /.build-*/
+          /dist/
+          EOF
+
+      - name: Check out private feature package
+        if: ${{ inputs.include_ai }}
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ steps.release-dependencies.outputs.sayall_ai_repository }}
+          ref: ${{ steps.release-dependencies.outputs.sayall_ai_version }}
+          path: .private-dependencies/sayall-ai
+          ssh-key: ${{ secrets.SAYALL_AI_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Check out private macOS feature packages
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: ${{ steps.release-dependencies.outputs.sayall_private_platform_repository }}
+          ref: ${{ steps.release-dependencies.outputs.sayall_private_platform_version }}
+          path: .private-dependencies/sayall-private-platform
+          fetch-depth: 0
+          ssh-key: ${{ secrets.SAYALL_PRIVATE_PLATFORM_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Check out readonly release credentials
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: HD838A/remotemic-notary-secrets
+          ref: 5baaeaf56f6cd5fbd0fb0e08c9290077ba8b5b5d
+          path: .private-release/remotemic-notary-secrets
+          ssh-key: ${{ secrets.RELEASE_CREDENTIALS_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Check out readonly Match signing identities
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          repository: HD838A/apple-signing-match
+          ref: 2e271768593821611c54f3d1b376f39e503f53be
+          path: .private-release/apple-signing-match
+          ssh-key: ${{ secrets.APPLE_SIGNING_MATCH_DEPLOY_KEY }}
+          persist-credentials: false
+
+      - name: Verify immutable private dependency checkouts
+        env:
+          SAYALL_AI_VERSION: ${{ steps.release-dependencies.outputs.sayall_ai_version }}
+          SAYALL_PRIVATE_PLATFORM_VERSION: ${{ steps.release-dependencies.outputs.sayall_private_platform_version }}
+        run: |
+          if [[ "$INCLUDE_SAYALL_AI" == 1 ]]; then
+            test "$(git -C .private-dependencies/sayall-ai describe --tags --exact-match)" = "$SAYALL_AI_VERSION"
+          fi
+          test "$(git -C .private-dependencies/sayall-private-platform describe --tags --exact-match)" = "$SAYALL_PRIVATE_PLATFORM_VERSION"
+          python3 scripts/prepare-private-platform.py check-checkout --checkout .private-dependencies/sayall-private-platform
+          test -f .private-dependencies/sayall-private-platform/packages/macos-remote/Package.swift
+          test -f .private-dependencies/sayall-private-platform/packages/audio-input-kit/siri-remote/Package.swift
+          test -f .private-dependencies/sayall-private-platform/packages/audio-input-kit/chromecast/Package.swift
+          test -x .private-dependencies/sayall-private-platform/tools/release/build-private-xcframeworks.sh
+          test "$(git -C .private-release/remotemic-notary-secrets rev-parse HEAD)" = 5baaeaf56f6cd5fbd0fb0e08c9290077ba8b5b5d
+          match_repo="$GITHUB_WORKSPACE/.private-release/apple-signing-match"
+          match_commit=2e271768593821611c54f3d1b376f39e503f53be
+          test "$(git -C "$match_repo" rev-parse HEAD)" = "$match_commit"
+          git -C "$match_repo" update-ref refs/heads/main "$match_commit"
+          test "$(git -C "$match_repo" rev-parse refs/heads/main)" = "$match_commit"
+
+      - name: Build and prepare private feature artifacts
+        env:
+          PRIVATE_ARTIFACT_OUTPUT: ${{ runner.temp }}/sayall-private-xcframeworks
+          PRIVATE_ARTIFACT_PACKAGE: ${{ runner.temp }}/sayall-private-artifact-package
+        run: |
+          private_root="$GITHUB_WORKSPACE/.private-dependencies/sayall-private-platform"
+          "$private_root/tools/release/build-private-xcframeworks.sh" "$PRIVATE_ARTIFACT_OUTPUT"
+          release_directory="$PRIVATE_ARTIFACT_OUTPUT/release"
+          trusted_manifest_sha256="$(shasum -a 256 "$release_directory/SHA256SUMS" | awk '{print $1}')"
+          ./scripts/prepare-private-artifact-package.sh \
+            "$release_directory" \
+            "$PRIVATE_ARTIFACT_PACKAGE" \
+            "$trusted_manifest_sha256"
+          {
+            echo "SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH=$PRIVATE_ARTIFACT_PACKAGE"
+            echo "REQUIRE_SAYALL_PRIVATE_ARTIFACT_PACKAGE=1"
+            echo "REQUIRE_SAYALL_BUTTON_PROFILES=1"
+            echo "REQUIRE_SAYALL_COMBINATION_ACTIONS=1"
+            echo "SAYALL_BUILD_CHANNEL=release"
+          } >> "$GITHUB_ENV"
+
+      - name: Configure private feature package
+        run: |
+          {
+            if [[ "$INCLUDE_SAYALL_AI" == 1 ]]; then
+              echo "SAYALL_AI_PACKAGE_PATH=$GITHUB_WORKSPACE/.private-dependencies/sayall-ai"
+              echo "REQUIRE_SAYALL_AI_PACKAGE=1"
+            else
+              echo "SAYALL_AI_PACKAGE_PATH="
+              echo "REQUIRE_SAYALL_AI_PACKAGE=0"
+            fi
+            echo "SAYALL_SIRI_REMOTE_PACKAGE_PATH=$GITHUB_WORKSPACE/.private-dependencies/sayall-private-platform/packages/audio-input-kit/siri-remote"
+            echo "SAYALL_CHROMECAST_PACKAGE_PATH=$GITHUB_WORKSPACE/.private-dependencies/sayall-private-platform/packages/audio-input-kit/chromecast"
+            echo "SAYALL_MAC_REMOTE_PACKAGE_PATH=$GITHUB_WORKSPACE/.private-dependencies/sayall-private-platform/packages/macos-remote"
+            echo "REQUIRE_SAYALL_CHROMECAST=1"
+            echo "REQUIRE_SAYALL_MAC_REMOTE_PACKAGE=1"
+          } >> "$GITHUB_ENV"
+
+      - name: Validate protected diagnostics configuration
+        env:
+          REMOTE_MIC_SENTRY_DSN: ${{ secrets.REMOTE_MIC_SENTRY_DSN }}
+          SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64: ${{ secrets.SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64 }}
+        run: |
+          test -n "$REMOTE_MIC_SENTRY_DSN"
+          test -n "$SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64"
+          printf '%s' "$SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64" | base64 --decode >/dev/null
+          test "$(printf '%s' "$SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64" | base64 --decode | wc -c | tr -d '[:space:]')" = 32
+
+      - name: Build architecture-specific Siri Remote Opus dependencies
+        timeout-minutes: 5
+        run: |
+          RELEASE_VARIANT=apple-silicon ./scripts/build-apple-remote-opus.sh
+          RELEASE_VARIANT=intel ./scripts/build-apple-remote-opus.sh
+
+      - name: Prepare protected release identity
+        env:
+          RELEASE_AGE_IDENTITY: ${{ secrets.RELEASE_AGE_IDENTITY }}
+        run: |
+          test -n "$RELEASE_AGE_IDENTITY"
+          release_identity="$RUNNER_TEMP/remotemic-release.agekey"
+          umask 077
+          printf '%s' "$RELEASE_AGE_IDENTITY" > "$release_identity"
+          chmod 600 "$release_identity"
+          {
+            echo "AGE_IDENTITY_FILE=$release_identity"
+            echo "RELEASE_CREDENTIALS_REPO=$GITHUB_WORKSPACE/.private-release/remotemic-notary-secrets"
+            echo "MATCH_REPO=$GITHUB_WORKSPACE/.private-release/apple-signing-match"
+          } >> "$GITHUB_ENV"
+
+      - name: Validate active source before signing
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+          SOURCE_BRANCH: ${{ inputs.source_branch }}
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY_ROOT: ${{ github.workspace }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_BIN: gh
+          RELEASE_SOURCE_CHECKOUT_MODE: detached
+          RELEASE_SOURCE_EXPECTED_BASE_TAG: ${{ steps.release-source.outputs.source_base_tag }}
+          RELEASE_SOURCE_EXPECTED_BASE_COMMIT: ${{ steps.release-source.outputs.source_base_commit }}
+        run: |
+          "$RUNNER_TEMP/verify-public-release-source.sh" "$SOURCE_BRANCH" "$EXPECTED_COMMIT"
+          ./scripts/verify-release-dependency-pins.sh
+
+      - name: Sign, notarize, staple, and verify both variants
+        timeout-minutes: 30
+        env:
+          REMOTE_WEB_RELAY_URL: ${{ secrets.REMOTE_WEB_RELAY_URL }}
+          EARLY_ACCESS_SERVICE_URL: ${{ secrets.EARLY_ACCESS_SERVICE_URL }}
+          REMOTE_MIC_SENTRY_DSN: ${{ secrets.REMOTE_MIC_SENTRY_DSN }}
+          SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64: ${{ secrets.SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64 }}
+        run: |
+          ./scripts/run-release-stage.sh \
+            all signed-release "$SIGNED_RELEASE_TIMEOUT_SECONDS" -- \
+            ./scripts/package-macos-release-in-actions.sh
+
+      - name: Prepare canonical public asset bundle
+        run: |
+          bundle="$RUNNER_TEMP/preview-bundle"
+          ./scripts/prepare-public-release-assets.sh "$GITHUB_WORKSPACE/dist" "$bundle"
+
+      - name: Upload immutable payload artifact
+        id: payload-upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mac-preview-payload-v${{ steps.release-meta.outputs.version }}-${{ inputs.expected_commit }}
+          path: ${{ runner.temp }}/preview-bundle
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record immutable staging identity
+        env:
+          PAYLOAD_ARTIFACT_ID: ${{ steps.payload-upload.outputs.artifact-id }}
+          PAYLOAD_ARTIFACT_DIGEST: ${{ steps.payload-upload.outputs.artifact-digest }}
+          RELEASE_MODE_INPUT: ${{ inputs.mode }}
+          SOURCE_BRANCH: ${{ steps.release-source.outputs.source_branch }}
+          SOURCE_KIND: ${{ steps.release-source.outputs.source_kind }}
+          SOURCE_BASE_TAG: ${{ steps.release-source.outputs.source_base_tag }}
+          SOURCE_BASE_COMMIT: ${{ steps.release-source.outputs.source_base_commit }}
+          SOURCE_COMMIT: ${{ inputs.expected_commit }}
+          SOURCE_WORKFLOW_COMMIT: ${{ github.sha }}
+          SOURCE_RUN_ID: ${{ github.run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.run_attempt }}
+          TAG: ${{ steps.release-meta.outputs.tag }}
+          VERSION: ${{ steps.release-meta.outputs.version }}
+          BUILD: ${{ steps.release-meta.outputs.build }}
+        run: |
+          digest="$PAYLOAD_ARTIFACT_DIGEST"
+          [[ "$digest" == sha256:* ]] || digest="sha256:$digest"
+          [[ "$PAYLOAD_ARTIFACT_ID" =~ ^[1-9][0-9]*$ && "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          manifest="$RUNNER_TEMP/preview-bundle/staged-assets.json"
+          manifest_sha="$(/usr/bin/shasum -a 256 "$manifest" | /usr/bin/awk '{print $1}')"
+          jq -n -S \
+            --arg mode "$RELEASE_MODE_INPUT" \
+            --arg tag "$TAG" --arg version "$VERSION" --arg build "$BUILD" \
+            --arg sourceBranch "$SOURCE_BRANCH" --arg sourceKind "$SOURCE_KIND" \
+            --arg sourceBaseTag "$SOURCE_BASE_TAG" --arg sourceBaseCommit "$SOURCE_BASE_COMMIT" \
+            --arg sourceCommit "$SOURCE_COMMIT" \
+            --arg sourceWorkflowCommit "$SOURCE_WORKFLOW_COMMIT" \
+            --argjson sourceRunId "$SOURCE_RUN_ID" \
+            --argjson sourceRunAttempt "$SOURCE_RUN_ATTEMPT" \
+            --argjson signedArtifactId "$PAYLOAD_ARTIFACT_ID" \
+            --arg signedArtifactDigest "$digest" \
+            --arg assetManifestSHA256 "$manifest_sha" \
+            --arg stagedAt "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            '{
+              schemaVersion:2, mode:$mode, tag:$tag, version:$version, build:$build,
+              sourceBranch:$sourceBranch, sourceKind:$sourceKind,
+              sourceBaseTag:$sourceBaseTag, sourceBaseCommit:$sourceBaseCommit,
+              sourceCommit:$sourceCommit, sourceWorkflowCommit:$sourceWorkflowCommit,
+              sourceRunId:$sourceRunId,
+              sourceRunAttempt:$sourceRunAttempt, signedArtifactId:$signedArtifactId,
+              signedArtifactDigest:$signedArtifactDigest,
+              assetManifestSHA256:$assetManifestSHA256, stagedAt:$stagedAt
+            }' > "$RUNNER_TEMP/preview-stage-record.json"
+
+      - name: Upload immutable staging record
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: mac-preview-stage-v${{ steps.release-meta.outputs.version }}-${{ inputs.expected_commit }}
+          path: ${{ runner.temp }}/preview-stage-record.json
+          if-no-files-found: error
+          retention-days: 30

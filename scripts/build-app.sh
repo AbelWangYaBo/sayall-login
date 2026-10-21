@@ -1,0 +1,961 @@
+#!/bin/zsh
+set -euo pipefail
+umask 022
+
+ROOT="${0:A:h:h}"
+source "$ROOT/scripts/release-variant.sh"
+CONFIGURATION="${CONFIGURATION:-release}"
+APP_NAME="RemoteMic"
+DISPLAY_NAME="SayAll"
+OUTPUT_DIR="$RELEASE_OUTPUT_DIR"
+APP_DIR="$OUTPUT_DIR/$DISPLAY_NAME.app"
+SIGNING_IDENTITY="${CODE_SIGN_IDENTITY:--}"
+REQUIRE_SIRI_REMOTE_SIGNING="${REQUIRE_SIRI_REMOTE_SIGNING:-1}"
+REQUIRE_DEVELOPER_ID_SIGNING="${REQUIRE_DEVELOPER_ID_SIGNING:-0}"
+REQUIRE_WEB_REMOTE_CONFIGURATION="${REQUIRE_WEB_REMOTE_CONFIGURATION:-0}"
+REQUIRE_EARLY_ACCESS_CONFIGURATION="${REQUIRE_EARLY_ACCESS_CONFIGURATION:-0}"
+REQUIRE_SAYALL_AI_PACKAGE="${REQUIRE_SAYALL_AI_PACKAGE:-0}"
+REQUIRE_SAYALL_COMBINATION_ACTIONS="${REQUIRE_SAYALL_COMBINATION_ACTIONS:-0}"
+REQUIRE_SAYALL_BUTTON_PROFILES="${REQUIRE_SAYALL_BUTTON_PROFILES:-0}"
+REQUIRE_SAYALL_MAC_REMOTE_PACKAGE="${REQUIRE_SAYALL_MAC_REMOTE_PACKAGE:-0}"
+REQUIRE_SAYALL_PRIVATE_ARTIFACT_PACKAGE="${REQUIRE_SAYALL_PRIVATE_ARTIFACT_PACKAGE:-0}"
+REQUIRE_SAYALL_CHROMECAST="${REQUIRE_SAYALL_CHROMECAST:-0}"
+REQUIRE_DIAGNOSTIC_PUBLIC_KEY="${REQUIRE_DIAGNOSTIC_PUBLIC_KEY:-0}"
+REQUIRE_DIAGNOSTIC_SERVICE="${REQUIRE_DIAGNOSTIC_SERVICE:-0}"
+REQUIRE_RELEASE_BUILD_CHANNEL="${REQUIRE_RELEASE_BUILD_CHANNEL:-0}"
+SAYALL_AI_PACKAGE_PATH="${SAYALL_AI_PACKAGE_PATH:-}"
+SAYALL_COMBINATION_ACTIONS_PATH="${SAYALL_COMBINATION_ACTIONS_PATH:-}"
+SAYALL_BUTTON_PROFILES_PACKAGE_PATH="${SAYALL_BUTTON_PROFILES_PACKAGE_PATH:-}"
+SAYALL_MAC_REMOTE_PACKAGE_PATH="${SAYALL_MAC_REMOTE_PACKAGE_PATH:-}"
+SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH="${SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH:-}"
+SAYALL_SIRI_REMOTE_PACKAGE_PATH="${SAYALL_SIRI_REMOTE_PACKAGE_PATH:-}"
+SAYALL_CHROMECAST_PACKAGE_PATH="${SAYALL_CHROMECAST_PACKAGE_PATH:-}"
+SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64="${SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64:-}"
+REMOTE_MIC_SENTRY_DSN="${REMOTE_MIC_SENTRY_DSN:-}"
+SAYALL_TEST_BUTTON_PROFILES_FREE="${SAYALL_TEST_BUTTON_PROFILES_FREE:-0}"
+SAYALL_BUILD_CHANNEL="${SAYALL_BUILD_CHANNEL:-}"
+RELEASE_STAGE_TIMEOUTS="${RELEASE_STAGE_TIMEOUTS:-0}"
+RELEASE_SWIFT_BUILD_TIMEOUT_SECONDS="${RELEASE_SWIFT_BUILD_TIMEOUT_SECONDS:-300}"
+RELEASE_CODESIGN_TIMEOUT_SECONDS="${RELEASE_CODESIGN_TIMEOUT_SECONDS:-45}"
+RELEASE_STAGE_RUNNER="$ROOT/scripts/run-release-stage.sh"
+
+ICON_ICNS_RESOURCE="AppIcon.icns"
+if [[ "$RELEASE_VARIANT" == "intel" ]]; then
+  ICON_ICNS_RESOURCE="AppIcon-intel.icns"
+fi
+
+if [[ "$#" -ne 0 ]]; then
+  print -u2 "usage: $0"
+  exit 1
+fi
+
+cd "$ROOT"
+
+case "$REQUIRE_DEVELOPER_ID_SIGNING" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_DEVELOPER_ID_SIGNING must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_SIRI_REMOTE_SIGNING" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_SIRI_REMOTE_SIGNING must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_WEB_REMOTE_CONFIGURATION" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_WEB_REMOTE_CONFIGURATION must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_EARLY_ACCESS_CONFIGURATION" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_EARLY_ACCESS_CONFIGURATION must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_SAYALL_AI_PACKAGE" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_SAYALL_AI_PACKAGE must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_SAYALL_COMBINATION_ACTIONS" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_SAYALL_COMBINATION_ACTIONS must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_SAYALL_BUTTON_PROFILES" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_SAYALL_BUTTON_PROFILES must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_SAYALL_MAC_REMOTE_PACKAGE" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_SAYALL_MAC_REMOTE_PACKAGE must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_SAYALL_PRIVATE_ARTIFACT_PACKAGE" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_SAYALL_PRIVATE_ARTIFACT_PACKAGE must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_SAYALL_CHROMECAST" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_SAYALL_CHROMECAST must be 0 or 1"; exit 1 ;;
+esac
+case "$SAYALL_TEST_BUTTON_PROFILES_FREE" in
+  0|1) ;;
+  *) print -u2 "SAYALL_TEST_BUTTON_PROFILES_FREE must be 0 or 1"; exit 1 ;;
+esac
+export SAYALL_TEST_BUTTON_PROFILES_FREE
+case "$REQUIRE_DIAGNOSTIC_PUBLIC_KEY" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_DIAGNOSTIC_PUBLIC_KEY must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_DIAGNOSTIC_SERVICE" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_DIAGNOSTIC_SERVICE must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_RELEASE_BUILD_CHANNEL" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_RELEASE_BUILD_CHANNEL must be 0 or 1"; exit 1 ;;
+esac
+case "$RELEASE_STAGE_TIMEOUTS" in
+  0|1) ;;
+  *) print -u2 "RELEASE_STAGE_TIMEOUTS must be 0 or 1"; exit 1 ;;
+esac
+if [[ "$RELEASE_STAGE_TIMEOUTS" == "1" && ! -x "$RELEASE_STAGE_RUNNER" ]]; then
+  print -u2 "release stage runner is unavailable"
+  exit 1
+fi
+
+run_release_stage() {
+  local stage="$1"
+  local timeout_seconds="$2"
+  shift 2
+  if [[ "$RELEASE_STAGE_TIMEOUTS" == "1" ]]; then
+    "$RELEASE_STAGE_RUNNER" "$RELEASE_VARIANT" "$stage" "$timeout_seconds" -- "$@"
+  else
+    "$@"
+  fi
+}
+if [[ "$REQUIRE_DEVELOPER_ID_SIGNING" == "1" && "$SIGNING_IDENTITY" == "-" ]]; then
+  print -u2 "Developer ID Application signing is required"
+  exit 1
+fi
+if [[ "$REQUIRE_DIAGNOSTIC_PUBLIC_KEY" == "1" && -z "$SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64" ]]; then
+  print -u2 "SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64 is required for this build"
+  exit 1
+fi
+if [[ "$REQUIRE_RELEASE_BUILD_CHANNEL" == "1" && "$SAYALL_BUILD_CHANNEL" != "release" ]]; then
+  print -u2 "SAYALL_BUILD_CHANNEL=release is required for protected release builds"
+  exit 1
+fi
+if [[ "$SAYALL_BUILD_CHANNEL" == "local" || "$SAYALL_BUILD_CHANNEL" == "release" ]]; then
+  REQUIRE_DIAGNOSTIC_SERVICE=1
+fi
+if [[ "$REQUIRE_DIAGNOSTIC_SERVICE" == "1" && -z "$REMOTE_MIC_SENTRY_DSN" ]]; then
+  print -u2 "REMOTE_MIC_SENTRY_DSN is required for internal diagnostic builds"
+  exit 1
+fi
+if [[ -n "$REMOTE_MIC_SENTRY_DSN" ]]; then
+  python3 - "$REMOTE_MIC_SENTRY_DSN" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+value = sys.argv[1].strip()
+parsed = urlparse(value)
+if (
+    parsed.scheme != "https"
+    or not parsed.hostname
+    or not parsed.username
+    or parsed.password
+    or parsed.port is not None
+    or parsed.query
+    or parsed.fragment
+    or not parsed.path.strip("/")
+):
+    raise SystemExit("REMOTE_MIC_SENTRY_DSN is not a valid protected Sentry DSN")
+PY
+fi
+if [[ -n "$SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64" ]]; then
+  if ! DIAGNOSTIC_PUBLIC_KEY_SIZE="$(
+    print -rn -- "$SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64" |
+      /usr/bin/base64 -D 2>/dev/null |
+      /usr/bin/wc -c |
+      /usr/bin/tr -d '[:space:]'
+  )" || [[ "$DIAGNOSTIC_PUBLIC_KEY_SIZE" != "32" ]]; then
+    print -u2 "SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64 must encode a 32-byte Curve25519 public key"
+    exit 1
+  fi
+fi
+
+# Default packaging prepares a versioned private checkout when it is readable.
+# Explicit paths (protected CI and development) are checked below instead.
+SAYALL_PRIVATE_PLATFORM_MODE="${SAYALL_PRIVATE_PLATFORM_MODE:-auto}"
+case "$SAYALL_PRIVATE_PLATFORM_MODE" in
+  auto|public|required) ;;
+  *) print -u2 "SAYALL_PRIVATE_PLATFORM_MODE must be auto, public, or required"; exit 1 ;;
+esac
+PRIVATE_PATHS_PROVIDED=false
+for private_input in \
+  SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH SAYALL_COMBINATION_ACTIONS_PATH \
+  SAYALL_BUTTON_PROFILES_PACKAGE_PATH SAYALL_MAC_REMOTE_PACKAGE_PATH \
+  SAYALL_SIRI_REMOTE_PACKAGE_PATH SAYALL_CHROMECAST_PACKAGE_PATH \
+  SAYALL_PRIVATE_PLATFORM_PACKAGE_PATH; do
+  [[ -z "${(P)private_input:-}" ]] || PRIVATE_PATHS_PROVIDED=true
+done
+if [[ "$SAYALL_PRIVATE_PLATFORM_MODE" == public && "$PRIVATE_PATHS_PROVIDED" == true ]]; then
+  print -u2 "Public packaging excludes private platform inputs; unset the private package paths"
+  exit 1
+fi
+if [[ "$PRIVATE_PATHS_PROVIDED" == false ]]; then
+  PRIVATE_PREPARATION="$(python3 "$ROOT/scripts/prepare-private-platform.py" package \
+    --mode "$SAYALL_PRIVATE_PLATFORM_MODE")"
+  PRIVATE_MODE="$(print -r -- "$PRIVATE_PREPARATION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["mode"])')"
+  if [[ "$PRIVATE_MODE" == private ]]; then
+    PRIVATE_CHECKOUT="$(print -r -- "$PRIVATE_PREPARATION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["checkout"])')"
+    export SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH="$(print -r -- "$PRIVATE_PREPARATION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["artifacts"])')"
+    export SAYALL_MAC_REMOTE_PACKAGE_PATH="$PRIVATE_CHECKOUT/packages/macos-remote"
+    export SAYALL_SIRI_REMOTE_PACKAGE_PATH="$PRIVATE_CHECKOUT/packages/audio-input-kit/siri-remote"
+    export SAYALL_CHROMECAST_PACKAGE_PATH="$PRIVATE_CHECKOUT/packages/audio-input-kit/chromecast"
+    REQUIRE_SAYALL_PRIVATE_ARTIFACT_PACKAGE=1
+    REQUIRE_SAYALL_COMBINATION_ACTIONS=1
+    REQUIRE_SAYALL_BUTTON_PROFILES=1
+    REQUIRE_SAYALL_MAC_REMOTE_PACKAGE=1
+    REQUIRE_SAYALL_CHROMECAST=1
+    print "PRIVATE PLATFORM integrated from manifest tag"
+  else
+    print "PRIVATE PLATFORM public compatibility build (private components unavailable or explicitly disabled)"
+  fi
+fi
+if [[ "${SAYALL_ENABLE_PRIVATE_SWIFTPM:-0}" == 1 || -n "${SAYALL_PRIVATE_PLATFORM_PACKAGE_PATH:-}" ]]; then
+  print -u2 "App packaging requires tag-pinned prepared artifacts; use SAYALL_PRIVATE_PLATFORM_MODE=required"
+  exit 1
+fi
+
+if [[ -n "$SAYALL_AI_PACKAGE_PATH" ]]; then
+  if [[ ! -f "$SAYALL_AI_PACKAGE_PATH/Package.swift" ]]; then
+    print -u2 "SAYALL_AI_PACKAGE_PATH must contain Package.swift"
+    exit 1
+  fi
+  SAYALL_AI_PACKAGE_PATH="${SAYALL_AI_PACKAGE_PATH:A}"
+  export SAYALL_AI_PACKAGE_PATH
+  SAYALL_AI_INCLUDED=true
+else
+  SAYALL_AI_INCLUDED=false
+fi
+if [[ "$REQUIRE_SAYALL_AI_PACKAGE" == "1" && "$SAYALL_AI_INCLUDED" != "true" ]]; then
+  print -u2 "A SayAllAI package is required for this build"
+  exit 1
+fi
+
+if [[ -n "$SAYALL_SIRI_REMOTE_PACKAGE_PATH" ]]; then
+  if [[ ! -f "$SAYALL_SIRI_REMOTE_PACKAGE_PATH/Package.swift" ]]; then
+    print -u2 "SAYALL_SIRI_REMOTE_PACKAGE_PATH must contain Package.swift"
+    exit 1
+  fi
+  SAYALL_SIRI_REMOTE_PACKAGE_PATH="${SAYALL_SIRI_REMOTE_PACKAGE_PATH:A}"
+  export SAYALL_SIRI_REMOTE_PACKAGE_PATH
+  # The private package owns the Siri Remote runtime and UI. Its internal
+  # targets use unique names so the full feature can be linked into the host.
+  unset SAYALL_SIRI_REMOTE_UI_ONLY
+  export SAYALL_ENABLE_SIRI_REMOTE=1
+  SAYALL_SIRI_REMOTE_INCLUDED=true
+  SIRI_REMOTE_SOURCE_ROOT="$SAYALL_SIRI_REMOTE_PACKAGE_PATH/Sources/SayAllSiriRemote"
+  SIRI_REMOTE_RESOURCE_RESOLVER="$SIRI_REMOTE_SOURCE_ROOT/SiriRemoteResources.swift"
+  if [[ ! -f "$SIRI_REMOTE_RESOURCE_RESOLVER" ]] || \
+      ! /usr/bin/grep -Eq 'Bundle\.main\.resourceURL' "$SIRI_REMOTE_RESOURCE_RESOLVER"; then
+    print -u2 "Siri Remote resource resolver is missing or does not prefer the packaged App resource bundle"
+    exit 1
+  fi
+  for siri_remote_source in \
+    SiriRemoteDeviceCapabilities.swift \
+    SiriRemoteConnectionPhoto.swift \
+    SiriRemoteMappingPage.swift; do
+    if /usr/bin/grep -Eq 'Bundle\.module' "$SIRI_REMOTE_SOURCE_ROOT/$siri_remote_source"; then
+      print -u2 "Siri Remote source bypasses the packaged resource resolver: $siri_remote_source"
+      exit 1
+    fi
+  done
+else
+  unset SAYALL_ENABLE_SIRI_REMOTE
+  SAYALL_SIRI_REMOTE_INCLUDED=false
+fi
+if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" &&
+      "$REQUIRE_SIRI_REMOTE_SIGNING" == "1" &&
+      "$SIGNING_IDENTITY" == "-" ]]; then
+  print -u2 "Siri Remote voice builds require Developer ID Application signing; ad-hoc builds cannot connect to the installed HCI helper"
+  exit 1
+fi
+
+# Chromecast 走标准 CoreBluetooth（ATVV GATT），不产出 helper、LaunchDaemon 或安装器组件，
+# 因此不要求 Developer ID 签名，ad-hoc 构建即可用于真机验证。
+if [[ -n "$SAYALL_CHROMECAST_PACKAGE_PATH" ]]; then
+  if [[ ! -f "$SAYALL_CHROMECAST_PACKAGE_PATH/Package.swift" ]]; then
+    print -u2 "SAYALL_CHROMECAST_PACKAGE_PATH must contain Package.swift"
+    exit 1
+  fi
+  SAYALL_CHROMECAST_PACKAGE_PATH="${SAYALL_CHROMECAST_PACKAGE_PATH:A}"
+  export SAYALL_CHROMECAST_PACKAGE_PATH
+  SAYALL_CHROMECAST_INCLUDED=true
+  # 按键页的遥控器素材随私有包打进 App，因此解析器必须优先读 App 的 Resources；
+  # 退回 SwiftPM 内嵌的构建机路径会让发布包找不到图片，界面只会显示占位块。
+  CHROMECAST_SOURCE_ROOT="$SAYALL_CHROMECAST_PACKAGE_PATH/Sources/SayAllChromecast"
+  CHROMECAST_RESOURCE_RESOLVER="$CHROMECAST_SOURCE_ROOT/ChromecastResources.swift"
+  if [[ ! -f "$CHROMECAST_RESOURCE_RESOLVER" ]] || \
+      ! /usr/bin/grep -Eq 'Bundle\.main\.resourceURL' "$CHROMECAST_RESOURCE_RESOLVER"; then
+    print -u2 "Chromecast resource resolver is missing or does not prefer the packaged App resource bundle"
+    exit 1
+  fi
+  # 只检查画布源文件；解析器本身必须保留 `Bundle.module` 作为兜底分支。
+  for chromecast_source in \
+    ChromecastMappingPage.swift; do
+    if /usr/bin/grep -Eq 'Bundle\.module' "$CHROMECAST_SOURCE_ROOT/$chromecast_source"; then
+      print -u2 "Chromecast source bypasses the packaged resource resolver: $chromecast_source"
+      exit 1
+    fi
+  done
+else
+  SAYALL_CHROMECAST_INCLUDED=false
+fi
+if [[ "$REQUIRE_SAYALL_CHROMECAST" == "1" && "$SAYALL_CHROMECAST_INCLUDED" != "true" ]]; then
+  print -u2 "A SayAll Chromecast package is required for this build"
+  exit 1
+fi
+
+if [[ -n "$SAYALL_COMBINATION_ACTIONS_PATH" ]]; then
+  if [[ ! -f "$SAYALL_COMBINATION_ACTIONS_PATH/Package.swift" ]]; then
+    print -u2 "SAYALL_COMBINATION_ACTIONS_PATH must contain Package.swift"
+    exit 1
+  fi
+  SAYALL_COMBINATION_ACTIONS_PATH="${SAYALL_COMBINATION_ACTIONS_PATH:A}"
+  MACRO_PAGE_SOURCE="$SAYALL_COMBINATION_ACTIONS_PATH/Sources/SayAllMacroRemoteMic/RemoteMicMacroView.swift"
+  if [[ ! -f "$MACRO_PAGE_SOURCE" ]] || \
+      /usr/bin/grep -Eq 'bundle:[[:space:]]*\.module' "$MACRO_PAGE_SOURCE"; then
+    print -u2 "SayAll macro page bypasses the packaged resource resolver"
+    exit 1
+  fi
+  export SAYALL_COMBINATION_ACTIONS_PATH
+  SAYALL_COMBINATION_ACTIONS_INCLUDED=true
+else
+  SAYALL_COMBINATION_ACTIONS_INCLUDED=false
+fi
+if [[ -n "$SAYALL_BUTTON_PROFILES_PACKAGE_PATH" ]]; then
+  if [[ ! -f "$SAYALL_BUTTON_PROFILES_PACKAGE_PATH/Package.swift" ]]; then
+    print -u2 "SAYALL_BUTTON_PROFILES_PACKAGE_PATH must contain Package.swift"
+    exit 1
+  fi
+  SAYALL_BUTTON_PROFILES_PACKAGE_PATH="${SAYALL_BUTTON_PROFILES_PACKAGE_PATH:A}"
+  export SAYALL_BUTTON_PROFILES_PACKAGE_PATH
+  SAYALL_BUTTON_PROFILES_INCLUDED=true
+else
+  SAYALL_BUTTON_PROFILES_INCLUDED=false
+fi
+if [[ -n "${SAYALL_MEMBERSHIP_PACKAGE_PATH:-}" || \
+      -n "${SAYALL_MEMBERSHIP_ADAPTER_PACKAGE_PATH:-}" ]]; then
+  print -u2 "membership source packages are not supported; use SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH"
+  exit 1
+fi
+if [[ -n "$SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH" ]]; then
+  if [[ -n "$SAYALL_COMBINATION_ACTIONS_PATH" || \
+        -n "$SAYALL_BUTTON_PROFILES_PACKAGE_PATH" ]]; then
+    print -u2 "private artifacts cannot be combined with private source packages"
+    exit 1
+  fi
+  if [[ ! -f "$SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH/Package.swift" || \
+        ! -f "$SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH/private-artifact-package.json" || \
+        ! -f "$SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH/PREPARED_SHA256SUMS" ]]; then
+    print -u2 "SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH must be a prepared private artifact package"
+    exit 1
+  fi
+  for command_name in jq shasum; do
+    command -v "$command_name" >/dev/null || {
+      print -u2 "required command is unavailable: $command_name"
+      exit 1
+    }
+  done
+  if ! jq -e '
+    .schemaVersion == 1 and
+    (.sourceCommit | type == "string" and test("^[0-9a-f]{40}$")) and
+    (.checksumsSHA256 | type == "string" and test("^[0-9a-f]{64}$")) and
+    (.preparedManifestSHA256 | type == "string" and test("^[0-9a-f]{64}$")) and
+    .repositoryDirty == false
+  ' "$SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH/private-artifact-package.json" >/dev/null; then
+    print -u2 "private artifact package metadata is invalid or dirty"
+    exit 1
+  fi
+  EXPECTED_PREPARED_MANIFEST_SHA256="$(jq -r '.preparedManifestSHA256' "$SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH/private-artifact-package.json")"
+  ACTUAL_PREPARED_MANIFEST_SHA256="$(shasum -a 256 "$SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH/PREPARED_SHA256SUMS" | awk '{print $1}')"
+  if [[ "$ACTUAL_PREPARED_MANIFEST_SHA256" != "$EXPECTED_PREPARED_MANIFEST_SHA256" ]] || \
+      ! (cd "$SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH" && shasum -a 256 -c PREPARED_SHA256SUMS); then
+    print -u2 "private artifact package contents do not match the prepared manifest"
+    exit 1
+  fi
+  SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH="${SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH:A}"
+  export SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH
+  SAYALL_PRIVATE_ARTIFACT_INCLUDED=true
+  SAYALL_COMBINATION_ACTIONS_INCLUDED=true
+  SAYALL_BUTTON_PROFILES_INCLUDED=true
+else
+  SAYALL_PRIVATE_ARTIFACT_INCLUDED=false
+  if [[ "$SAYALL_BUTTON_PROFILES_INCLUDED" == "true" &&
+        "$SAYALL_COMBINATION_ACTIONS_INCLUDED" != "true" ]]; then
+    print -u2 "SAYALL_BUTTON_PROFILES_PACKAGE_PATH requires SAYALL_COMBINATION_ACTIONS_PATH"
+    exit 1
+  fi
+fi
+if [[ "$REQUIRE_SAYALL_PRIVATE_ARTIFACT_PACKAGE" == "1" && \
+      "$SAYALL_PRIVATE_ARTIFACT_INCLUDED" != "true" ]]; then
+  print -u2 "A prepared private artifact package is required for this build"
+  exit 1
+fi
+if [[ "$REQUIRE_SAYALL_COMBINATION_ACTIONS" == "1" &&
+      "$SAYALL_COMBINATION_ACTIONS_INCLUDED" != "true" ]]; then
+  print -u2 "A SayAll combination actions package is required for this build"
+  exit 1
+fi
+if [[ "$REQUIRE_SAYALL_BUTTON_PROFILES" == "1" &&
+      "$SAYALL_BUTTON_PROFILES_INCLUDED" != "true" ]]; then
+  print -u2 "A SayAll button profiles package is required for this build"
+  exit 1
+fi
+if [[ "$SAYALL_TEST_BUTTON_PROFILES_FREE" == "1" &&
+      "$SAYALL_BUTTON_PROFILES_INCLUDED" != "true" ]]; then
+  print -u2 "free button profile test access requires the source button profiles package"
+  exit 1
+fi
+if [[ "$SAYALL_TEST_BUTTON_PROFILES_FREE" == "1" &&
+      "$SAYALL_PRIVATE_ARTIFACT_INCLUDED" == "true" ]]; then
+  print -u2 "free button profile test access excludes private membership artifacts"
+  exit 1
+fi
+if [[ "$SAYALL_BUTTON_PROFILES_INCLUDED" == "true" &&
+      "$SAYALL_PRIVATE_ARTIFACT_INCLUDED" == "true" ]]; then
+  SAYALL_MEMBERSHIP_RESOURCE_BUNDLE="$SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH/Resources/SayAllMembership_SayAllMembershipUI.bundle"
+  SAYALL_COMMON_PHRASES_RESOURCE_BUNDLE="$SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH/Resources/SayAllCommonPhrases_SayAllCommonPhrases.bundle"
+  if [[ ! -d "$SAYALL_MEMBERSHIP_RESOURCE_BUNDLE" ||
+        ! -f "$SAYALL_MEMBERSHIP_RESOURCE_BUNDLE/Contents/Resources/MembershipCenterCopy.json" ||
+        ! -f "$SAYALL_MEMBERSHIP_RESOURCE_BUNDLE/Contents/Resources/AppIcon.png" ]]; then
+    print -u2 "Prepared private artifacts are missing the SayAll membership resource bundle"
+    exit 1
+  fi
+  if [[ ! -d "$SAYALL_COMMON_PHRASES_RESOURCE_BUNDLE" ||
+        ! -f "$SAYALL_COMMON_PHRASES_RESOURCE_BUNDLE/Contents/Resources/CommonPhrases.json" ]]; then
+    print -u2 "Prepared private artifacts are missing the SayAll common phrases resource bundle"
+    exit 1
+  fi
+fi
+if [[ -n "$SAYALL_MAC_REMOTE_PACKAGE_PATH" ]]; then
+  if [[ ! -f "$SAYALL_MAC_REMOTE_PACKAGE_PATH/Package.swift" ]]; then
+    print -u2 "SAYALL_MAC_REMOTE_PACKAGE_PATH must contain Package.swift"
+    exit 1
+  fi
+  SAYALL_MAC_REMOTE_PACKAGE_PATH="${SAYALL_MAC_REMOTE_PACKAGE_PATH:A}"
+  export SAYALL_MAC_REMOTE_PACKAGE_PATH
+  SAYALL_MAC_REMOTE_INCLUDED=true
+else
+  SAYALL_MAC_REMOTE_INCLUDED=false
+fi
+if [[ "$REQUIRE_SAYALL_MAC_REMOTE_PACKAGE" == "1" && "$SAYALL_MAC_REMOTE_INCLUDED" != "true" ]]; then
+  print -u2 "A SayAll Mac remote package is required for this build"
+  exit 1
+fi
+
+# Source inputs must all belong to the fixed private monorepo tag.
+PRIVATE_SOURCE_ROOT=""
+for private_source in "$SAYALL_COMBINATION_ACTIONS_PATH" "$SAYALL_BUTTON_PROFILES_PACKAGE_PATH" \
+  "$SAYALL_MAC_REMOTE_PACKAGE_PATH" "$SAYALL_SIRI_REMOTE_PACKAGE_PATH" "$SAYALL_CHROMECAST_PACKAGE_PATH"; do
+  [[ -n "$private_source" ]] || continue
+  source_root="$(git -C "$private_source" rev-parse --show-toplevel)"
+  if [[ -n "$PRIVATE_SOURCE_ROOT" && "$source_root" != "$PRIVATE_SOURCE_ROOT" ]]; then
+    print -u2 "Private source packages must use the same tag checkout"
+    exit 1
+  fi
+  PRIVATE_SOURCE_ROOT="$source_root"
+done
+if [[ -n "$PRIVATE_SOURCE_ROOT" ]]; then
+  python3 "$ROOT/scripts/prepare-private-platform.py" check-checkout --checkout "$PRIVATE_SOURCE_ROOT"
+  if [[ -n "$SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH" && \
+        "$(jq -r '.sourceCommit' "$SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH/private-artifact-package.json")" != "$(git -C "$PRIVATE_SOURCE_ROOT" rev-parse HEAD)" ]]; then
+    print -u2 "Prepared artifacts and private source packages must use the same tag commit"
+    exit 1
+  fi
+fi
+
+VERSION="$(plutil -extract CFBundleShortVersionString raw -o - "$ROOT/Resources/Info.plist")"
+BUILD="$(plutil -extract CFBundleVersion raw -o - "$ROOT/Resources/Info.plist")"
+if [[ "$SAYALL_PRIVATE_ARTIFACT_INCLUDED" == "true" && "$SAYALL_AI_INCLUDED" == "true" ]]; then
+  SCRATCH_FLAVOR="sayall-ai-private-artifacts"
+elif [[ "$SAYALL_PRIVATE_ARTIFACT_INCLUDED" == "true" ]]; then
+  SCRATCH_FLAVOR="private-artifacts"
+elif [[ "$SAYALL_AI_INCLUDED" == "true" && "$SAYALL_BUTTON_PROFILES_INCLUDED" == "true" ]]; then
+  SCRATCH_FLAVOR="sayall-ai-combination-actions-button-profiles"
+elif [[ "$SAYALL_AI_INCLUDED" == "true" && "$SAYALL_COMBINATION_ACTIONS_INCLUDED" == "true" ]]; then
+  SCRATCH_FLAVOR="sayall-ai-combination-actions"
+elif [[ "$SAYALL_AI_INCLUDED" == "true" ]]; then
+  SCRATCH_FLAVOR="sayall-ai"
+elif [[ "$SAYALL_BUTTON_PROFILES_INCLUDED" == "true" ]]; then
+  SCRATCH_FLAVOR="combination-actions-button-profiles"
+elif [[ "$SAYALL_COMBINATION_ACTIONS_INCLUDED" == "true" ]]; then
+  SCRATCH_FLAVOR="combination-actions"
+else
+  SCRATCH_FLAVOR="public"
+fi
+if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+  SCRATCH_FLAVOR="${SCRATCH_FLAVOR}-siri-remote"
+fi
+if [[ "$SAYALL_CHROMECAST_INCLUDED" == "true" ]]; then
+  SCRATCH_FLAVOR="${SCRATCH_FLAVOR}-chromecast"
+fi
+if [[ "$SAYALL_TEST_BUTTON_PROFILES_FREE" == "1" ]]; then
+  SCRATCH_FLAVOR="${SCRATCH_FLAVOR}-free-button-profiles-test"
+fi
+DEFAULT_SCRATCH_PATH="/private/tmp/remote-mic-swiftpm/$VERSION-$BUILD/$RELEASE_VARIANT-$SCRATCH_FLAVOR"
+DEFAULT_CACHE_PATH="/private/tmp/remote-mic-swiftpm-cache/$VERSION-$BUILD/$RELEASE_VARIANT-$SCRATCH_FLAVOR"
+BUILD_SCRATCH_PATH="${REMOTE_MIC_BUILD_SCRATCH_PATH:-$DEFAULT_SCRATCH_PATH}"
+BUILD_CACHE_PATH="${REMOTE_MIC_BUILD_CACHE_PATH:-$DEFAULT_CACHE_PATH}"
+SPARKLE_FRAMEWORK="$BUILD_SCRATCH_PATH/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
+
+run_release_stage app-swift-build "$RELEASE_SWIFT_BUILD_TIMEOUT_SECONDS" \
+  xcrun swift build \
+  --disable-keychain \
+  --scratch-path "$BUILD_SCRATCH_PATH" \
+  --cache-path "$BUILD_CACHE_PATH" \
+  -c "$CONFIGURATION" \
+  --triple "$RELEASE_TRIPLE"
+BIN_DIR="$(run_release_stage app-swift-bin-path 30 \
+  xcrun swift build \
+  --disable-keychain \
+  --scratch-path "$BUILD_SCRATCH_PATH" \
+  --cache-path "$BUILD_CACHE_PATH" \
+  -c "$CONFIGURATION" \
+  --triple "$RELEASE_TRIPLE" \
+  --show-bin-path)"
+BIN_PATH="$BIN_DIR/$APP_NAME"
+MCP_HELPER_PATH="$BIN_DIR/SayAllMCP"
+APPLE_REMOTE_AUDIO_HELPER_PATH="$BIN_DIR/AppleRemoteAudioCapture"
+APPLE_REMOTE_HCI_SERVICE_PATH="$BIN_DIR/AppleRemoteHCIService"
+if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+  SIRI_HCI_SCRATCH_PATH="$BUILD_SCRATCH_PATH/siri-hci-helper"
+  run_release_stage app-siri-hci-helper-build "$RELEASE_SWIFT_BUILD_TIMEOUT_SECONDS" \
+    xcrun swift build --disable-keychain \
+    --package-path "$SAYALL_SIRI_REMOTE_PACKAGE_PATH" \
+    --scratch-path "$SIRI_HCI_SCRATCH_PATH" --cache-path "$BUILD_CACHE_PATH" \
+    -c "$CONFIGURATION" --triple "$RELEASE_TRIPLE" --product AppleRemoteHCIService
+  SIRI_HCI_BIN_DIR="$(run_release_stage app-siri-hci-helper-bin-path 30 \
+    xcrun swift build --disable-keychain \
+    --package-path "$SAYALL_SIRI_REMOTE_PACKAGE_PATH" \
+    --scratch-path "$SIRI_HCI_SCRATCH_PATH" --cache-path "$BUILD_CACHE_PATH" \
+    -c "$CONFIGURATION" --triple "$RELEASE_TRIPLE" --show-bin-path)"
+  APPLE_REMOTE_HCI_SERVICE_PATH="$SIRI_HCI_BIN_DIR/AppleRemoteHCIService"
+fi
+if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+  SIRI_REMOTE_RESOURCE_BUNDLE="$BIN_DIR/SayAllSiriRemote_SayAllSiriRemote.bundle"
+fi
+if [[ "$SAYALL_CHROMECAST_INCLUDED" == "true" ]]; then
+  CHROMECAST_RESOURCE_BUNDLE="$BIN_DIR/SayAllChromecast_SayAllChromecast.bundle"
+fi
+
+case "$APP_DIR" in
+  "$ROOT/dist/"*.app|"$ROOT/dist/intel/"*.app) ;;
+  *) print -u2 "refusing to clean unexpected app path: $APP_DIR"; exit 1 ;;
+esac
+if [[ -e "$APP_DIR" ]]; then
+  USER_HOME_DIRECTORY="$(dscl . -read "/Users/$(id -un)" NFSHomeDirectory | awk '{print $2}')"
+  TRASH_DIRECTORY="$USER_HOME_DIRECTORY/.Trash"
+  TRASH_DESTINATION="$TRASH_DIRECTORY/${APP_DIR:t}.build-app.$(date -u +%Y%m%dT%H%M%SZ).$$"
+  test -d "$TRASH_DIRECTORY"
+  test ! -e "$TRASH_DESTINATION"
+  mv "$APP_DIR" "$TRASH_DESTINATION"
+  print "PREVIOUS APP MOVED TO TRASH: $TRASH_DESTINATION"
+fi
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Helpers" "$APP_DIR/Contents/Resources"
+test -d "$SPARKLE_FRAMEWORK"
+test -x "$MCP_HELPER_PATH"
+if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+  test -x "$APPLE_REMOTE_AUDIO_HELPER_PATH"
+  test -x "$APPLE_REMOTE_HCI_SERVICE_PATH"
+fi
+ditto --norsrc --noextattr --noqtn --noacl \
+  "$BIN_PATH" "$APP_DIR/Contents/MacOS/$APP_NAME"
+strip -S -x "$APP_DIR/Contents/MacOS/$APP_NAME"
+install_name_tool -add_rpath @executable_path/../Frameworks \
+  "$APP_DIR/Contents/MacOS/$APP_NAME"
+ditto --norsrc --noextattr --noqtn --noacl \
+  "$MCP_HELPER_PATH" "$APP_DIR/Contents/Helpers/SayAllMCP"
+strip -S -x "$APP_DIR/Contents/Helpers/SayAllMCP"
+if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+  ditto --norsrc --noextattr --noqtn --noacl \
+    "$APPLE_REMOTE_AUDIO_HELPER_PATH" "$APP_DIR/Contents/Helpers/SayAllAppleRemoteAudioCapture"
+  strip -S -x "$APP_DIR/Contents/Helpers/SayAllAppleRemoteAudioCapture"
+  ditto --norsrc --noextattr --noqtn --noacl \
+    "$APPLE_REMOTE_HCI_SERVICE_PATH" "$APP_DIR/Contents/Helpers/SayAllAppleRemoteHCIService"
+  strip -S -x "$APP_DIR/Contents/Helpers/SayAllAppleRemoteHCIService"
+  if [[ ! -d "$SIRI_REMOTE_RESOURCE_BUNDLE" ]]; then
+    print -u2 "SayAllSiriRemote resource bundle is missing from the Swift build"
+    exit 1
+  fi
+  ditto --norsrc --noextattr --noqtn --noacl \
+    "$SIRI_REMOTE_RESOURCE_BUNDLE" "$APP_DIR/Contents/Resources/SayAllSiriRemote_SayAllSiriRemote.bundle"
+fi
+if [[ "$SAYALL_CHROMECAST_INCLUDED" == "true" ]]; then
+  if [[ ! -d "$CHROMECAST_RESOURCE_BUNDLE" ]]; then
+    print -u2 "SayAllChromecast resource bundle is missing from the Swift build"
+    exit 1
+  fi
+  ditto --norsrc --noextattr --noqtn --noacl \
+    "$CHROMECAST_RESOURCE_BUNDLE" "$APP_DIR/Contents/Resources/SayAllChromecast_SayAllChromecast.bundle"
+fi
+ditto --norsrc --noextattr --noqtn --noacl \
+  "$ROOT/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
+plutil -remove SayAllBuildChannel "$APP_DIR/Contents/Info.plist" 2>/dev/null || true
+if [[ -n "$SAYALL_BUILD_CHANNEL" ]]; then
+  plutil -insert SayAllBuildChannel -string "$SAYALL_BUILD_CHANNEL" \
+    "$APP_DIR/Contents/Info.plist"
+fi
+plutil -remove SayAllAIIncluded "$APP_DIR/Contents/Info.plist" 2>/dev/null || true
+plutil -insert SayAllAIIncluded -bool "$SAYALL_AI_INCLUDED" \
+  "$APP_DIR/Contents/Info.plist"
+plutil -remove SayAllCombinationActionsIncluded "$APP_DIR/Contents/Info.plist" 2>/dev/null || true
+plutil -insert SayAllCombinationActionsIncluded -bool "$SAYALL_COMBINATION_ACTIONS_INCLUDED" \
+  "$APP_DIR/Contents/Info.plist"
+plutil -remove SayAllButtonProfilesIncluded "$APP_DIR/Contents/Info.plist" 2>/dev/null || true
+plutil -insert SayAllButtonProfilesIncluded -bool "$SAYALL_BUTTON_PROFILES_INCLUDED" \
+  "$APP_DIR/Contents/Info.plist"
+plutil -remove SayAllButtonProfilesTestAccess "$APP_DIR/Contents/Info.plist" 2>/dev/null || true
+SAYALL_BUTTON_PROFILES_TEST_ACCESS=false
+if [[ "$SAYALL_TEST_BUTTON_PROFILES_FREE" == "1" ]]; then
+  SAYALL_BUTTON_PROFILES_TEST_ACCESS=true
+fi
+plutil -insert SayAllButtonProfilesTestAccess -bool "$SAYALL_BUTTON_PROFILES_TEST_ACCESS" \
+  "$APP_DIR/Contents/Info.plist"
+plutil -remove SayAllPrivateArtifactsIncluded "$APP_DIR/Contents/Info.plist" 2>/dev/null || true
+plutil -insert SayAllPrivateArtifactsIncluded -bool "$SAYALL_PRIVATE_ARTIFACT_INCLUDED" \
+  "$APP_DIR/Contents/Info.plist"
+plutil -remove SayAllDiagnosticPublicKey "$APP_DIR/Contents/Info.plist" 2>/dev/null || true
+if [[ -n "$SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64" ]]; then
+  plutil -insert SayAllDiagnosticPublicKey -string "$SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64" \
+    "$APP_DIR/Contents/Info.plist"
+fi
+plutil -remove SayAllSentryDSN "$APP_DIR/Contents/Info.plist" 2>/dev/null || true
+if [[ -n "$REMOTE_MIC_SENTRY_DSN" ]]; then
+  plutil -insert SayAllSentryDSN -string "$REMOTE_MIC_SENTRY_DSN" \
+    "$APP_DIR/Contents/Info.plist"
+fi
+plutil -remove SayAllSiriRemoteIncluded "$APP_DIR/Contents/Info.plist" 2>/dev/null || true
+plutil -insert SayAllSiriRemoteIncluded -bool "$SAYALL_SIRI_REMOTE_INCLUDED" \
+  "$APP_DIR/Contents/Info.plist"
+plutil -remove SMPrivilegedExecutables "$APP_DIR/Contents/Info.plist" 2>/dev/null || true
+if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+  plutil -insert SMPrivilegedExecutables -json \
+    '{"com.hd838a.SayAll.AppleRemoteHCIService":"identifier \"com.hd838a.SayAll.AppleRemoteHCIService\" and anchor apple generic and certificate leaf[subject.OU] = \"L3QHLDRPAY\""}' \
+    "$APP_DIR/Contents/Info.plist"
+fi
+plutil -remove SayAllChromecastIncluded "$APP_DIR/Contents/Info.plist" 2>/dev/null || true
+plutil -insert SayAllChromecastIncluded -bool "$SAYALL_CHROMECAST_INCLUDED" \
+  "$APP_DIR/Contents/Info.plist"
+if [[ "$RELEASE_VARIANT" == "intel" ]]; then
+  plutil -replace LSMinimumSystemVersion -string "$RELEASE_MIN_SYSTEM_VERSION" \
+    "$APP_DIR/Contents/Info.plist"
+  plutil -replace SUFeedURL -string "$RELEASE_FEED_URL" \
+    "$APP_DIR/Contents/Info.plist"
+fi
+if [[ -n "${REMOTE_WEB_RELAY_URL:-}" ]]; then
+  plutil -remove RemoteWebRelayURL "$APP_DIR/Contents/Info.plist" 2>/dev/null || true
+  plutil -insert RemoteWebRelayURL -string "$REMOTE_WEB_RELAY_URL" \
+    "$APP_DIR/Contents/Info.plist"
+fi
+if [[ -n "${EARLY_ACCESS_SERVICE_URL:-}" ]]; then
+  if ! print -r -- "$EARLY_ACCESS_SERVICE_URL" | rg -q '^https://[^/?#]+/?$'; then
+    print -u2 "EARLY_ACCESS_SERVICE_URL must be a root HTTPS URL"
+    exit 1
+  fi
+  plutil -remove EarlyAccessServiceURL "$APP_DIR/Contents/Info.plist" 2>/dev/null || true
+  plutil -insert EarlyAccessServiceURL -string "$EARLY_ACCESS_SERVICE_URL" \
+    "$APP_DIR/Contents/Info.plist"
+fi
+if [[ "$REQUIRE_WEB_REMOTE_CONFIGURATION" == "1" ]]; then
+  RELAY_URL="$(plutil -extract RemoteWebRelayURL raw -o - \
+    "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
+  if [[ "$RELAY_URL" != wss://?*/ws ]]; then
+    print -u2 "A production wss:// relay URL ending in /ws is required"
+    exit 1
+  fi
+fi
+if [[ "$REQUIRE_EARLY_ACCESS_CONFIGURATION" == "1" ]]; then
+  EARLY_ACCESS_URL="$(plutil -extract EarlyAccessServiceURL raw -o - \
+    "$APP_DIR/Contents/Info.plist" 2>/dev/null || true)"
+  if ! print -r -- "$EARLY_ACCESS_URL" | rg -q '^https://[^/?#]+/?$'; then
+    print -u2 "A production root HTTPS Early Access URL is required"
+    exit 1
+  fi
+fi
+mkdir -p "$APP_DIR/Contents/Frameworks"
+if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+  OPUS_DYLIB=""
+  for candidate in \
+    "${SAYALL_OPUS_LIBRARY:-}" \
+    "$ROOT/.build/apple-remote-opus/$RELEASE_VARIANT/install/lib/libopus.0.dylib" \
+    "/opt/homebrew/opt/opus/lib/libopus.0.dylib" \
+    "/usr/local/opt/opus/lib/libopus.0.dylib"; do
+    [[ -n "$candidate" && -f "$candidate" ]] || continue
+    OPUS_ARCHS="$(lipo -archs "$candidate")"
+    OPUS_MINOS="$(xcrun vtool -show-build "$candidate" | awk '/minos / { print $2; exit }')"
+    [[ "$OPUS_ARCHS" == "$RELEASE_ARCH" ]] || continue
+    [[ -n "$OPUS_MINOS" && "${OPUS_MINOS%%.*}" -le "$RELEASE_MIN_SYSTEM_MAJOR" ]] || continue
+    OPUS_DYLIB="$candidate"
+    break
+  done
+  if [[ -n "$OPUS_DYLIB" ]]; then
+    ditto --norsrc --noextattr --noqtn --noacl \
+      "$OPUS_DYLIB" "$APP_DIR/Contents/Frameworks/libopus.0.dylib"
+    install_name_tool -id @rpath/libopus.0.dylib \
+      "$APP_DIR/Contents/Frameworks/libopus.0.dylib"
+    chmod 0644 "$APP_DIR/Contents/Frameworks/libopus.0.dylib"
+  else
+    print -u2 "Apple Remote audio helper requires a compatible libopus; run scripts/build-apple-remote-opus.sh or set SAYALL_OPUS_LIBRARY"
+    exit 1
+  fi
+fi
+ditto --norsrc --noextattr --noqtn --noacl \
+  "$SPARKLE_FRAMEWORK" "$APP_DIR/Contents/Frameworks/Sparkle.framework"
+if [[ "$RELEASE_VARIANT" == "intel" ]]; then
+  for sparkle_binary in \
+    "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Sparkle" \
+    "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate" \
+    "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app/Contents/MacOS/Updater" \
+    "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer" \
+    "$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"; do
+    thin_binary="$sparkle_binary.thin"
+    /usr/bin/lipo "$sparkle_binary" -thin "$RELEASE_ARCH" -output "$thin_binary"
+    /bin/chmod 755 "$thin_binary"
+    /bin/mv "$thin_binary" "$sparkle_binary"
+  done
+fi
+ditto --norsrc --noextattr --noqtn --noacl \
+  "$ROOT/LICENSE.md" "$APP_DIR/Contents/Resources/LICENSE.md"
+for document in README TECHNICAL TROUBLESHOOTING COPYRIGHT LOGO-LICENSE; do
+  ditto --norsrc --noextattr --noqtn --noacl \
+    "$ROOT/$document.en.md" "$APP_DIR/Contents/Resources/$document.md"
+done
+ditto --norsrc --noextattr --noqtn --noacl \
+  "$ROOT/THIRD_PARTY_NOTICES.md" "$APP_DIR/Contents/Resources/THIRD_PARTY_NOTICES.md"
+ditto --norsrc --noextattr --noqtn --noacl \
+  "$ROOT/Resources/首次安装说明.en.md" \
+  "$APP_DIR/Contents/Resources/FirstInstallGuide.md"
+ditto --norsrc --noextattr --noqtn --noacl \
+  "$ROOT/Resources/RC003-remote-photo.png" \
+  "$APP_DIR/Contents/Resources/RC003-remote-photo.png"
+ditto --norsrc --noextattr --noqtn --noacl \
+  "$ROOT/Resources/Onboarding" \
+  "$APP_DIR/Contents/Resources/Onboarding"
+ditto --norsrc --noextattr --noqtn --noacl \
+  "$ROOT/Resources/$ICON_ICNS_RESOURCE" \
+  "$APP_DIR/Contents/Resources/AppIcon.icns"
+for icon_resource in \
+  StatusIconTemplate.png \
+  StatusIconTemplate@2x.png \
+  StatusIconActiveTemplate.png \
+  StatusIconActiveTemplate@2x.png; do
+  ditto --norsrc --noextattr --noqtn --noacl \
+    "$ROOT/Resources/$icon_resource" \
+    "$APP_DIR/Contents/Resources/$icon_resource"
+done
+if [[ -d "$ROOT/Resources/AppIcons" ]]; then
+  ditto --norsrc --noextattr --noqtn --noacl \
+    "$ROOT/Resources/AppIcons" \
+    "$APP_DIR/Contents/Resources/AppIcons"
+fi
+LOCALIZATION_DIRS=("$ROOT"/Resources/*.lproj(N))
+if (( ${#LOCALIZATION_DIRS} == 0 )); then
+  print -u2 "no localization resources found"
+  exit 1
+fi
+for localization_dir in "${LOCALIZATION_DIRS[@]}"; do
+  localization="${localization_dir:t}"
+  ditto --norsrc --noextattr --noqtn --noacl \
+    "$localization_dir" \
+    "$APP_DIR/Contents/Resources/$localization"
+done
+if [[ "$SAYALL_AI_INCLUDED" == "true" ]]; then
+  SAYALL_AI_RESOURCE_BUNDLE="$BIN_DIR/SayAllAI_SayAllAI.bundle"
+  if [[ ! -d "$SAYALL_AI_RESOURCE_BUNDLE" ]]; then
+    print -u2 "SayAllAI resource bundle is missing from the Swift build"
+    exit 1
+  fi
+  ditto --norsrc --noextattr --noqtn --noacl \
+    "$SAYALL_AI_RESOURCE_BUNDLE" \
+    "$APP_DIR/Contents/Resources/SayAllAI_SayAllAI.bundle"
+fi
+if [[ "$SAYALL_COMBINATION_ACTIONS_INCLUDED" == "true" ]]; then
+  if [[ "$SAYALL_PRIVATE_ARTIFACT_INCLUDED" == "true" ]]; then
+    SAYALL_MACRO_RESOURCE_BUNDLE="$SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH/Resources/SayAllCombinationActions_SayAllMacroRemoteMic.bundle"
+  else
+    SAYALL_MACRO_RESOURCE_BUNDLE="$BIN_DIR/SayAllCombinationActions_SayAllMacroRemoteMic.bundle"
+  fi
+  if [[ ! -d "$SAYALL_MACRO_RESOURCE_BUNDLE" ]]; then
+    print -u2 "SayAll combination actions resource bundle is missing from the Swift build"
+    exit 1
+  fi
+  ditto --norsrc --noextattr --noqtn --noacl \
+    "$SAYALL_MACRO_RESOURCE_BUNDLE" \
+    "$APP_DIR/Contents/Resources/SayAllCombinationActions_SayAllMacroRemoteMic.bundle"
+fi
+if [[ "$SAYALL_BUTTON_PROFILES_INCLUDED" == "true" ]]; then
+  if [[ "$SAYALL_PRIVATE_ARTIFACT_INCLUDED" == "true" ]]; then
+    SAYALL_BUTTON_PROFILES_RESOURCE_BUNDLE="$SAYALL_PRIVATE_ARTIFACT_PACKAGE_PATH/Resources/SayAllButtonProfiles_SayAllButtonProfiles.bundle"
+  else
+    SAYALL_BUTTON_PROFILES_RESOURCE_BUNDLE="$BIN_DIR/SayAllButtonProfiles_SayAllButtonProfiles.bundle"
+  fi
+  if [[ ! -d "$SAYALL_BUTTON_PROFILES_RESOURCE_BUNDLE" ]]; then
+    print -u2 "SayAll button profiles resource bundle is missing from the Swift build"
+    exit 1
+  fi
+  ditto --norsrc --noextattr --noqtn --noacl \
+    "$SAYALL_BUTTON_PROFILES_RESOURCE_BUNDLE" \
+    "$APP_DIR/Contents/Resources/SayAllButtonProfiles_SayAllButtonProfiles.bundle"
+fi
+if [[ "$SAYALL_BUTTON_PROFILES_INCLUDED" == "true" &&
+      "$SAYALL_PRIVATE_ARTIFACT_INCLUDED" == "true" ]]; then
+  ditto --norsrc --noextattr --noqtn --noacl \
+    "$SAYALL_MEMBERSHIP_RESOURCE_BUNDLE" \
+    "$APP_DIR/Contents/Resources/SayAllMembership_SayAllMembershipUI.bundle"
+  ditto --norsrc --noextattr --noqtn --noacl \
+    "$SAYALL_COMMON_PHRASES_RESOURCE_BUNDLE" \
+    "$APP_DIR/Contents/Resources/SayAllCommonPhrases_SayAllCommonPhrases.bundle"
+fi
+SPARKLE_VERSION_DIR="$APP_DIR/Contents/Frameworks/Sparkle.framework/Versions/B"
+if [[ "$SIGNING_IDENTITY" != "-" ]]; then
+  run_release_stage app-codesign-installer-xpc "$RELEASE_CODESIGN_TIMEOUT_SECONDS" \
+    codesign \
+      --force \
+      --options runtime \
+      --timestamp \
+      --sign "$SIGNING_IDENTITY" \
+      "$APP_DIR/Contents/Helpers/SayAllMCP"
+  if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+    codesign \
+      --force \
+      --options runtime \
+      --timestamp \
+      --identifier "com.hd838a.RemoteMic.apple-remote-audio" \
+      --sign "$SIGNING_IDENTITY" \
+      "$APP_DIR/Contents/Helpers/SayAllAppleRemoteAudioCapture"
+    codesign \
+      --force \
+      --options runtime \
+      --timestamp \
+      --identifier "com.hd838a.SayAll.AppleRemoteHCIService" \
+      --sign "$SIGNING_IDENTITY" \
+      "$APP_DIR/Contents/Helpers/SayAllAppleRemoteHCIService"
+    mkdir -p "$APP_DIR/Contents/Library/LaunchServices"
+    ditto --norsrc --noextattr --noqtn --noacl \
+      "$APP_DIR/Contents/Helpers/SayAllAppleRemoteHCIService" \
+      "$APP_DIR/Contents/Library/LaunchServices/com.hd838a.SayAll.AppleRemoteHCIService"
+    codesign \
+      --force \
+      --options runtime \
+      --timestamp \
+      --sign "$SIGNING_IDENTITY" \
+      "$APP_DIR/Contents/Frameworks/libopus.0.dylib"
+  fi
+  codesign \
+    --force \
+    --options runtime \
+    --timestamp \
+    --sign "$SIGNING_IDENTITY" \
+    "$SPARKLE_VERSION_DIR/XPCServices/Installer.xpc"
+  run_release_stage app-codesign-downloader-xpc "$RELEASE_CODESIGN_TIMEOUT_SECONDS" \
+    codesign \
+    --force \
+    --options runtime \
+    --timestamp \
+    --preserve-metadata=entitlements \
+    --sign "$SIGNING_IDENTITY" \
+    "$SPARKLE_VERSION_DIR/XPCServices/Downloader.xpc"
+  run_release_stage app-codesign-autoupdate "$RELEASE_CODESIGN_TIMEOUT_SECONDS" \
+    codesign \
+    --force \
+    --options runtime \
+    --timestamp \
+    --sign "$SIGNING_IDENTITY" \
+    "$SPARKLE_VERSION_DIR/Autoupdate"
+  run_release_stage app-codesign-updater "$RELEASE_CODESIGN_TIMEOUT_SECONDS" \
+    codesign \
+    --force \
+    --options runtime \
+    --timestamp \
+    --sign "$SIGNING_IDENTITY" \
+    "$SPARKLE_VERSION_DIR/Updater.app"
+  run_release_stage app-codesign-sparkle-framework "$RELEASE_CODESIGN_TIMEOUT_SECONDS" \
+    codesign \
+    --force \
+    --options runtime \
+    --timestamp \
+    --sign "$SIGNING_IDENTITY" \
+    "$APP_DIR/Contents/Frameworks/Sparkle.framework"
+  run_release_stage app-codesign-main "$RELEASE_CODESIGN_TIMEOUT_SECONDS" \
+    codesign \
+    --force \
+    --options runtime \
+    --timestamp \
+    --sign "$SIGNING_IDENTITY" \
+    "$APP_DIR"
+fi
+if [[ "$SIGNING_IDENTITY" == "-" ]]; then
+  BUNDLE_IDENTIFIER="$(plutil -extract CFBundleIdentifier raw -o - "$APP_DIR/Contents/Info.plist")"
+  codesign \
+    --force \
+    --timestamp=none \
+    --sign - \
+    "$APP_DIR/Contents/Helpers/SayAllMCP"
+  if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+    codesign \
+      --force \
+      --timestamp=none \
+      --identifier "com.hd838a.RemoteMic.apple-remote-audio" \
+      --sign - \
+      "$APP_DIR/Contents/Helpers/SayAllAppleRemoteAudioCapture"
+    codesign \
+      --force \
+      --timestamp=none \
+      --identifier "com.hd838a.SayAll.AppleRemoteHCIService" \
+      --sign - \
+      "$APP_DIR/Contents/Helpers/SayAllAppleRemoteHCIService"
+    mkdir -p "$APP_DIR/Contents/Library/LaunchServices"
+    ditto --norsrc --noextattr --noqtn --noacl \
+      "$APP_DIR/Contents/Helpers/SayAllAppleRemoteHCIService" \
+      "$APP_DIR/Contents/Library/LaunchServices/com.hd838a.SayAll.AppleRemoteHCIService"
+    codesign \
+      --force \
+      --timestamp=none \
+      --sign - \
+      "$APP_DIR/Contents/Frameworks/libopus.0.dylib"
+  fi
+  codesign \
+    --force \
+    --timestamp=none \
+    --sign - \
+    "$SPARKLE_VERSION_DIR/XPCServices/Installer.xpc"
+  codesign \
+    --force \
+    --timestamp=none \
+    --preserve-metadata=entitlements \
+    --sign - \
+    "$SPARKLE_VERSION_DIR/XPCServices/Downloader.xpc"
+  codesign \
+    --force \
+    --timestamp=none \
+    --sign - \
+    "$SPARKLE_VERSION_DIR/Autoupdate"
+  codesign \
+    --force \
+    --timestamp=none \
+    --sign - \
+    "$SPARKLE_VERSION_DIR/Updater.app"
+  codesign \
+    --force \
+    --timestamp=none \
+    --sign - \
+    "$APP_DIR/Contents/Frameworks/Sparkle.framework"
+  codesign \
+    --force \
+    --timestamp=none \
+    --sign - \
+    --requirements "=designated => identifier \"$BUNDLE_IDENTIFIER\"" \
+    "$APP_DIR"
+fi
+codesign --verify --deep --strict "$APP_DIR"
+
+print "$APP_DIR"
+print "RELEASE VARIANT: $RELEASE_VARIANT"
+print "SIGNING IDENTITY: $SIGNING_IDENTITY"

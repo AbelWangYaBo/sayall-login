@@ -1,0 +1,66 @@
+# SayAll First-Install Guide
+
+[简体中文](首次安装说明.md)
+
+## Requirements
+
+- Apple Silicon Mac
+- macOS 14 or later
+- Xiaomi Bluetooth Remote 2 Pro
+
+Installation does not require Xcode or the Command Line Tools.
+
+Starting with v1.3.0, the app, both PKGs in the DMG, and the DMG itself are Developer ID signed and notarized by Apple for official releases. Download only from this project's GitHub Releases and verify the `.sha256` file supplied with the same release.
+
+## Install
+
+After opening `SayAll-<version>.dmg`, double-click `Install SayAll.pkg`. It will:
+
+1. install SayAll.app in Applications;
+2. install the compatible SayAll microphone (existing installations keep MiRemoteV 2ch);
+3. restart the system audio service;
+4. launch SayAll for the current desktop user.
+
+When upgrading, the installer checks the canonical and legacy app paths by bundle identifier without deleting an existing app before installation. After the new SayAll.app is installed and verified, matching legacy Remote Mic.app and 无线麦.app bundles are moved to Trash so they remain recoverable. If Trash is unavailable, the legacy app stays in place. If the canonical target belongs to another app, installation stops without overwriting it; unrelated content at legacy paths is left untouched.
+
+If you do not need the Doubao-compatible microphone, drag SayAll.app to Applications instead. This path requires an existing loopback device such as BlackHole 2ch.
+
+If macOS still blocks installation, delete the local download, download it again from GitHub Releases, and verify the `.sha256` file; do not use an untrusted copy.
+
+If an older `/Applications/Remote Mic.app` or `/Applications/无线麦.app` exists, the installer migrates it only after confirming that its bundle identifier is `com.hd838a.RemoteMic` and the new SayAll.app is valid. An unrelated app at either path is never removed.
+
+## Pair the remote
+
+1. Turn on Bluetooth in Mac System Settings.
+2. For the first connection, hold TV for about 2 seconds until the white light at the bottom of the remote flashes.
+3. Hold Home and Menu together to enter Bluetooth pairing mode.
+4. On the Mac, pair 小米蓝牙语音遥控器, MI RC, or Xiaomi Bluetooth Remote 2 Pro.
+
+## Permissions
+
+Allow Bluetooth access on first launch.
+
+To customize remote buttons, grant Input Monitoring and Accessibility in that order from the **Permissions** page. Quit and reopen SayAll after granting either macOS permission.
+
+## Configure voice input
+
+1. Left-click the SayAll menu bar icon.
+2. In **Connection & Voice**, choose **Refresh Devices**.
+3. Select SayAll, an existing MiRemoteV 2ch, or another available loopback device.
+4. Choose the same device as the microphone in the voice typing app.
+5. Click the target input field, hold the remote voice button to speak, then release it to finish.
+
+You can first choose the device in QuickTime Player's **New Audio Recording** window and confirm that input level changes while holding the voice button.
+
+## Uninstall
+
+1. Quit SayAll.
+2. Download and double-click `SayAll-<version>-Uninstaller.pkg` from the same GitHub Release.
+
+After checking bundle identifiers, the uninstall PKG moves recognized SayAll.app bundles, legacy app paths, and the compatible microphone to macOS Trash so they can be restored. It does not change BlackHole or SayAll's local settings. Same-named content that does not belong to SayAll stays in place. If Trash is unavailable or a move fails, the uninstaller stops and restores items already moved during that run.
+
+## Privacy and license
+
+SayAll does not upload or store voice, does not change the system default audio device, and logs neither voice content, Bluetooth addresses, nor unique device identifiers.
+
+The project's software code is GPL-3.0-only. The app logo is a separate proprietary brand asset. License material is included in the app bundle; complete corresponding source for every release is available in the GitHub repository and identified by the release's Git tag.

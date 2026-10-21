@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<installer-gui-script minSpecVersion="1">
+    <title>SayAll</title>
+    <options customize="always" hostArchitectures="arm64,x86_64"/>
+    <script><![CDATA[
+function hardwareIsAppleSilicon() {
+    return system.sysctl('hw.optional.arm64') == 1;
+}
+
+function currentSystemMajorVersion() {
+    return parseInt(system.version.ProductVersion.split('.')[0], 10);
+}
+
+function siriRemoteSupportWasPreviouslyInstalled() {
+    if (!my.target) {
+        return false;
+    }
+    return Boolean(my.target.receiptForIdentifier('com.hd838a.RemoteMic.siri-remote'));
+}
+
+function installationCheck() {
+    if (hardwareIsAppleSilicon()) {
+        my.result.type = 'Fatal';
+        my.result.message = system.localizedString('wrong_architecture_intel');
+        return false;
+    }
+    if (currentSystemMajorVersion() < 13) {
+        my.result.type = 'Fatal';
+        my.result.message = system.localizedString('unsupported_system_intel');
+        return false;
+    }
+    return true;
+}
+    ]]></script>
+    <installation-check script="installationCheck()"/>
+    <choices-outline>
+        <line choice="remote-mic"/>
+        <line choice="siri-remote"/>
+    </choices-outline>
+    <choice id="remote-mic" visible="false" start_selected="true">
+        <pkg-ref id="com.hd838a.RemoteMic.installer"/>
+    </choice>
+    <choice id="siri-remote" title="苹果遥控器 Siri Remote"
+            description="首次安装默认不选；检测到已有 Siri Remote 支持时自动选中。 / Off for first install; selected automatically when existing Siri Remote support is detected."
+            start_selected="siriRemoteSupportWasPreviouslyInstalled()">
+        <pkg-ref id="com.hd838a.RemoteMic.siri-remote"/>
+    </choice>
+    <pkg-ref id="com.hd838a.RemoteMic.installer" auth="Root">RemoteMicComponent.pkg</pkg-ref>
+    <pkg-ref id="com.hd838a.RemoteMic.siri-remote" auth="Root">SiriRemoteComponent.pkg</pkg-ref>
+</installer-gui-script>

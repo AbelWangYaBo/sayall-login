@@ -1,0 +1,8934 @@
+import AppKit
+import AVFoundation
+import Combine
+import CoreAudio
+import CoreBluetooth
+import Foundation
+import SayAllMacRemoteCore
+
+enum MobileVoiceSource: Equatable {
+    case nearbyPhone
+    case nearbyWatch
+    case web
+
+    var logName: String {
+        switch self {
+        case .nearbyPhone: return "iphone"
+        case .nearbyWatch: return "watch"
+        case .web: return "web"
+        }
+    }
+}
+
+enum MobileVoiceStartDisposition: Equatable {
+    case startNow
+    case deferUntilStopped
+    case busy
+}
+
+enum MobileVoiceRestartPolicy {
+    static func startDisposition(
+        requested: MobileVoiceSource,
+        active: MobileVoiceSource?,
+        stopping: MobileVoiceSource?
+    ) -> MobileVoiceStartDisposition {
+        guard let active else { return .startNow }
+        if active == requested, stopping == requested { return .deferUntilStopped }
+        return .busy
+    }
+
+    static func shouldCancelPendingRestart(
+        stopped: MobileVoiceSource,
+        pending: MobileVoiceSource?
+    ) -> Bool {
+        pending == stopped
+    }
+}
+
+enum MobileVoiceWatchRecoveryPolicy {
+    static let noAudioTimeout: TimeInterval = 5
+
+    static func shouldRecover(
+        startedAt: Date,
+        now: Date,
+        receivedBatchCount: Int
+    ) -> Bool {
+        receivedBatchCount == 0 &&
+            now.timeIntervalSince(startedAt) >= noAudioTimeout
+    }
+}
+
+struct HIDPermissionSnapshot: Equatable {
+    let inputMonitoringGranted: Bool
+    let accessibilityGranted: Bool
+
+    static var current: HIDPermissionSnapshot {
+        HIDPermissionSnapshot(
+            inputMonitoringGranted: HIDRemoteMonitor.isInputMonitoringGranted,
+            accessibilityGranted: KeyboardInjector.isAccessibilityTrusted
+        )
+    }
+}
+
+enum HIDPermissionRecoveryPolicy {
+    static func shouldReapplySettings(
+        started: Bool,
+        customMappingEnabled: Bool,
+        voiceKeyMode: VoiceKeyMode = .function,
+        voiceFnTapModeEnabled: Bool = false,
+        softwareVoiceKeyHeld: Bool = false,
+        previous: HIDPermissionSnapshot?,
+        current: HIDPermissionSnapshot
+    ) -> Bool {
+        guard started,
+              (
+                  customMappingEnabled ||
+                      voiceKeyMode.requiresAccessibility ||
+                      voiceFnTapModeEnabled ||
+                      softwareVoiceKeyHeld
+              ),
+              let previous
+        else { return false }
+        return previous != current
+    }
+}
+
+enum HIDMappingRecoveryPolicy {
+    static let retryDelays: [TimeInterval] = [0.5, 1, 2, 4, 8]
+
+    static func shouldPreserveFnTapPreferenceAfterMappingFailure(
+        hasMatchingServices: Bool
+    ) -> Bool {
+        !hasMatchingServices
+    }
+
+    static func retryDelay(
+        forAttempt attempt: Int,
+        started: Bool,
+        readyBridgeCount: Int,
+        hasMatchingServices: Bool
+    ) -> TimeInterval? {
+        guard started,
+              readyBridgeCount > 0,
+              !hasMatchingServices,
+              retryDelays.indices.contains(attempt)
+        else { return nil }
+        return retryDelays[attempt]
+    }
+}
+
+enum MobileVoiceStopDisposition: Equatable {
+    case ignoredInactive
+    case ignoredAlreadyStopping(cancelledPendingRestart: Bool)
+    case begin(generation: UInt64)
+}
+
+enum MobileVoiceStopCompletion: Equatable {
+    case ignored
+    case stopped
+    case restart(MobileVoiceSource)
+}
+
+struct MobileVoiceLifecycleState {
+    private(set) var activeSource: MobileVoiceSource?
+    private(set) var stoppingSource: MobileVoiceSource?
+    private(set) var pendingRestartSource: MobileVoiceSource?
+    private(set) var stopGeneration: UInt64 = 0
+
+    mutating func markStarted(_ source: MobileVoiceSource) {
+        activeSource = source
+    }
+
+    mutating func requestStart(_ source: MobileVoiceSource) -> MobileVoiceStartDisposition {
+        let disposition = MobileVoiceRestartPolicy.startDisposition(
+            requested: source,
+            active: activeSource,
+            stopping: stoppingSource
+        )
+        guard disposition == .deferUntilStopped else { return disposition }
+        guard pendingRestartSource == nil else { return .busy }
+        pendingRestartSource = source
+        return disposition
+    }
+
+    mutating func beginStop(_ source: MobileVoiceSource) -> MobileVoiceStopDisposition {
+        guard activeSource == source else { return .ignoredInactive }
+        guard stoppingSource != source else {
+            let cancelledPendingRestart = MobileVoiceRestartPolicy.shouldCancelPendingRestart(
+                stopped: source,
+                pending: pendingRestartSource
+            )
+            if cancelledPendingRestart {
+                pendingRestartSource = nil
+            }
+            return .ignoredAlreadyStopping(
+                cancelledPendingRestart: cancelledPendingRestart
+            )
+        }
+        stoppingSource = source
+        stopGeneration &+= 1
+        return .begin(generation: stopGeneration)
+    }
+
+    mutating func completeStop(
+        _ source: MobileVoiceSource,
+        generation: UInt64
+    ) -> MobileVoiceStopCompletion {
+        guard stopGeneration == generation,
+              activeSource == source,
+              stoppingSource == source
+        else { return .ignored }
+        activeSource = nil
+        stoppingSource = nil
+        guard pendingRestartSource == source else { return .stopped }
+        pendingRestartSource = nil
+        return .restart(source)
+    }
+
+    @discardableResult
+    mutating func reset() -> Bool {
+        stopGeneration &+= 1
+        let cancelledPendingRestart = pendingRestartSource != nil
+        activeSource = nil
+        stoppingSource = nil
+        pendingRestartSource = nil
+        return cancelledPendingRestart
+    }
+}
+
+private struct MobileButtonGestureKey: Hashable {
+    let source: UsageEventSource
+    let button: RemoteButton
+}
+
+private struct AppleRemoteButtonGestureKey: Hashable {
+    let device: SiriRemoteDeviceIdentity
+    let button: RemoteButton
+}
+
+enum AppleRemoteInteractionPolicy {
+    static func repeatIntervalMilliseconds(
+        for button: RemoteButton,
+        configured: ConfiguredButtonAction,
+        hasSecondaryAction: Bool,
+        hasSingleActionOverride: Bool,
+        frontmostBundleIdentifier: String?
+    ) -> UInt64? {
+        guard !hasSecondaryAction,
+              !hasSingleActionOverride,
+              configured.action != .disabled,
+              configured.action != .appSwitcher,
+              HIDRemoteMonitor.shouldRepeat(
+                  configured: configured,
+                  frontmostBundleIdentifier: frontmostBundleIdentifier
+              )
+        else { return nil }
+        return HIDRemoteTiming.repeatIntervalMilliseconds(for: button)
+    }
+
+    static func repeatIntervalMilliseconds(
+        for button: RemoteButton,
+        action: ButtonAction,
+        hasSecondaryAction: Bool,
+        hasSingleActionOverride: Bool,
+        frontmostBundleIdentifier: String?
+    ) -> UInt64? {
+        repeatIntervalMilliseconds(
+            for: button,
+            configured: ConfiguredButtonAction(action: action, shortcut: nil),
+            hasSecondaryAction: hasSecondaryAction,
+            hasSingleActionOverride: hasSingleActionOverride,
+            frontmostBundleIdentifier: frontmostBundleIdentifier
+        )
+    }
+
+    static func blocksTouch(activeVoiceDeviceCount: Int, voiceStopping: Bool) -> Bool {
+        activeVoiceDeviceCount > 0 || voiceStopping
+    }
+}
+
+struct AppleRemoteCircularNavigationAccumulator {
+    static let stepThreshold = 18.0
+    static let maximumStepsPerEvent = 3
+
+    private(set) var pendingPixels = 0.0
+
+    mutating func consume(_ pixels: Double) -> Int {
+        guard pixels != 0 else { return 0 }
+        if pendingPixels != 0, pendingPixels.sign != pixels.sign {
+            pendingPixels = 0
+        }
+        pendingPixels += pixels
+        let availableSteps = Int(abs(pendingPixels) / Self.stepThreshold)
+        guard availableSteps > 0 else { return 0 }
+
+        let emittedSteps = min(availableSteps, Self.maximumStepsPerEvent)
+        let direction = pendingPixels > 0 ? 1 : -1
+        pendingPixels -= Double(direction * emittedSteps) * Self.stepThreshold
+        return direction * emittedSteps
+    }
+
+    mutating func reset() {
+        pendingPixels = 0
+    }
+
+    static func movesLeft(for steps: Int) -> Bool {
+        // The Siri Remote click-wheel contract emits negative pixels clockwise
+        // and positive pixels counter-clockwise.
+        steps > 0
+    }
+}
+
+struct MobileRemoteButtonObservation: Equatable {
+    let source: UsageEventSource
+    let button: RemoteButton
+}
+
+private struct ManagedDefaultInputTransition {
+    let virtualUID: String
+    let fallbackUID: String
+}
+
+enum BluetoothVoiceStopPolicy {
+    /// Remote stop ends capture but must not discard PCM already scheduled for playback.
+    static func shouldFlushAudio(handledByFnTapMode _: Bool) -> Bool {
+        false
+    }
+}
+
+enum VoiceKeyPendingDownPolicy {
+    static func shouldRejectStart(
+        streaming: Bool,
+        pendingDown: Bool
+    ) -> Bool {
+        streaming && pendingDown
+    }
+}
+
+enum VoiceKeySessionPreservationPolicy {
+    static func shouldPreserveInputSourceSession(
+        latchHeld: Bool,
+        heldMode: VoiceKeyMode?,
+        pendingMode: VoiceKeyMode?
+    ) -> Bool {
+        (latchHeld && heldMode?.requiresAccessibility == true) ||
+            pendingMode?.requiresAccessibility == true
+    }
+}
+
+struct CommandVoiceActivationAudioBuffer {
+    private let maximumSampleCount: Int
+    private var samples: [Int16] = []
+    private(set) var isWaiting = false
+
+    init(maximumSampleCount: Int = 8_000) {
+        self.maximumSampleCount = maximumSampleCount
+    }
+
+    var bufferedSampleCount: Int {
+        samples.count
+    }
+
+    mutating func begin() {
+        samples.removeAll(keepingCapacity: true)
+        isWaiting = true
+    }
+
+    mutating func appendIfWaiting(_ newSamples: [Int16]) -> Bool {
+        guard isWaiting else { return false }
+        samples.append(contentsOf: newSamples)
+        if samples.count > maximumSampleCount {
+            samples.removeFirst(samples.count - maximumSampleCount)
+        }
+        return true
+    }
+
+    mutating func drain() -> [Int16] {
+        guard isWaiting else { return [] }
+        isWaiting = false
+        defer { samples.removeAll(keepingCapacity: true) }
+        return samples
+    }
+
+    mutating func cancel() {
+        isWaiting = false
+        samples.removeAll(keepingCapacity: true)
+    }
+}
+
+enum VoiceSamplePresentationPolicy {
+    static func shouldPublishReceipt(
+        hasReceivedSamples: Bool,
+        sampleCount: Int
+    ) -> Bool {
+        sampleCount > 0 && !hasReceivedSamples
+    }
+}
+
+struct AudioRecoveryCoalescingState {
+    private(set) var pendingEventCount = 0
+    private(set) var includesHardwareChange = false
+
+    mutating func recordEvent(reason: String) {
+        pendingEventCount += 1
+        if reason == "hardware_change" {
+            includesHardwareChange = true
+        }
+    }
+
+    mutating func consumePendingEvents() -> (count: Int, includesHardwareChange: Bool) {
+        let result = (pendingEventCount, includesHardwareChange)
+        pendingEventCount = 0
+        includesHardwareChange = false
+        return result
+    }
+
+    mutating func reset() {
+        pendingEventCount = 0
+        includesHardwareChange = false
+    }
+}
+
+struct BluetoothVoiceTailSnapshot: Equatable {
+    let sampleCount: Int
+    let durationMilliseconds: Int
+    let nonZeroSampleCount: Int
+    let peak: Int
+    let rms: Int
+    let finalWindowSampleCount: Int
+    let finalWindowDurationMilliseconds: Int
+    let finalWindowNonZeroSampleCount: Int
+    let finalWindowPeak: Int
+    let finalWindowRMS: Int
+    let lastAudioAgeMilliseconds: Int?
+}
+
+struct BluetoothVoiceTailDiagnostics {
+    static let sampleRate = 16_000
+    static let maximumSampleCount = 4_800
+
+    private var recentSamples: [Int16] = []
+    private var lastAudioUptime: TimeInterval?
+
+    mutating func reset() {
+        recentSamples.removeAll(keepingCapacity: true)
+        lastAudioUptime = nil
+    }
+
+    mutating func append(_ samples: [Int16], at uptime: TimeInterval) {
+        guard !samples.isEmpty else { return }
+        lastAudioUptime = uptime
+        if samples.count >= Self.maximumSampleCount {
+            recentSamples = Array(samples.suffix(Self.maximumSampleCount))
+            return
+        }
+        let overflow = max(0, recentSamples.count + samples.count - Self.maximumSampleCount)
+        if overflow > 0 {
+            recentSamples.removeFirst(overflow)
+        }
+        recentSamples.append(contentsOf: samples)
+    }
+
+    func snapshot(at stopUptime: TimeInterval) -> BluetoothVoiceTailSnapshot {
+        var metrics = WatchBluetoothAudioSignalMetrics()
+        metrics.append(recentSamples)
+        let finalWindowSamples = Array(recentSamples.suffix(Self.sampleRate / 10))
+        var finalWindowMetrics = WatchBluetoothAudioSignalMetrics()
+        finalWindowMetrics.append(finalWindowSamples)
+        return BluetoothVoiceTailSnapshot(
+            sampleCount: metrics.sampleCount,
+            durationMilliseconds: metrics.sampleCount * 1_000 / Self.sampleRate,
+            nonZeroSampleCount: metrics.nonZeroSampleCount,
+            peak: metrics.peak,
+            rms: metrics.rms,
+            finalWindowSampleCount: finalWindowMetrics.sampleCount,
+            finalWindowDurationMilliseconds:
+                finalWindowMetrics.sampleCount * 1_000 / Self.sampleRate,
+            finalWindowNonZeroSampleCount: finalWindowMetrics.nonZeroSampleCount,
+            finalWindowPeak: finalWindowMetrics.peak,
+            finalWindowRMS: finalWindowMetrics.rms,
+            lastAudioAgeMilliseconds: lastAudioUptime.map {
+                max(0, Int(((stopUptime - $0) * 1_000).rounded()))
+            }
+        )
+    }
+}
+
+private enum RecordingPlaybackOperationError: Error {
+    case playerRejected
+}
+
+private enum RecordingPlaybackStage: String {
+    case resolveAsset = "resolve_asset"
+    case initializePlayer = "initialize_player"
+    case preparePlayer = "prepare_player"
+    case startPlayback = "start_playback"
+}
+
+private struct LocalTestRemoteSessionResponse: Decodable {
+    let relayMode: String
+    let sessionID: String
+    let creatorToken: String
+    let joinURL: String
+    let webSocketURL: String
+    let pairingCode: String
+    let expiresAt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case relayMode
+        case sessionID = "sessionId"
+        case creatorToken
+        case joinURL
+        case webSocketURL
+        case pairingCode
+        case expiresAt
+    }
+}
+
+enum VoiceKeyCompatibilityWarning: Equatable {
+    case karabiner
+    case otherInputTool
+
+    var messageKey: String {
+        switch self {
+        case .karabiner:
+            return "connection.voice_key_compatibility.karabiner_detail"
+        case .otherInputTool:
+            return "connection.voice_key_compatibility.other_detail"
+        }
+    }
+}
+
+final class BridgeAppModel: NSObject, ObservableObject, XiaomiBluetoothBridgeDelegate, AVAudioPlayerDelegate {
+    private static let longRecordingOpenTimeout: TimeInterval = 5
+    private static let longRecordingCloseTimeout: TimeInterval = 2
+    private static let rc003VoiceExtensionOpenTimeout: TimeInterval = 5
+    private static let rc003VoiceExtensionInterval: TimeInterval = 8
+    private static let rc003VoiceExtensionMaximumDuration: TimeInterval = 120
+
+    let settings: AppSettings
+    let privateFeature: PrivateFeatureIntegration
+    let macroFeature: MacroFeatureIntegration
+    let membershipFeature: MembershipFeatureIntegration
+    let loginItemService: LoginItemService
+
+    @Published private(set) var connectionStatus = LocalizedMessage("bluetooth.status.initializing")
+    @Published private(set) var hidStatus = LocalizedMessage("button_mapping.status.disabled")
+    @Published private(set) var audioStatus = LocalizedMessage("audio.output.none_selected")
+    @Published private(set) var doubaoAudioStatus = LocalizedMessage("audio.compatibility.checking")
+    @Published private(set) var isStreaming = false
+    @Published private(set) var voiceSessionWarningLevel: VoiceSessionWarningLevel = .none
+    @Published private(set) var isConnected = false
+    @Published private(set) var isVoiceTriggerEnabled = false
+    @Published private(set) var activeRemoteButtons = Set<RemoteButton>()
+    @Published private(set) var activeAppleRemoteControlIDs = Set<String>()
+    /// Chromecast 画布的活动按键（控制 ID）。与苹果遥控器链路完全隔离，互不清除。
+    @Published private(set) var activeChromecastControlIDs = Set<String>()
+    @Published private(set) var lastRemoteButtonPress: RemoteButton?
+    @Published private(set) var connectedRemoteProfileIDs = Set<UUID>()
+    @Published private(set) var remoteBatteryLevels: [UUID: Int] = [:]
+    @Published private(set) var remotePowerStates: [UUID: RemotePowerState] = [:]
+    private var pendingRemoteBatteryLevels: [UUID: Int] = [:]
+    private var pendingRemotePowerStates: [UUID: RemotePowerState] = [:]
+    private var pendingRemoteModels: [UUID: XiaomiRemoteModel] = [:]
+    @Published private(set) var remoteSystemDeviceNames: [UUID: String] = [:]
+    @Published private(set) var audioDevices: [AudioDeviceInfo] = []
+    @Published private(set) var testToneStatus = LocalizedMessage("audio.output.none_selected")
+    @Published private(set) var isPlayingTestTone = false
+    @Published private(set) var isAudioOutputReady = false
+    @Published private(set) var hasReceivedCurrentVoiceSamples = false
+    @Published private(set) var activeVoiceSource: UsageEventSource?
+    @Published private(set) var lastMobileRemoteButtonObservation: MobileRemoteButtonObservation?
+    @Published private(set) var isPhoneRemoteConnectionEnabled = false
+    @Published private(set) var isPhoneRemoteConnected = false
+    @Published private(set) var isWatchRemoteConnected = false
+    @Published private(set) var phoneRemoteInvitation: PhoneRemoteInvitation?
+    @Published private(set) var webRemoteState: WebRemoteSessionState = .disabled
+    @Published private(set) var voiceShortcutStatus = LocalizedMessage("voice_button.status.preparing")
+    @Published private(set) var voiceKeyCompatibilityWarning: VoiceKeyCompatibilityWarning?
+    @Published private(set) var diagnosticUploadStatus = LocalizedMessage("diagnostics.upload.ready")
+    @Published private(set) var isSendingDiagnosticLogs = false
+    @Published private(set) var transcriptRecords: [TranscriptRecord] = []
+    @Published private(set) var recordingAssets: [RecordingAssetManifest] = []
+    @Published private(set) var recordingPlaybackError: RecordingPlaybackFailure?
+    @Published private(set) var recordingPlaybackAssetID: UUID?
+    @Published private(set) var isRecordingPlaybackPlaying = false
+
+    private let transcriptArchiveStore: TranscriptArchiveStore
+    private let recordingAssetStore: RecordingAssetStore
+    private let transcriptArchiveOperationQueue = DispatchQueue(
+        label: "RemoteMic.transcriptArchive.operations",
+        qos: .utility
+    )
+    private let recordingPlaybackDiagnosticQueue = DispatchQueue(
+        label: "RemoteMic.recordingPlayback.diagnostics",
+        qos: .utility
+    )
+    private let audioOutput = VirtualAudioOutput()
+    private let diagnosticLogUploader: DiagnosticLogUploader
+    private var recordingPlayback: AVAudioPlayer?
+
+    func isOnboardingControlSourceConnected(_ source: OnboardingControlSource) -> Bool {
+        switch source {
+        case .xiaomiRemote:
+            return connectedRemoteProfileIDs.contains { profileID in
+                guard let model = settings.remoteDeviceProfiles.first(where: {
+                    $0.id == profileID
+                })?.model else { return false }
+                return !model.usesPrivateAdapter
+            }
+        case .siriRemote:
+            return !connectedAppleRemoteProfileIDs.isEmpty
+        case .chromecastRemote:
+            return !connectedChromecastProfileIDs.isEmpty
+        case .appleCompanion:
+            return isPhoneRemoteConnected || isWatchRemoteConnected
+        case .webRemote:
+            if case .connected = webRemoteState { return true }
+            return false
+        case .unselected:
+            return false
+        }
+    }
+
+    var activePhysicalVoiceControlSource: OnboardingControlSource? {
+        if bluetoothVoiceActive { return .xiaomiRemote }
+        if !appleRemoteVoiceDevices.isEmpty || appleRemoteVoiceStopping { return .siriRemote }
+        if chromecastVoiceActive || chromecastVoiceStopping { return .chromecastRemote }
+        return nil
+    }
+    private let phoneRemoteServer = PhoneRemoteServer(logger: { message in
+        AppLogger.shared.write(message)
+    })
+    private let watchBluetoothServer = WatchBluetoothRemoteServer(logger: { message in
+        AppLogger.shared.write(message)
+    })
+    private let webRemoteClient = WebRemoteRelayClient()
+    private let voiceFunctionMapper = RemoteVoiceFunctionMapper()
+    private lazy var preferredInputSourceMonitor = PreferredInputSourceMonitor(
+        voiceTool: { [weak self] in
+            self?.settings.onboardingVoiceTool ?? .unselected
+        }
+    )
+    private lazy var voiceInputDestinationCoordinator = VoiceInputDestinationCoordinator(
+        onStateChange: { [weak self] state in
+            self?.handleVoiceInputDestinationState(state)
+        }
+    )
+    private lazy var voiceFnTapSession = VoiceFnTapSessionController(
+        destinationReadiness: { [weak self] completion in
+            self?.voiceInputDestinationCoordinator.waitUntilReady(completion: completion) ?? .immediate
+        },
+        setFunctionKeyPressed: { KeyboardInjector.setFunctionKeyPressed($0) },
+        enqueueAudio: { [weak self] samples in
+            self?.enqueueVoiceFnTapAudio(samples)
+        },
+        drainAudio: { [weak self] operationID, completion in
+            guard let self else {
+                completion()
+                return
+            }
+            self.audioOutput.endSessionAfterDraining(
+                source: "voice_fn_tap",
+                operationID: operationID
+            ) { outcome in
+                AppLogger.shared.write(
+                    "VOICE FN TAP playback_stop operation_id=\(operationID) " +
+                        "phase=completed result=\(outcome.rawValue)"
+                )
+                completion()
+            }
+        },
+        onFailure: { [weak self] failure in
+            self?.handleVoiceFnTapFailure(failure)
+        },
+        logger: { AppLogger.shared.write($0) }
+    )
+    private lazy var transcriptCaptureCoordinator = TranscriptCaptureCoordinator(
+        isEnabled: { [weak self] in
+            self?.settings.localTranscriptHistoryEnabled ?? false
+        },
+        onCapture: { [weak self] capture in
+            self?.archiveCapturedTranscript(capture)
+        }
+    )
+    private lazy var voiceTargetActivityMonitor = VoiceTargetActivityMonitor(
+        onInterruption: { [weak self] interruption in
+            self?.handleVoiceTargetInterruption(interruption)
+        },
+        log: { AppLogger.shared.write($0) }
+    )
+    private lazy var recordingAssetCoordinator = RecordingAssetCoordinator(
+        store: recordingAssetStore,
+        isEnabled: { [weak self] in
+            self?.settings.localOriginalAudioRecordingEnabled ?? false
+        },
+        onCommit: { [weak self] _ in
+            self?.refreshRecordingAssets()
+        }
+    )
+    private var transcriptHistoryToggleCancellable: AnyCancellable?
+    private var recordingToggleCancellable: AnyCancellable?
+    private var membershipAccessCancellable: AnyCancellable?
+    private var membershipCompanionAccessCancellable: AnyCancellable?
+    private var membershipAccountCancellable: AnyCancellable?
+    private var membershipEnvironmentCancellable: AnyCancellable?
+    private var testToneGeneration = 0
+    private var voiceKeyLatch = VoiceFunctionKeyLatch()
+    private var heldVoiceKeyMode: VoiceKeyMode?
+    private var pendingVoiceKeyMode: VoiceKeyMode?
+    private var heldSoftwareVoiceKeyDiagnostic: ATVVAudioDiagnostics?
+    private var pendingCommandVoiceAudioDiagnostic: ATVVAudioDiagnostics?
+    private var pendingCommandVoiceAudio = CommandVoiceActivationAudioBuffer()
+    private var voiceSessionStartedAt: Date?
+    private var voiceSessionID: UUID?
+    private var voiceAudioDeliveryGeneration = 0
+    private var voiceAudioDeliveryDiagnostic = VoiceAudioDeliveryDiagnostic()
+    private var voiceSessionUsageSource: UsageEventSource?
+    private var voiceSessionApplicationName: String?
+    private var bluetoothVoiceActive = false
+    private var voiceSessionWarningTasks: [DispatchWorkItem] = []
+    private var voiceSessionWarningGeneration: UInt64 = 0
+    private var voiceSessionWarningStartedAt: Date?
+    private var loggedBluetoothVoiceAudioDeviceIdentifier: UUID?
+    private var mobileVoiceLifecycle = MobileVoiceLifecycleState()
+    private var pendingMobileVoiceStartSource: MobileVoiceSource?
+    private var pendingMobileVoiceAudio = CommandVoiceActivationAudioBuffer(
+        maximumSampleCount: 32_000
+    )
+    private var pendingMobileVoiceStopRequested = false
+    private var pendingMobileVoiceRestartCompletion: ((RemoteVoiceStartResult) -> Void)?
+    private var mobileVoiceNoAudioRecoveryTimer: DispatchSourceTimer?
+    private var activeMobileVoiceSource: MobileVoiceSource? {
+        mobileVoiceLifecycle.activeSource
+    }
+    private var stoppingMobileVoiceSource: MobileVoiceSource? {
+        mobileVoiceLifecycle.stoppingSource
+    }
+    private var mobileVoiceAudioBatchCount = 0
+    private var mobileVoiceAudioReceivedBatchCount = 0
+    private var mobileVoiceAudioEnqueueFailureCount = 0
+    private var mobileVoiceAudioSourceMismatchCount = 0
+    private var mobileVoiceAudioSignalMetrics = WatchBluetoothAudioSignalMetrics()
+    private var mobileVoiceOperationCounter: UInt64 = 0
+    private var activeMobileVoiceOperationID: String?
+    private var activeMobileVoiceStartedAt: Date?
+    private var longRecordingRequested = false
+    private var longRecordingGeneration: UInt64 = 0
+    private var longRecordingOpenTimer: DispatchSourceTimer?
+    private var longRecordingCloseTimer: DispatchSourceTimer?
+    private let rc003VoiceExtensionTestEnabled: Bool
+    private weak var rc003VoiceExtensionBridge: XiaomiBluetoothBridge?
+    private var rc003VoiceExtensionActive = false
+    private var rc003VoiceExtensionAwaitingReopen = false
+    private var rc003VoiceExtensionGeneration: UInt64 = 0
+    private var rc003VoiceExtensionDidReceiveAudio = false
+    private var rc003VoiceExtensionTimer: DispatchSourceTimer?
+    private var rc003VoiceExtensionOpenTimer: DispatchSourceTimer?
+    private var rc003VoiceExtensionDeadlineTimer: DispatchSourceTimer?
+    private var phoneApprovalAlert: NSAlert?
+    private var webApprovalAlert: NSAlert?
+    private var webRemoteSessionGeneration: UInt64 = 0
+    private var webRemoteSessionOperationCounter: UInt64 = 0
+    private var webRemoteSessionIdempotencyKey: String?
+    private var remoteButtonTitles: [String: String] = [:]
+    private var mobileButtonGestureRecognizers: [UsageEventSource: RemoteButtonGestureRecognizer] = [:]
+    private var mobileDoubleClickTimers: [MobileButtonGestureKey: DispatchSourceTimer] = [:]
+    private var mobileLongPressTimers: [MobileButtonGestureKey: DispatchSourceTimer] = [:]
+    private var bluetoothBridges: [UUID: XiaomiBluetoothBridge] = [:]
+    private var bluetoothBridgeStates: [ObjectIdentifier: BluetoothBridgeState] = [:]
+    private var discoveryBluetoothBridge: XiaomiBluetoothBridge?
+    private var pendingBluetoothVoiceStartIdentifier: UUID?
+    // Keep up to two seconds while the audio engine opens. This protects the
+    // first word without allowing an unbounded pre-configuration buffer.
+    private var pendingBluetoothVoiceAudio = CommandVoiceActivationAudioBuffer(
+        maximumSampleCount: 32_000
+    )
+    private var pendingBluetoothVoiceAudioDiagnostic: ATVVAudioDiagnostics?
+    private var pendingBluetoothVoiceStopRequested = false
+    private var activeBluetoothVoiceDeviceIdentifier: UUID?
+    private var bluetoothVoiceTraceCounter: UInt64 = 0
+    private var activeBluetoothVoiceTraceID: UInt64?
+    private var bluetoothVoiceTraceStartedAt: Date?
+    private var bluetoothVoiceTraceModel: XiaomiRemoteModel = .unknown
+    private var bluetoothVoiceDecodedBatchCount = 0
+    private var bluetoothVoiceDecodedSampleCount = 0
+    private var bluetoothVoiceEnqueueFailureCount = 0
+    /// 因为活动设备标识不匹配而被静默丢掉的蓝牙音频批次；过去这条路径没有任何记录。
+    private var bluetoothVoiceIdentifierDropCount = 0
+    private var latestBluetoothAudioDiagnosticOperationID: UInt64?
+    private var latestBluetoothAudioDiagnosticGeneration: Int?
+    private var sharedBluetoothAudioDiagnosticGenerations: [Int] = []
+    private var transcriptDiagnosticOperations: [(sessionID: UUID, operationID: UInt64)] = []
+    private var bluetoothVoiceTraceRoute = "none"
+    private var bluetoothVoiceTailDiagnostics = BluetoothVoiceTailDiagnostics()
+    private let hidEventSuppressor = KeyboardEventSuppressor()
+    private var hidMonitors: [String: HIDRemoteMonitor] = [:]
+    private var discoveryHIDMonitor: HIDRemoteMonitor?
+    private lazy var siriRemoteFeature = SiriRemoteFeatureIntegration(
+        logger: { AppLogger.shared.write($0) }
+    )
+    @Published private(set) var siriRemoteAudioStatus = "disabled"
+    private let siriRemoteCursorFeedback = SiriRemoteCursorFeedbackController(
+        logger: { AppLogger.shared.write($0) }
+    )
+    private var appleRemoteProfileIDs: [SiriRemoteDeviceIdentity: UUID] = [:]
+    private var connectedAppleRemoteProfileIDs = Set<UUID>()
+    private var appleRemoteActiveButtons: [SiriRemoteDeviceIdentity: Set<RemoteButton>] = [:]
+    private var appleRemoteActiveControlIDs: [SiriRemoteDeviceIdentity: Set<String>] = [:]
+    private var appleRemoteHoverClickDevices = Set<SiriRemoteDeviceIdentity>()
+    private var appleRemoteGestureRecognizers:
+        [SiriRemoteDeviceIdentity: RemoteButtonGestureRecognizer] = [:]
+    private var appleRemoteDoubleClickTimers:
+        [AppleRemoteButtonGestureKey: DispatchSourceTimer] = [:]
+    private var appleRemoteLongPressTimers:
+        [AppleRemoteButtonGestureKey: DispatchSourceTimer] = [:]
+    private var appleRemoteRepeatTimers:
+        [AppleRemoteButtonGestureKey: DispatchSourceTimer] = [:]
+    private var appleRemoteRepeatCounts: [AppleRemoteButtonGestureKey: Int] = [:]
+    private var appleRemoteRepeatOperationIDs: [AppleRemoteButtonGestureKey: UInt64] = [:]
+    private var appleRemoteRepeatOperationCounter: UInt64 = 0
+    private let appleRemoteAppSwitcherSession = KeyboardInjector.AppSwitcherSession()
+    private var appleRemoteAppSwitcherTimeout: DispatchSourceTimer?
+    private var appleRemoteAppSwitcherFrontmostMonitor: DispatchSourceTimer?
+    private var appleRemoteAppSwitcherOriginBundleIdentifier: String?
+    private var appleRemoteAppSwitcherOperationCounter: UInt64 = 0
+    private var appleRemoteAppSwitcherOperationID: UInt64?
+    private var appleRemoteAppSwitcherProfileID: UUID?
+    private var appleRemoteAppSwitcherStartedUptime: TimeInterval?
+    private var appleRemoteAppSwitcherTabCount = 0
+    private var appleRemoteAppSwitcherTouchNavigationSteps = 0
+    private var appleRemoteAppSwitcherButtonLeftCount = 0
+    private var appleRemoteAppSwitcherButtonRightCount = 0
+    private var appleRemoteAppSwitcherTouchConfirmationCount = 0
+    private var appleRemoteAppSwitcherButtonConfirmationCount = 0
+    private var appleRemoteCircularNavigation = AppleRemoteCircularNavigationAccumulator()
+    private var appleRemoteVoiceDevices = Set<SiriRemoteDeviceIdentity>()
+    private var appleRemoteVoiceStopping = false
+    private var pendingAppleRemoteVoiceStarts = Set<SiriRemoteDeviceIdentity>()
+    private var pendingAppleRemoteVoiceAudio = CommandVoiceActivationAudioBuffer(
+        maximumSampleCount: 32_000
+    )
+    private var pendingAppleRemoteVoiceStopRequested = false
+    private var appleRemoteVoiceStopOperation: UInt64 = 0
+    private var appleRemoteVoiceCaptureRetryAttempt = 0
+    private var appleRemoteVoiceCaptureRetryWorkItem: DispatchWorkItem?
+    private var appleRemoteAudioBatchCount = 0
+    private var appleRemoteAudioSampleCount = 0
+    private var appleRemoteAudioEnqueueFailureCount = 0
+    private var appleRemoteAudioStopPendingBuffers = 0
+    private var appleRemoteAudioStopPendingSamples = 0
+    private var appleRemoteAudioStopInterruptedBuffers = 0
+    private var appleRemoteAudioStopInterruptedSamples = 0
+    private var loggedAppleRemoteAudioDevice = false
+    private var appleRemoteVoiceOperationCounter: UInt64 = 0
+    private var activeAppleRemoteVoiceOperationID: String?
+    private var activeAppleRemoteVoiceStartedAt: Date?
+
+    // MARK: - Chromecast（可选私有包）
+
+    /// 私有包缺失时该实例内部全部退化为 no-op，宿主行为与未接入前完全一致。
+    private lazy var chromecastFeature = ChromecastFeatureIntegration()
+    /// 当前是否有活跃的 Chromecast 收音会话。
+    private var chromecastVoiceActive = false
+    private var chromecastVoiceStopping = false
+    private var pendingChromecastVoiceStart = false
+    private var pendingChromecastVoiceAudio = CommandVoiceActivationAudioBuffer(
+        maximumSampleCount: 32_000
+    )
+    private var pendingChromecastVoiceStopReason: ChromecastVoiceEndReason?
+    private var chromecastVoiceStopOperation: UInt64 = 0
+    private var chromecastVoiceOperationCounter: UInt64 = 0
+    private var activeChromecastVoiceOperationID: String?
+    private var activeChromecastVoiceStartedAt: Date?
+    private var chromecastAudioBatchCount = 0
+    private var chromecastAudioSampleCount = 0
+    private var chromecastAudioEnqueueFailureCount = 0
+    private var loggedChromecastAudioDevice = false
+    /// 设置页展示用。私有包缺失时恒为 `.unavailable`，界面据此隐藏整块内容。
+    @Published private(set) var chromecastStatus: ChromecastLinkStatus =
+        ChromecastFeatureIntegration.isPackageIncluded ? .disabled : .unavailable
+    /// 遥控器**自报**的能力位；链路不可用时为空集合。
+    ///
+    /// 界面与语音键驱动都读它（经 `RemoteVoiceCapabilities.resolve`），宿主不再维护第二份型号能力表。
+    @Published private(set) var chromecastDeclaredCapabilities: ChromecastDeclaredCapabilities = []
+    /// 苹果遥控器**自报**的能力位；链路不可用时为空集合（同上）。
+    @Published private(set) var siriDeclaredCapabilities: SiriRemoteDeclaredCapabilities = []
+
+    /// 当前选中遥控器档案的语音能力：**该遥控器所在链路的自报**优先，自报缺失才回退型号默认表。
+    ///
+    /// 两条链路各自上报（Chromecast 走 ATVV、苹果遥控器走 HID），必须按型号取对应的那一份，
+    /// 不能混用——串用会让不具备该能力的遥控器凭空多出功能入口。
+    var selectedRemoteVoiceCapabilities: RemoteVoiceCapabilities {
+        let model = settings.selectedRemoteProfile?.model
+        var declared: ChromecastDeclaredCapabilities = []
+        if let model {
+            if model.isChromecastRemote {
+                declared = chromecastDeclaredCapabilities
+            } else if model.isAppleSiriRemote {
+                declared = siriDeclaredCapabilities.asDeclaredVoiceCapabilities
+            }
+        }
+        return .resolve(model: model, declared: declared)
+    }
+    /// 当前是否有活跃的 Chromecast 收音会话（按键页用它点亮固定的语音键卡片）。
+    @Published private(set) var isChromecastVoiceActive = false
+    /// Chromecast 遥控器对应的设备档案。按型号识别，不存设备标识。
+    private var chromecastProfileID: UUID?
+    /// 已连接的 Chromecast 档案，用于设备选择器与「已连接」状态。
+    private var connectedChromecastProfileIDs = Set<UUID>()
+    /// 当前按下的 Chromecast 按键（画布控制 ID）。
+    private var chromecastPressedControls = Set<String>()
+    private var chromecastButtonGestureRecognizer = RemoteButtonGestureRecognizer()
+    private var chromecastDoubleClickTimers: [RemoteButton: DispatchSourceTimer] = [:]
+    private var chromecastLongPressTimers: [RemoteButton: DispatchSourceTimer] = [:]
+    private var hidPowerKeySuppressed = false
+    private var hidAllowedLocationIDs: Set<UInt32>?
+    private var started = false
+    private var remoteDeviceNameRefreshOperation: UInt64 = 0
+    private var appliedHIDPermissionSnapshot: HIDPermissionSnapshot?
+    private var terminationObserver: NSObjectProtocol?
+    private var completedUpdateHIDRecoveryWorkItem: DispatchWorkItem?
+    private var hidMappingRecoveryWorkItem: DispatchWorkItem?
+    private var hidMappingRecoveryAttempt = 0
+    private var hidMappingRecoveryGeneration: UInt64 = 0
+    private let audioPreparationQueue = DispatchQueue(label: "RemoteMic.audioPreparation", qos: .userInitiated)
+    private var audioConfigurationGeneration: UInt64 = 0
+    private var audioStartupGeneration: UInt64 = 0
+    private var audioDeviceRefreshGeneration: UInt64 = 0
+    private var audioStartupPending = false
+    private let audioHardwareListenerQueue = DispatchQueue(label: "RemoteMic.audioHardware")
+    private var observedAudioHardwareAddresses: [AudioObjectPropertyAddress] = []
+    private var audioRecoveryWorkItem: DispatchWorkItem?
+    private var audioRecoveryGeneration: UInt64 = 0
+    private var audioRecoveryCoalescingState = AudioRecoveryCoalescingState()
+    private var virtualAudioReleaseGeneration: UInt64 = 0
+    private var pendingVirtualAudioRelease: (generation: UInt64, reason: String)?
+    private var systemAudioSuspensionState = SystemAudioSuspensionState()
+    private var managedDefaultInputTransition: ManagedDefaultInputTransition?
+    private lazy var audioHardwareListener: AudioObjectPropertyListenerBlock = { [weak self] count, addresses in
+        let properties = Self.audioHardwarePropertyNames(count: count, addresses: addresses)
+        self?.scheduleAudioRecovery(reason: "hardware_change", details: "properties=\(properties)")
+    }
+
+    var isRC003VoiceExtensionTestEnabled: Bool {
+        rc003VoiceExtensionTestEnabled
+    }
+
+    init(
+        settings: AppSettings = AppSettings(),
+        initialAudioDevices: [AudioDeviceInfo] = [],
+        privateFeature: PrivateFeatureIntegration = PrivateFeatureIntegration(),
+        macroFeature: MacroFeatureIntegration = MacroFeatureIntegration(),
+        membershipFeature: MembershipFeatureIntegration = MembershipFeatureIntegration(),
+        loginItemService: LoginItemService = LoginItemService(),
+        transcriptArchiveStore: TranscriptArchiveStore = TranscriptArchiveStore(),
+        rc003VoiceExtensionTestEnabled: Bool =
+            ProcessInfo.processInfo.arguments.contains("--rc003-voice-extension-test") ||
+            (Bundle.main.object(forInfoDictionaryKey: "RC003VoiceExtensionTestEnabled") as? Bool == true),
+        recordingAssetStore: RecordingAssetStore = RecordingAssetStore(),
+        diagnosticLogUploader: DiagnosticLogUploader = .shared
+    ) {
+        self.settings = settings
+        self.privateFeature = privateFeature
+        self.macroFeature = macroFeature
+        self.membershipFeature = membershipFeature
+        self.loginItemService = loginItemService
+        self.transcriptArchiveStore = transcriptArchiveStore
+        self.rc003VoiceExtensionTestEnabled = rc003VoiceExtensionTestEnabled
+        self.recordingAssetStore = recordingAssetStore
+        self.diagnosticLogUploader = diagnosticLogUploader
+        super.init()
+        if settings.siriRemoteEnabled, settings.siriRemoteNeedsUserAction {
+            siriRemoteAudioStatus = "unavailable:authorization_user_action_required"
+        }
+        membershipFeature.configureConfigurationBackup(settings: settings)
+        macroFeature.configurePortableTransfer(settings: settings) { [weak self] snapshot in
+            guard let self else { throw AppConfigurationError.invalidValues }
+            guard let envelope = try JSONSerialization.jsonObject(with: snapshot) as? [String:Any],
+                  let configuration = envelope["configuration"] else { throw AppConfigurationError.invalidValues }
+            let data = try JSONSerialization.data(withJSONObject: configuration)
+            let voice = try self.settings.voiceKeyConfigurationState(in: data)
+            if voice != self.settings.voiceKeyConfigurationState {
+                guard !self.isStreaming, self.releaseVoiceKeyIfNeeded() else { throw AppConfigurationError.unsafeVoiceKeyChange }
+            }
+        }
+        self.diagnosticLogUploader.setPrivateEventProvider(membershipFeature)
+        audioDevices = initialAudioDevices
+        appleRemoteAppSwitcherSession.setDiagnosticLogger { [weak self] message in
+            AppLogger.shared.write(
+                "APPLE REMOTE APP SWITCHER EVENT " +
+                    "operation_id=\(self?.appleRemoteAppSwitcherOperationLabel ?? "none") " +
+                    message
+            )
+        }
+        macroFeature.attachBindings(to: settings) { [weak self] device in
+            self?.cancelButtonMappingInteractions(device: device)
+        }
+        membershipAccessCancellable = membershipFeature.$buttonProfilesAccessDecision
+            .removeDuplicates()
+            .sink { [weak macroFeature] decision in
+                macroFeature?.updateButtonProfilesAccess(decision)
+            }
+        membershipCompanionAccessCancellable = membershipFeature.$canUseCompanionConnections
+            .removeDuplicates()
+            .sink { [weak self] allowed in
+                if !allowed { self?.disablePhoneRemoteConnection() }
+            }
+        membershipAccountCancellable = membershipFeature.$accountDisplayName
+            .removeDuplicates()
+            .sink { [weak self] account in
+                guard let self, account == nil else { return }
+                self.disablePhoneRemoteConnection()
+                self.disableWebRemoteConnection()
+                self.webRemoteState = .disabled
+            }
+        membershipEnvironmentCancellable = membershipFeature.$serviceEnvironmentForDiagnostics
+            .removeDuplicates()
+            .sink { [weak self] environment in
+                guard let self else { return }
+                self.disablePhoneRemoteConnection()
+                self.webRemoteSessionGeneration &+= 1
+                self.webRemoteSessionIdempotencyKey = nil
+                self.webRemoteClient.stop()
+                self.webRemoteState = .disabled
+                AppLogger.shared.write(
+                    "WEB REMOTE SESSION phase=cancelled result=cancelled " +
+                        "reason=service_environment_changed " +
+                        "membership_check=required"
+                )
+                self.objectWillChange.send()
+            }
+        audioOutput.onConfigurationChange = { [weak self] in
+            self?.scheduleAudioRecovery(reason: "engine_configuration_change")
+        }
+#if SAYALL_SIRI_REMOTE_ENABLED
+        siriRemoteFeature.onConnection = { [weak self] connection in
+            self?.handleAppleRemoteConnection(connection)
+        }
+        siriRemoteFeature.onDeclaredCapabilitiesChange = { [weak self] declared in
+            guard let self, self.siriDeclaredCapabilities != declared else { return }
+            self.siriDeclaredCapabilities = declared
+            // 触摸类设置是否出现取决于设备自报，必须跟着变。
+            AppLogger.shared.write(
+                "SIRI CAPABILITIES declared=\(BridgeAppModel.describeSiri(declared))"
+            )
+        }
+        siriRemoteFeature.onControlEvent = { [weak self] event in
+            self?.handleAppleRemoteControlEvent(event)
+        }
+        siriRemoteFeature.onSamples = { [weak self] samples in
+            self?.receiveAppleRemoteAudio(samples)
+        }
+        siriRemoteFeature.onStatus = { [weak self] status in
+            guard let self, self.settings.siriRemoteEnabled,
+                  !["ipc_ready", "capturing", "stopped"].contains(status) else { return }
+            if status.hasPrefix("unavailable:"), status.contains("authorization_") {
+                self.settings.siriRemoteNeedsUserAction = true
+            }
+            self.siriRemoteAudioStatus = status
+        }
+        siriRemoteFeature.onTouchFeedback = { [weak self] feedback in
+            guard let self else { return }
+            if case .clicked = feedback {
+                _ = siriRemoteCursorFeedback.activateHoveredElementIfAvailable()
+            }
+            siriRemoteCursorFeedback.handle(
+                feedback,
+                scrollArrowReversed: settings.siriRemoteScrollArrowReversed
+            )
+        }
+        siriRemoteFeature.onContextualScroll = { [weak self] pixels in
+            self?.handleAppleRemoteContextualScroll(pixels) ?? false
+        }
+        siriRemoteFeature.onCenterTapConfirmation = { [weak self] _ in
+            guard let self else { return false }
+            if self.appleRemoteAppSwitcherSession.isActive {
+                self.appleRemoteAppSwitcherTouchConfirmationCount += 1
+                let confirmed = self.appleRemoteAppSwitcherSession.confirm()
+                self.finishAppleRemoteAppSwitcher(
+                    reason: confirmed ? "touch_confirmed" : "touch_confirm_failed",
+                    confirmed: confirmed
+                )
+                return confirmed
+            }
+            return self.siriRemoteCursorFeedback.activateHoveredElementIfAvailable()
+        }
+        siriRemoteFeature.onPowerSnapshot = { [weak self] snapshot in
+            self?.handleAppleRemotePowerSnapshot(snapshot)
+        }
+#endif
+#if SAYALL_CHROMECAST_ENABLED
+        // 适配层固定使用主队列，因此这里必须**同步**调用：
+        // 包在发出 startRecognition 意图之后才写 MIC_OPEN，宿主必须在那之前备好音频出口，
+        // 否则最早几帧会落在还没有出口的时刻（首字丢失）。
+        chromecastFeature.onStatusChange = { [weak self] status in
+            self?.handleChromecastStatusChange(status)
+        }
+        chromecastFeature.onDeclaredCapabilitiesChange = { [weak self] declared in
+            guard let self else { return }
+            guard self.chromecastDeclaredCapabilities != declared else { return }
+            self.chromecastDeclaredCapabilities = declared
+            // 能力变化会改变「按一次说话」这类选项的可用性，必须立即同步到运行时与界面。
+            AppLogger.shared.write(
+                "CHROMECAST CAPABILITIES declared=\(Self.describe(declared))"
+            )
+            self.syncChromecastRuntimeState()
+        }
+        chromecastFeature.onVoiceStart = { [weak self] in
+            self?.beginChromecastVoice()
+        }
+        chromecastFeature.onVoiceSustain = { [weak self] in
+            // 远端换流不产生第二次用户可见动作，否则豆包侧识别会被立刻关掉。
+            self?.logChromecastSustain()
+        }
+        chromecastFeature.onVoiceStop = { [weak self] reason in
+            self?.endChromecastVoice(reason: reason)
+        }
+        chromecastFeature.onSamples = { [weak self] samples, _ in
+            self?.receiveChromecastAudio(samples)
+        }
+        chromecastFeature.onControlEvent = { [weak self] event in
+            self?.handleChromecastControlEvent(event)
+        }
+        chromecastFeature.onHIDPresenceChange = { [weak self] isPresent in
+            AppLogger.shared.write("CHROMECAST HID DEVICE present=\(isPresent)")
+        }
+        chromecastFeature.onLog = { message in
+            AppLogger.shared.write(message)
+        }
+#endif
+        phoneRemoteServer.isIdentityTrusted = { [weak self] fingerprint in
+            guard let self, self.membershipFeature.canStartCompanionConnection else { return false }
+            return self.settings.isPhoneIdentityTrusted(fingerprint)
+        }
+        phoneRemoteServer.onConnectionStateChange = { [weak self] connected in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if connected && !self.membershipFeature.canStartCompanionConnection {
+                    self.disablePhoneRemoteConnection()
+                    return
+                }
+                self.isPhoneRemoteConnected = connected
+            }
+        }
+        phoneRemoteServer.onInvitationChange = { [weak self] invitation in
+            DispatchQueue.main.async {
+                self?.phoneRemoteInvitation = invitation
+            }
+        }
+        phoneRemoteServer.onApprovalCancelled = { [weak self] in
+            self?.cancelPhoneApproval()
+        }
+        phoneRemoteServer.onApprovalRequested = { [weak self] deviceName, pairingCode, fingerprint, completion in
+            guard let self, self.isPhoneRemoteConnectionEnabled,
+                  self.membershipFeature.canStartCompanionConnection else {
+                completion(false)
+                return
+            }
+            requestPhoneApproval(
+                deviceName: deviceName,
+                pairingCode: pairingCode,
+                identityFingerprint: fingerprint,
+                completion: completion
+            )
+        }
+        phoneRemoteServer.onCommand = { [weak self] button, completion in
+            DispatchQueue.main.async {
+                guard let button = Self.appRemoteButton(rawValue: button.rawValue) else {
+                    completion(false)
+                    return
+                }
+                self?.observeMobileButton(button, source: .nearbyPhone)
+                completion(self?.performPhoneCommand(button, source: .nearbyPhone) ?? false)
+            }
+        }
+        phoneRemoteServer.onButtonEvent = { [weak self] button, phase, completion in
+            DispatchQueue.main.async {
+                guard let button = Self.appRemoteButton(rawValue: button.rawValue),
+                      let phase = Self.appRemoteButtonPhase(rawValue: phase.rawValue)
+                else {
+                    completion(false)
+                    return
+                }
+                if phase == .press {
+                    self?.observeMobileButton(button, source: .nearbyPhone)
+                }
+                completion(self?.handleMobileButtonEvent(
+                    button,
+                    phase: phase,
+                    source: .nearbyPhone
+                ) ?? false)
+            }
+        }
+        phoneRemoteServer.onButtonEventsReset = { [weak self] in
+            DispatchQueue.main.async {
+                self?.resetMobileButtonGestures(source: .nearbyPhone)
+            }
+        }
+        phoneRemoteServer.onVoiceStartResult = { [weak self] completion in
+            DispatchQueue.main.async {
+                guard let self else {
+                    completion(.unavailable)
+                    return
+                }
+                self.requestPhoneVoiceStart(
+                    source: .nearbyPhone,
+                    completion: completion
+                )
+            }
+        }
+        phoneRemoteServer.onVoiceStop = { [weak self] in
+            DispatchQueue.main.async {
+                self?.stopPhoneVoice(source: .nearbyPhone)
+            }
+        }
+        phoneRemoteServer.onAudio = { [weak self] samples in
+            DispatchQueue.main.async {
+                self?.receivePhoneAudio(samples, source: .nearbyPhone)
+            }
+        }
+        watchBluetoothServer.isIdentityTrusted = { [weak self] fingerprint in
+            guard let self, self.membershipFeature.canStartCompanionConnection else { return false }
+            return self.settings.isPhoneIdentityTrusted(fingerprint)
+        }
+        watchBluetoothServer.onConnectionStateChange = { [weak self] connected in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if connected && !self.membershipFeature.canStartCompanionConnection {
+                    self.disablePhoneRemoteConnection()
+                    return
+                }
+                self.isWatchRemoteConnected = connected
+            }
+        }
+        watchBluetoothServer.onApprovalCancelled = { [weak self] in
+            self?.cancelPhoneApproval()
+        }
+        watchBluetoothServer.onApprovalRequested = { [weak self] deviceName, pairingCode, fingerprint, completion in
+            guard let self, self.isPhoneRemoteConnectionEnabled,
+                  self.membershipFeature.canStartCompanionConnection else {
+                completion(false)
+                return
+            }
+            requestPhoneApproval(
+                deviceName: deviceName,
+                pairingCode: pairingCode,
+                identityFingerprint: fingerprint,
+                completion: completion
+            )
+        }
+        watchBluetoothServer.onCommand = { [weak self] button, completion in
+            DispatchQueue.main.async {
+                guard let button = Self.appRemoteButton(rawValue: button.rawValue) else {
+                    completion(false)
+                    return
+                }
+                self?.observeMobileButton(button, source: .nearbyPhone)
+                completion(self?.performPhoneCommand(button, source: .nearbyPhone, phraseSource: "watch") ?? false)
+            }
+        }
+        watchBluetoothServer.onButtonEvent = { [weak self] button, phase, completion in
+            DispatchQueue.main.async {
+                guard let button = Self.appRemoteButton(rawValue: button.rawValue),
+                      let phase = Self.appRemoteButtonPhase(rawValue: phase.rawValue)
+                else {
+                    completion(false)
+                    return
+                }
+                if phase == .press {
+                    self?.observeMobileButton(button, source: .nearbyPhone)
+                }
+                completion(self?.handleMobileButtonEvent(
+                    button,
+                    phase: phase,
+                    source: .nearbyPhone,
+                    phraseSource: "watch"
+                ) ?? false)
+            }
+        }
+        watchBluetoothServer.onButtonEventsReset = { [weak self] in
+            DispatchQueue.main.async {
+                self?.resetMobileButtonGestures(source: .nearbyPhone, phraseSource: "watch")
+            }
+        }
+        watchBluetoothServer.onVoiceStartResult = { [weak self] completion in
+            DispatchQueue.main.async {
+                guard let self else {
+                    completion(.unavailable)
+                    return
+                }
+                self.requestPhoneVoiceStart(
+                    source: .nearbyWatch,
+                    completion: completion
+                )
+            }
+        }
+        watchBluetoothServer.onVoiceStop = { [weak self] in
+            DispatchQueue.main.async {
+                self?.stopPhoneVoice(source: .nearbyWatch)
+            }
+        }
+        watchBluetoothServer.onAudio = { [weak self] samples in
+            DispatchQueue.main.async {
+                self?.receivePhoneAudio(samples, source: .nearbyWatch)
+            }
+        }
+        webRemoteClient.onStateChange = { [weak self] state in
+            self?.webRemoteState = state
+        }
+        webRemoteClient.onApprovalCancelled = { [weak self] in
+            self?.cancelWebApproval()
+        }
+        webRemoteClient.onApprovalRequested = { [weak self] deviceName, pairingCode, completion in
+            guard let self else {
+                completion(false)
+                return
+            }
+            requestWebApproval(
+                deviceName: deviceName,
+                pairingCode: pairingCode,
+                completion: completion
+            )
+        }
+        webRemoteClient.onCommand = { [weak self] button, completion in
+            DispatchQueue.main.async {
+                guard let button = Self.appRemoteButton(rawValue: button.rawValue) else {
+                    completion(false)
+                    return
+                }
+                self?.observeMobileButton(button, source: .webRemote)
+                completion(self?.performPhoneCommand(button, source: .webRemote) ?? false)
+            }
+        }
+        webRemoteClient.onButtonEvent = { [weak self] button, phase, completion in
+            DispatchQueue.main.async {
+                guard let button = Self.appRemoteButton(rawValue: button.rawValue),
+                      let phase = Self.appRemoteButtonPhase(rawValue: phase.rawValue)
+                else {
+                    completion(false)
+                    return
+                }
+                if phase == .press {
+                    self?.observeMobileButton(button, source: .webRemote)
+                }
+                completion(self?.handleMobileButtonEvent(
+                    button,
+                    phase: phase,
+                    source: .webRemote
+                ) ?? false)
+            }
+        }
+        webRemoteClient.onButtonEventsReset = { [weak self] in
+            DispatchQueue.main.async {
+                self?.resetMobileButtonGestures(source: .webRemote)
+            }
+        }
+        webRemoteClient.onVoiceStart = { [weak self] completion in
+            DispatchQueue.main.async {
+                guard let self else {
+                    completion(false)
+                    return
+                }
+                self.requestPhoneVoiceStart(source: .web) {
+                    completion($0 == .started)
+                }
+            }
+        }
+        webRemoteClient.onVoiceStop = { [weak self] in
+            DispatchQueue.main.async {
+                self?.stopPhoneVoice(source: .web)
+            }
+        }
+        webRemoteClient.onAudio = { [weak self] samples in
+            DispatchQueue.main.async {
+                self?.receivePhoneAudio(samples, source: .web)
+            }
+        }
+        transcriptHistoryToggleCancellable = settings.$localTranscriptHistoryEnabled
+            .removeDuplicates()
+            .sink { [weak self] isEnabled in
+                guard let self else { return }
+                if isEnabled || self.settings.localOriginalAudioRecordingEnabled {
+                    refreshTranscriptRecords()
+                } else {
+                    transcriptCaptureCoordinator.cancel()
+                }
+            }
+    }
+
+    func startIfNeeded() {
+        guard !started else { return }
+        started = true
+        startAudioSubsystem()
+#if SAYALL_SIRI_REMOTE_ENABLED
+        if settings.siriRemoteEnabled, !settings.siriRemoteNeedsUserAction {
+            siriRemoteFeature.start()
+        }
+#endif
+        applyHIDSettings()
+        refreshRemoteDeviceNames(reason: .startup)
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.stop()
+        }
+        let version = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "development"
+        AppLogger.shared.write(
+            "APP START version=\(version) rc003_test=\(rc003VoiceExtensionTestEnabled)"
+        )
+    }
+
+    func stop() {
+        membershipFeature.closeCommonPhrases(reason: "app_stop")
+        privateFeature.stop()
+        macroFeature.stop()
+        preferredInputSourceMonitor.stop()
+        voiceTargetActivityMonitor.stop()
+        transcriptCaptureCoordinator.cancel()
+        recordingAssetCoordinator.cancel(reason: "app_stop")
+        stopRecordingPlayback()
+        guard started else { return }
+        started = false
+        cancelHIDMappingRecovery(reason: "app_stop")
+        completedUpdateHIDRecoveryWorkItem?.cancel()
+        completedUpdateHIDRecoveryWorkItem = nil
+        audioStartupGeneration &+= 1
+        audioDeviceRefreshGeneration &+= 1
+        let shouldStopAudioOnPreparationQueue = audioStartupPending
+        audioStartupPending = false
+        audioRecoveryGeneration &+= 1
+        audioRecoveryWorkItem?.cancel()
+        audioRecoveryWorkItem = nil
+        audioRecoveryCoalescingState.reset()
+        stopObservingAudioHardware()
+        cancelTestToneIfNeeded(
+            statusMessage: LocalizedMessage("app.status.stopped"),
+            logReason: "app_stop"
+        )
+        stopLongRecording(reason: "app_stop")
+        finishRC003VoiceExtensionTest(reason: "app_stop")
+        voiceInputDestinationCoordinator.shutdown()
+        voiceFnTapSession.shutdown()
+        bluetoothBridges.values.forEach { $0.stop() }
+        discoveryBluetoothBridge?.stop()
+#if SAYALL_SIRI_REMOTE_ENABLED
+        appleRemoteVoiceCaptureRetryWorkItem?.cancel()
+        appleRemoteVoiceCaptureRetryWorkItem = nil
+        siriRemoteFeature.stop()
+        siriRemoteCursorFeedback.stop()
+        resetAllAppleRemoteState(reason: "app_stop")
+#endif
+#if SAYALL_CHROMECAST_ENABLED
+        chromecastVoiceStopOperation &+= 1
+        chromecastVoiceActive = false
+        isChromecastVoiceActive = false
+        chromecastVoiceStopping = false
+        pendingChromecastVoiceStart = false
+        pendingChromecastVoiceAudio.cancel()
+        pendingChromecastVoiceStopReason = nil
+        activeChromecastVoiceOperationID = nil
+        activeChromecastVoiceStartedAt = nil
+        // 按键通道必须先清干净再停 HID：否则残留的「按住」状态会拖到下一次启动。
+        resetChromecastButtonState(reason: "app_stop")
+        connectedChromecastProfileIDs.removeAll()
+        chromecastFeature.stop()
+        chromecastStatus = .disabled
+#endif
+        bluetoothBridges.removeAll()
+        bluetoothBridgeStates.removeAll()
+        discoveryBluetoothBridge = nil
+        pendingBluetoothVoiceStartIdentifier = nil
+        cancelPendingBluetoothVoiceAudio(reason: "app_stop")
+        pendingBluetoothVoiceStopRequested = false
+        activeBluetoothVoiceDeviceIdentifier = nil
+        phoneRemoteServer.stop()
+        watchBluetoothServer.stop()
+        webRemoteClient.stop()
+        isPhoneRemoteConnectionEnabled = false
+        isPhoneRemoteConnected = false
+        isWatchRemoteConnected = false
+        webRemoteState = .disabled
+        cancelVoiceSessionWarningTracking()
+        bluetoothVoiceActive = false
+#if SAYALL_SIRI_REMOTE_ENABLED
+        appleRemoteVoiceDevices.removeAll()
+        appleRemoteVoiceStopping = false
+        pendingAppleRemoteVoiceStarts.removeAll()
+        pendingAppleRemoteVoiceAudio.cancel()
+        pendingAppleRemoteVoiceStopRequested = false
+        appleRemoteVoiceStopOperation &+= 1
+        activeAppleRemoteVoiceOperationID = nil
+        activeAppleRemoteVoiceStartedAt = nil
+#endif
+        let cancelledPendingRestart = mobileVoiceLifecycle.reset()
+        cancelMobileVoiceNoAudioRecoveryTimer()
+        mobileVoiceAudioReceivedBatchCount = 0
+        activeMobileVoiceOperationID = nil
+        activeMobileVoiceStartedAt = nil
+        let completion = pendingMobileVoiceRestartCompletion
+        pendingMobileVoiceRestartCompletion = nil
+        pendingMobileVoiceStartSource = nil
+        pendingMobileVoiceAudio.cancel()
+        pendingMobileVoiceStopRequested = false
+        if cancelledPendingRestart {
+            completion?(.unavailable)
+        }
+        voiceSessionUsageSource = nil
+        voiceSessionApplicationName = nil
+        releaseVoiceKeyIfNeeded()
+        stopHIDMonitors()
+        isAudioOutputReady = false
+        virtualAudioReleaseGeneration &+= 1
+        pendingVirtualAudioRelease = nil
+        managedDefaultInputTransition = nil
+        if shouldStopAudioOnPreparationQueue {
+            audioPreparationQueue.async { [weak self] in
+                self?.audioOutput.stop()
+            }
+        } else {
+            audioOutput.stop()
+        }
+        voiceFunctionMapper.restore()
+        if let terminationObserver {
+            NotificationCenter.default.removeObserver(terminationObserver)
+            self.terminationObserver = nil
+        }
+        AppLogger.shared.write("APP STOP")
+    }
+
+    func refreshTranscriptRecords() {
+        transcriptArchiveOperationQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                let records = try transcriptArchiveStore.loadAll()
+                DispatchQueue.main.async { [weak self] in
+                    self?.transcriptRecords = records
+                }
+            } catch {
+                AppLogger.shared.write(
+                    "TRANSCRIPT ARCHIVE load_failed reason=load_all " +
+                        AppLogger.errorFields(error)
+                )
+            }
+        }
+        refreshRecordingAssets()
+        recordingToggleCancellable = settings.$localOriginalAudioRecordingEnabled
+            .removeDuplicates()
+            .sink { [weak self] isEnabled in
+                guard let self else { return }
+                if !isEnabled {
+                    self.recordingAssetCoordinator.cancel(reason: "feature_disabled")
+                }
+                self.refreshRecordingAssets()
+            }
+    }
+
+    func refreshRecordingAssets() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            do {
+                let assets = try self.recordingAssetStore.loadAll()
+                DispatchQueue.main.async { [weak self] in
+                    self?.recordingAssets = assets
+                }
+            } catch {
+                AppLogger.shared.write(
+                    "RECORDING ASSET load_failed reason=load_all " +
+                        AppLogger.errorFields(error)
+                )
+            }
+        }
+    }
+
+    func playRecording(_ asset: RecordingAssetManifest) {
+        recordingPlaybackError = nil
+        if recordingPlaybackAssetID == asset.id, let player = recordingPlayback {
+            if player.isPlaying {
+                player.pause()
+                isRecordingPlaybackPlaying = false
+                AppLogger.shared.write(
+                    "RECORDING ASSET playback_paused record_id=\(asset.id.uuidString)"
+                )
+            } else {
+                guard player.play() else {
+                    stopRecordingPlayback()
+                    recordingPlaybackError = .playerUnavailable
+                    AppLogger.shared.write(
+                        "RECORDING ASSET playback_resume_failed " +
+                            "record_id=\(asset.id.uuidString)"
+                    )
+                    return
+                }
+                isRecordingPlaybackPlaying = true
+                AppLogger.shared.write(
+                    "RECORDING ASSET playback_resumed record_id=\(asset.id.uuidString)"
+                )
+            }
+            return
+        }
+        var stage = RecordingPlaybackStage.resolveAsset
+        var prepareResult: Bool?
+        do {
+            let url = try recordingAssetStore.mediaURL(for: asset)
+            stopRecordingPlayback(reason: "superseded")
+            stage = .initializePlayer
+            recordingPlayback = try AVAudioPlayer(contentsOf: url)
+            recordingPlayback?.delegate = self
+            stage = .preparePlayer
+            prepareResult = recordingPlayback?.prepareToPlay()
+            recordingPlaybackAssetID = asset.id
+            stage = .startPlayback
+            guard recordingPlayback?.play() == true else {
+                throw RecordingPlaybackOperationError.playerRejected
+            }
+            isRecordingPlaybackPlaying = true
+        } catch {
+            let playerDurationMilliseconds = recordingPlayback.map {
+                Int(($0.duration * 1_000).rounded())
+            } ?? -1
+            let playerChannelCount = recordingPlayback?.numberOfChannels ?? -1
+            let playerSampleRate = recordingPlayback.map {
+                Int($0.format.sampleRate.rounded())
+            } ?? -1
+            stopRecordingPlayback()
+            let failure: RecordingPlaybackFailure = error is RecordingPlaybackOperationError
+                ? .playerUnavailable
+                : .classify(error)
+            recordingPlaybackError = failure
+            let failureFields = [
+                "RECORDING ASSET playback_failed",
+                "record_id=\(asset.id.uuidString)",
+                "session_id=\(asset.sessionID.uuidString)",
+                "application_key=\(AppLogger.stableToken(asset.applicationKey ?? "__unknown__"))",
+                "date=\(asset.localDateKey)",
+                "reason=\(failure.logReason)",
+                "stage=\(stage.rawValue)",
+                "source=\(asset.source.rawValue)",
+                "manifest_format_supported=\(asset.format == "m4a-aac")",
+                "manifest_bytes=\(asset.byteCount)",
+                "manifest_duration_ms=\(asset.durationMilliseconds)",
+                "prepare_result=\(prepareResult.map { String($0) } ?? "not_attempted")",
+                "player_duration_ms=\(playerDurationMilliseconds)",
+                "player_channels=\(playerChannelCount)",
+                "player_sample_rate_hz=\(playerSampleRate)",
+                AppLogger.errorFields(error)
+            ]
+            AppLogger.shared.write(failureFields.joined(separator: " "))
+            logRecordingPlaybackIntegrity(asset)
+        }
+    }
+
+    private func logRecordingPlaybackIntegrity(_ asset: RecordingAssetManifest) {
+        recordingPlaybackDiagnosticQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                let diagnostics = try self.recordingAssetStore.integrityDiagnostics(for: asset)
+                AppLogger.shared.write(
+                    "RECORDING ASSET playback_integrity " +
+                        "record_id=\(asset.id.uuidString) " +
+                        "session_id=\(asset.sessionID.uuidString) " +
+                        "actual_bytes=\(diagnostics.actualByteCount) " +
+                        "byte_count_match=\(diagnostics.byteCountMatches) " +
+                        "sha256_match=\(diagnostics.sha256Matches)"
+                )
+            } catch {
+                AppLogger.shared.write(
+                    "RECORDING ASSET playback_integrity_failed " +
+                        "record_id=\(asset.id.uuidString) " +
+                        "session_id=\(asset.sessionID.uuidString) " +
+                        AppLogger.errorFields(error)
+                )
+            }
+        }
+    }
+
+    func clearRecordingPlaybackError() {
+        recordingPlaybackError = nil
+    }
+
+    func stopRecordingPlayback(reason: String = "user") {
+        let hadPlayback = recordingPlayback != nil || recordingPlaybackAssetID != nil
+        recordingPlayback?.stop()
+        recordingPlayback = nil
+        recordingPlaybackAssetID = nil
+        isRecordingPlaybackPlaying = false
+        if hadPlayback {
+            AppLogger.shared.write(
+                "RECORDING ASSET playback_stopped reason=\(reason)"
+            )
+        }
+    }
+
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, player === self.recordingPlayback else { return }
+            self.recordingPlayback = nil
+            self.recordingPlaybackAssetID = nil
+            self.isRecordingPlaybackPlaying = false
+            AppLogger.shared.write(
+                "RECORDING ASSET playback_finished success=\(flag)"
+            )
+        }
+    }
+
+    func exportRecording(_ asset: RecordingAssetManifest) {
+        guard let sourceURL = try? recordingAssetStore.mediaURL(for: asset) else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = LocalizedMessage(
+            "statistics.recordings.export_filename", arguments: [asset.localDateKey]
+        ).text(using: LocalizationStore(settings: settings))
+        panel.allowedFileTypes = ["m4a"]
+        panel.begin { response in
+            guard response == .OK, let destinationURL = panel.url else { return }
+            do {
+                if FileManager.default.fileExists(atPath: destinationURL.path) {
+                    try FileManager.default.trashItem(at: destinationURL, resultingItemURL: nil)
+                }
+                try FileManager.default.copyItem(at: sourceURL, to: destinationURL)
+            } catch {
+                AppLogger.shared.write("RECORDING ASSET export_failed")
+            }
+        }
+    }
+
+    func deleteRecording(_ asset: RecordingAssetManifest) {
+        stopRecordingPlayback(reason: "deleted")
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.recordingAssetStore.delete(id: asset.id)
+                self.refreshRecordingAssets()
+            } catch {
+                AppLogger.shared.write("RECORDING ASSET delete_failed")
+            }
+        }
+    }
+
+    func deleteRecordingApplication(applicationKey: String) {
+        stopRecordingPlayback(reason: "application_deleted")
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.recordingAssetStore.deleteApplication(applicationKey: applicationKey)
+                self.refreshRecordingAssets()
+            } catch {
+                AppLogger.shared.write("RECORDING ASSET delete_application_failed")
+            }
+        }
+    }
+
+    func deleteAllRecordings() {
+        stopRecordingPlayback(reason: "all_deleted")
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            do {
+                try self.recordingAssetStore.deleteAll()
+                self.refreshRecordingAssets()
+            } catch {
+                AppLogger.shared.write("RECORDING ASSET delete_all_failed")
+            }
+        }
+    }
+
+    @discardableResult
+    func copyTranscript(_ record: TranscriptRecord) -> Bool {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        return pasteboard.writeObjects([record.originalTranscript as NSString])
+    }
+
+    func deleteTranscriptRecord(_ record: TranscriptRecord) {
+        updateTranscriptArchive {
+            try self.transcriptArchiveStore.deleteRecord(id: record.id)
+        }
+    }
+
+    func deleteTranscriptRecordAndRecording(
+        _ record: TranscriptRecord,
+        recording: RecordingAssetManifest
+    ) {
+        deleteTranscriptRecord(record)
+        deleteRecording(recording)
+    }
+
+    func deleteTranscriptApplication(applicationKey: String) {
+        updateTranscriptArchive {
+            try self.transcriptArchiveStore.deleteApplication(applicationKey: applicationKey)
+        }
+    }
+
+    func deleteAllTranscripts() {
+        updateTranscriptArchive {
+            try self.transcriptArchiveStore.deleteAll()
+        }
+    }
+
+    static func shouldRecoverHIDAfterCompletedUpdate(
+        completedUpdate: Bool,
+        customMappingEnabled: Bool
+    ) -> Bool {
+        completedUpdate && customMappingEnabled
+    }
+
+    static func shouldReapplyHIDSettings(
+        previousState: BluetoothBridgeState?,
+        currentState: BluetoothBridgeState
+    ) -> Bool {
+        guard case .ready = currentState else { return false }
+        guard let previousState else { return true }
+        if case .ready = previousState { return false }
+        return true
+    }
+
+    static func canStartBluetoothVoice(
+        mode: VoiceKeyMode,
+        voiceFnTapModeEnabled: Bool = false,
+        isVoiceKeyNeutralized: Bool
+    ) -> Bool {
+        (mode == .function && !voiceFnTapModeEnabled) || isVoiceKeyNeutralized
+    }
+
+    static func canFallbackVoiceKeyMode(
+        isStreaming: Bool,
+        allowVoiceKeyModeFallback: Bool
+    ) -> Bool {
+        !isStreaming && allowVoiceKeyModeFallback
+    }
+
+    static func voiceKeyCompatibilityWarning(
+        remoteConnected: Bool,
+        usesPrivateAdapter: Bool,
+        customMappingEnabled: Bool,
+        hidStatusKey: String,
+        voiceShortcutStatusKey: String,
+        karabinerRunning: Bool
+    ) -> VoiceKeyCompatibilityWarning? {
+        guard remoteConnected, !usesPrivateAdapter, customMappingEnabled else { return nil }
+
+        let isExclusiveAccess = hidStatusKey == "button_mapping.error.exclusive_access" ||
+            hidStatusKey == "button_mapping.error.exclusive_access.karabiner"
+        if isExclusiveAccess {
+            return hidStatusKey == "button_mapping.error.exclusive_access.karabiner" && karabinerRunning
+                ? .karabiner
+                : .otherInputTool
+        }
+
+        let isVoiceKeyMappingUnavailable = voiceShortcutStatusKey == "voice_button.status.waiting" ||
+            hidStatusKey == "button_mapping.status.disconnected" ||
+            hidStatusKey == "button_mapping.status.waiting_for_device"
+        return isVoiceKeyMappingUnavailable && karabinerRunning ? .karabiner : nil
+    }
+
+    @discardableResult
+    static func importConfiguration(
+        from data: Data,
+        into settings: AppSettings,
+        isStreaming: Bool,
+        releaseVoiceKey: () -> Bool
+    ) throws -> Bool {
+        let importedVoiceKeyConfiguration = try settings.voiceKeyConfigurationState(in: data)
+        let changesVoiceKeyConfiguration =
+            importedVoiceKeyConfiguration != settings.voiceKeyConfigurationState
+        if changesVoiceKeyConfiguration {
+            guard !isStreaming, releaseVoiceKey() else {
+                throw AppConfigurationError.unsafeVoiceKeyChange
+            }
+        }
+        try settings.importConfiguration(from: data)
+        return changesVoiceKeyConfiguration
+    }
+
+    func recoverHIDAfterCompletedUpdate(delay: TimeInterval = 2) {
+        guard started, settings.customMappingEnabled else { return }
+        completedUpdateHIDRecoveryWorkItem?.cancel()
+        stopHIDMonitors()
+        AppLogger.shared.write("HID UPDATE RECOVERY scheduled delay_ms=\(Int(delay * 1_000))")
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.started, self.settings.customMappingEnabled else { return }
+            self.completedUpdateHIDRecoveryWorkItem = nil
+            self.applyHIDSettings()
+            AppLogger.shared.write("HID UPDATE RECOVERY applied")
+        }
+        completedUpdateHIDRecoveryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    func refreshHIDAfterPermissionChange() {
+        let current = HIDPermissionSnapshot.current
+        guard HIDPermissionRecoveryPolicy.shouldReapplySettings(
+            started: started,
+            customMappingEnabled: settings.customMappingEnabled,
+            voiceKeyMode: settings.voiceKeyMode,
+            voiceFnTapModeEnabled: settings.voiceFnTapModeEnabled,
+            softwareVoiceKeyHeld: voiceKeyLatch.isHeld,
+            previous: appliedHIDPermissionSnapshot,
+            current: current
+        ) else { return }
+        let previous = appliedHIDPermissionSnapshot
+        AppLogger.shared.write(
+            "HID PERMISSIONS changed " +
+                "input=\(previous?.inputMonitoringGranted ?? false)->\(current.inputMonitoringGranted) " +
+                "accessibility=\(previous?.accessibilityGranted ?? false)->\(current.accessibilityGranted) " +
+                "recovery=apply_settings"
+        )
+        recordPublicDiagnosticEvent(
+            component: "permission",
+            action: "input_monitoring",
+            phase: "observed",
+            result: current.inputMonitoringGranted ? "granted" : "denied",
+            reason: "status_changed",
+            source: "app"
+        )
+        recordPublicDiagnosticEvent(
+            component: "permission",
+            action: "accessibility",
+            phase: "observed",
+            result: current.accessibilityGranted ? "granted" : "denied",
+            reason: "status_changed",
+            source: "app"
+        )
+        applyHIDSettings()
+    }
+
+    func reconnect() {
+        guard started else { return }
+        if bluetoothBridges.isEmpty && discoveryBluetoothBridge == nil {
+            AppLogger.shared.write("BLE RECONNECT starting_missing_bridges")
+            startBluetoothConnections()
+            return
+        }
+        if let selectedBluetoothBridge {
+            selectedBluetoothBridge.reconnectNow()
+        } else {
+            bluetoothBridges.values.forEach { $0.reconnectNow() }
+            discoveryBluetoothBridge?.reconnectNow()
+        }
+    }
+
+    func recheckRemoteInput() {
+        guard started, !isStreaming else { return }
+        AppLogger.shared.write("HID USER_RECHECK requested")
+        applyHIDSettings()
+        refreshVoiceKeyCompatibilityWarning()
+    }
+
+    func refreshVoiceKeyCompatibilityWarning() {
+        let warning = Self.voiceKeyCompatibilityWarning(
+            remoteConnected: isConnected,
+            usesPrivateAdapter: settings.selectedRemoteProfile?.model.usesPrivateAdapter == true,
+            customMappingEnabled: settings.customMappingEnabled,
+            hidStatusKey: hidStatus.key,
+            voiceShortcutStatusKey: voiceShortcutStatus.key,
+            karabinerRunning: HIDRemoteMonitor.isKarabinerElementsRunning()
+        )
+        guard warning != voiceKeyCompatibilityWarning else { return }
+        voiceKeyCompatibilityWarning = warning
+        let reason: String
+        switch warning {
+        case .karabiner: reason = "karabiner"
+        case .otherInputTool: reason = "other_input_tool"
+        case nil: reason = "none"
+        }
+        AppLogger.shared.write(
+            "HID VOICE_KEY_COMPATIBILITY state=\(warning == nil ? "clear" : "warning") reason=\(reason)"
+        )
+    }
+
+    private func recoverBluetoothVoiceLink(reason: String) {
+        let targets: [XiaomiBluetoothBridge]
+        if let selectedBluetoothBridge {
+            targets = [selectedBluetoothBridge]
+        } else {
+            targets = Array(bluetoothBridges.values)
+        }
+        AppLogger.shared.write(
+            "BLE RECOVERY phase=begin trigger=\(reason) target_bridges=\(targets.count) " +
+                "configured_bridges=\(bluetoothBridges.count) " +
+                "discovery=\(discoveryBluetoothBridge != nil) " +
+                "ready_bridges=\(readyBluetoothBridgeCount)"
+        )
+        if targets.isEmpty, discoveryBluetoothBridge == nil {
+            startBluetoothConnections()
+            AppLogger.shared.write(
+                "BLE RECOVERY phase=begin trigger=\(reason) cause=started_missing_bridges"
+            )
+            return
+        }
+        targets.forEach { $0.recoverVoiceLink(reason: reason) }
+        discoveryBluetoothBridge?.recoverVoiceLink(reason: reason)
+    }
+
+    private func setBluetoothSystemSuspended(_ suspended: Bool, reason: String) {
+        bluetoothBridges.values.forEach {
+            $0.setSystemSuspended(suspended, reason: reason)
+        }
+        discoveryBluetoothBridge?.setSystemSuspended(suspended, reason: reason)
+    }
+
+    private func resumeBluetoothConnectionCyclesIfNeeded(reason: String) {
+        bluetoothBridges.values.forEach {
+            $0.resumeConnectionCycleIfNeeded(reason: reason)
+        }
+        discoveryBluetoothBridge?.resumeConnectionCycleIfNeeded(reason: reason)
+    }
+
+    func refreshRemoteDiscovery() {
+        guard started else { return }
+        if discoveryBluetoothBridge == nil {
+            startBluetoothDiscoveryIfNeeded()
+        } else {
+            discoveryBluetoothBridge?.reconnectNow()
+        }
+        AppLogger.shared.write("BLE DISCOVERY refreshed_from_foreground")
+    }
+
+    func enablePhoneRemoteConnection() {
+        guard started, !isPhoneRemoteConnectionEnabled else { return }
+        guard membershipFeature.canStartCompanionConnection else {
+            objectWillChange.send()
+            return
+        }
+        isPhoneRemoteConnectionEnabled = true
+        phoneRemoteServer.start()
+        watchBluetoothServer.start()
+        AppLogger.shared.write("PHONE REMOTE enabled_by_user")
+    }
+
+    func disablePhoneRemoteConnection() {
+        guard isPhoneRemoteConnectionEnabled else { return }
+        isPhoneRemoteConnectionEnabled = false
+        isPhoneRemoteConnected = false
+        isWatchRemoteConnected = false
+        cancelPhoneApproval()
+        phoneRemoteServer.stop()
+        watchBluetoothServer.stop()
+        AppLogger.shared.write("PHONE REMOTE disabled_by_user")
+    }
+
+    func togglePhoneRemoteConnection() {
+        if isPhoneRemoteConnectionEnabled {
+            disablePhoneRemoteConnection()
+        } else {
+            enablePhoneRemoteConnection()
+        }
+    }
+
+    var isWatchRemoteConnectionEnabled: Bool {
+        isPhoneRemoteConnectionEnabled
+    }
+
+    func enableWatchRemoteConnection() {
+        enablePhoneRemoteConnection()
+    }
+
+    func toggleWatchRemoteConnection() {
+        togglePhoneRemoteConnection()
+    }
+
+    func enableWebRemoteConnection() {
+        guard started else { return }
+        guard membershipFeature.canStartCompanionConnection else {
+            webRemoteState = .membershipRequired
+            return
+        }
+        switch webRemoteState {
+        case .failed:
+            webRemoteSessionIdempotencyKey = nil
+        case let .waitingForPhone(_, _, expiresAt),
+             let .plusRequired(_, _, expiresAt):
+            if let expiresAt, expiresAt <= Date() {
+                webRemoteSessionIdempotencyKey = nil
+            }
+        default:
+            break
+        }
+        webRemoteSessionGeneration &+= 1
+        webRemoteSessionOperationCounter &+= 1
+        let generation = webRemoteSessionGeneration
+        let operationID = "web_remote_\(webRemoteSessionOperationCounter)"
+        webRemoteState = .connecting
+        AppLogger.shared.write(
+            "WEB REMOTE SESSION operation_id=\(operationID) " +
+                "phase=requested result=unknown"
+        )
+        Task { @MainActor [weak self] in
+            await self?.startWebRemoteConnection(
+                generation: generation,
+                operationID: operationID
+            )
+        }
+    }
+
+    func disableWebRemoteConnection() {
+        webRemoteSessionGeneration &+= 1
+        webRemoteSessionIdempotencyKey = nil
+        webRemoteClient.stop()
+        AppLogger.shared.write(
+            "WEB REMOTE SESSION phase=cancelled result=cancelled " +
+                "reason=cancelled_by_user"
+        )
+    }
+
+    @MainActor
+    private func startWebRemoteConnection(
+        generation: UInt64,
+        operationID: String
+    ) async {
+        let version = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String
+
+        if isWebRemoteMembershipBypassEnabled,
+           let relayURL = WebRemoteConfiguration.relayURL(),
+           Self.isLoopbackRelayURL(relayURL)
+        {
+            do {
+                let idempotencyKey = webRemoteSessionIdempotencyKey
+                    ?? UUID().uuidString.lowercased()
+                webRemoteSessionIdempotencyKey = idempotencyKey
+                let relayAuthorization = try await localTestWebRemoteAuthorization(
+                    relayURL: relayURL,
+                    idempotencyKey: idempotencyKey
+                )
+                guard generation == webRemoteSessionGeneration else { return }
+                webRemoteClient.start(
+                    authorization: relayAuthorization,
+                    macName: Host.current().localizedName ?? "Mac",
+                    appVersion: version,
+                    buttonTitles: remoteButtonTitles
+                )
+                AppLogger.shared.write(
+                    "WEB REMOTE SESSION operation_id=\(operationID) " +
+                        "phase=authorized result=accepted relay_mode=cloudflare_v1 " +
+                        "membership_check=bypassed"
+                )
+            } catch {
+                guard generation == webRemoteSessionGeneration else { return }
+                webRemoteState = .failed(webRemoteFailureMessage(.invalidResponse))
+                AppLogger.shared.write(
+                    "WEB REMOTE SESSION operation_id=\(operationID) " +
+                        "phase=failed result=failed reason=local_test_session_unavailable"
+                )
+            }
+            return
+        }
+
+        if membershipFeature.supportsRemoteSessionAuthorization {
+            do {
+                let idempotencyKey = webRemoteSessionIdempotencyKey
+                    ?? UUID().uuidString.lowercased()
+                webRemoteSessionIdempotencyKey = idempotencyKey
+                let authorization = try await membershipFeature
+                    .createRemoteSessionAuthorization(
+                        idempotencyKey: idempotencyKey,
+                        clientContractVersion: 1,
+                        testMembershipBypass: isWebRemoteMembershipBypassEnabled
+                    )
+                guard generation == webRemoteSessionGeneration else {
+                    AppLogger.shared.write(
+                        "WEB REMOTE SESSION operation_id=\(operationID) " +
+                            "phase=cancelled result=cancelled reason=stale_generation"
+                    )
+                    return
+                }
+                guard let sessionID = authorization.sessionID,
+                      let joinURL = authorization.joinURL,
+                      let pairingCode = authorization.pairingCode
+                else {
+                    throw HostRemoteSessionFailure.invalidResponse
+                }
+                if authorization.access == .plusRequired {
+                    webRemoteState = .membershipRequired
+                    AppLogger.shared.write(
+                        "WEB REMOTE SESSION operation_id=\(operationID) " +
+                            "phase=previewed result=rejected reason=plus_required " +
+                            "relay_mode=cloudflare_v1"
+                    )
+                    return
+                }
+                guard let creatorToken = authorization.creatorToken else {
+                    throw HostRemoteSessionFailure.invalidResponse
+                }
+                let relayAuthorization = WebRemoteSessionAuthorization.cloudflareV1(
+                    webSocketURL: authorization.webSocketURL,
+                    sessionID: sessionID,
+                    creatorToken: creatorToken,
+                    joinURL: joinURL,
+                    pairingCode: pairingCode,
+                    expiresAt: authorization.expiresAt
+                )
+                webRemoteClient.start(
+                    authorization: relayAuthorization,
+                    macName: Host.current().localizedName ?? "Mac",
+                    appVersion: version,
+                    buttonTitles: remoteButtonTitles
+                )
+                AppLogger.shared.write(
+                    "WEB REMOTE SESSION operation_id=\(operationID) " +
+                        "phase=authorized result=accepted relay_mode=cloudflare_v1 " +
+                        "membership_check=\(isWebRemoteMembershipBypassEnabled ? "bypassed" : "required")"
+                )
+                return
+            } catch let failure as HostRemoteSessionFailure {
+                guard generation == webRemoteSessionGeneration else { return }
+                if failure == .signInRequired || failure == .plusRequired {
+                    webRemoteState = .membershipRequired
+                } else {
+                    webRemoteState = .failed(webRemoteFailureMessage(failure))
+                }
+                AppLogger.shared.write(
+                    "WEB REMOTE SESSION operation_id=\(operationID) " +
+                        "phase=failed result=failed reason=\(webRemoteFailureReason(failure))"
+                )
+                return
+            } catch {
+                guard generation == webRemoteSessionGeneration else { return }
+                webRemoteState = .failed(
+                    webRemoteFailureMessage(.invalidResponse)
+                )
+                AppLogger.shared.write(
+                    "WEB REMOTE SESSION operation_id=\(operationID) " +
+                        "phase=failed result=failed reason=invalid_response"
+                )
+                return
+            }
+        }
+
+        guard generation == webRemoteSessionGeneration else { return }
+        webRemoteState = .unavailable
+        AppLogger.shared.write(
+            "WEB REMOTE SESSION operation_id=\(operationID) " +
+                "phase=failed result=failed reason=membership_component_unavailable"
+        )
+    }
+
+    var webRemoteServiceEnvironment: String {
+        membershipFeature.serviceEnvironmentForDiagnostics
+    }
+
+    var isWebRemoteMembershipBypassEnabled: Bool {
+        membershipFeature.remoteSessionMembershipBypassEnabled
+    }
+
+    // 兼容现有固定镜像的旧 UI 合同；不显示或恢复独立免检开关。
+    var isWebRemoteMembershipBypassAvailable: Bool { false }
+    func setWebRemoteMembershipBypassEnabled(_ enabled: Bool) {}
+
+    private static func isLoopbackRelayURL(_ url: URL) -> Bool {
+        guard url.scheme == "ws", let host = url.host?.lowercased() else { return false }
+        return host == "127.0.0.1" || host == "localhost" || host == "::1"
+    }
+
+    private func localTestWebRemoteAuthorization(
+        relayURL: URL,
+        idempotencyKey: String
+    ) async throws -> WebRemoteSessionAuthorization {
+        guard var components = URLComponents(url: relayURL, resolvingAgainstBaseURL: false),
+              Self.isLoopbackRelayURL(relayURL)
+        else { throw HostRemoteSessionFailure.invalidResponse }
+        components.scheme = relayURL.scheme == "wss" ? "https" : "http"
+        components.path = "/__local-test/remote-session"
+        components.query = nil
+        components.fragment = nil
+        guard let endpoint = components.url else {
+            throw HostRemoteSessionFailure.invalidResponse
+        }
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 30
+        request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key")
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              httpResponse.statusCode == 201
+        else { throw HostRemoteSessionFailure.invalidResponse }
+        let payload = try JSONDecoder().decode(LocalTestRemoteSessionResponse.self, from: data)
+        guard payload.relayMode == "cloudflare_v1",
+              let webSocketURL = URL(string: payload.webSocketURL),
+              let joinURL = URL(string: payload.joinURL),
+              Self.isLoopbackRelayURL(webSocketURL),
+              webSocketURL.host?.lowercased() == relayURL.host?.lowercased(),
+              webSocketURL.port == relayURL.port,
+              payload.sessionID.count == 22,
+              payload.creatorToken.count == 43,
+              payload.pairingCode.count == 4
+        else { throw HostRemoteSessionFailure.invalidResponse }
+        return .cloudflareV1(
+            webSocketURL: webSocketURL,
+            sessionID: payload.sessionID,
+            creatorToken: payload.creatorToken,
+            joinURL: joinURL,
+            pairingCode: payload.pairingCode,
+            expiresAt: Self.webRemoteISO8601Date(payload.expiresAt)
+        )
+    }
+
+    private static func webRemoteISO8601Date(_ value: String) -> Date? {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.date(from: value)
+    }
+
+    private func webRemoteFailureMessage(
+        _ failure: HostRemoteSessionFailure
+    ) -> String {
+        let key: String
+        switch failure {
+        case .signInRequired:
+            key = "connection.web.failure.sign_in_required"
+        case .deviceBindingRequired:
+            key = "connection.web.failure.device_binding_required"
+        case .plusRequired:
+            key = "connection.web.failure.plus_required"
+        case .upgradeRequired:
+            key = "connection.web.failure.upgrade_required"
+        case .unavailable:
+            key = "connection.web.failure.unavailable"
+        case .networkUnavailable:
+            key = "connection.web.failure.network_unavailable"
+        case .invalidResponse:
+            key = "connection.web.failure.invalid_response"
+        }
+        return LocalizedMessage(key).text(
+            using: LocalizationStore(
+                settings: settings,
+                resourceBundle: RemoteMicResourceBundle.mainOrDevelopment
+            )
+        )
+    }
+
+    private func webRemoteFailureReason(
+        _ failure: HostRemoteSessionFailure
+    ) -> String {
+        switch failure {
+        case .signInRequired: return "sign_in_required"
+        case .deviceBindingRequired: return "device_binding_required"
+        case .plusRequired: return "plus_required"
+        case .upgradeRequired: return "upgrade_required"
+        case .unavailable: return "remote_session_unavailable"
+        case .networkUnavailable: return "network_unavailable"
+        case .invalidResponse: return "invalid_response"
+        }
+    }
+
+    func updatePhoneRemoteButtonTitles(
+        bindings: [RemoteButton: ButtonAction],
+        shortcuts: [RemoteButton: CustomKeyboardShortcut],
+        applicationProfileIDs: [RemoteButton: UUID] = [:],
+        customApplicationProfiles: [CustomApplicationProfile] = [],
+        localization: LocalizationStore
+    ) {
+        var titles: [String: String] = [:]
+        for button in RemoteButton.allCases {
+            let action = bindings[button] ?? .disabled
+            let buttonProfileTitle = macroFeature.activeButtonProfileTitle(
+                remoteProfileID: settings.selectedRemoteProfileID,
+                button: button.rawValue,
+                trigger: ButtonTrigger.singleClick.rawValue
+            )
+            guard buttonProfileTitle != nil || action != AppSettings.defaultBindings[button] else {
+                continue
+            }
+            let fullTitle: String
+            if let buttonProfileTitle {
+                fullTitle = buttonProfileTitle
+            } else if action == .customShortcut {
+                fullTitle = shortcuts[button]?.displayName(using: localization)
+                    ?? action.displayName(using: localization)
+            } else if action == .openCustomApplication,
+                      let profileID = applicationProfileIDs[button],
+                      let profile = customApplicationProfiles.first(where: { $0.id == profileID })
+            {
+                fullTitle = profile.displayName
+            } else {
+                fullTitle = action.displayName(using: localization)
+            }
+            titles[button.rawValue] = String(fullTitle.prefix(10))
+        }
+        remoteButtonTitles = titles
+        phoneRemoteServer.updateButtonTitles(titles)
+        watchBluetoothServer.updateButtonTitles(titles)
+        webRemoteClient.updateButtonTitles(titles)
+    }
+
+    func refreshAudioDevices() {
+        audioDeviceRefreshGeneration &+= 1
+        let generation = audioDeviceRefreshGeneration
+        AppLogger.shared.write("AUDIO DEVICES refresh_requested id=\(generation)")
+        audioPreparationQueue.async { [weak self] in
+            let devices = CoreAudioDeviceCatalog.outputDevices()
+            let diagnostic = Self.audioDevicesDiagnostic(devices)
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.started,
+                      self.audioDeviceRefreshGeneration == generation
+                else { return }
+                self.publishAudioDevices(devices)
+                AppLogger.shared.write("AUDIO DEVICES refreshed id=\(generation) \(diagnostic)")
+            }
+        }
+    }
+
+    private func startAudioSubsystem() {
+        audioStartupGeneration &+= 1
+        let generation = audioStartupGeneration
+        let selectedDeviceUID = settings.selectedAudioDeviceUID
+        let rememberedDeviceUID = settings.lastKnownAudioDeviceUID
+        let hasHistoricalAudioConfiguration = settings.hasHistoricalAudioConfiguration
+        audioStartupPending = true
+        AppLogger.shared.write("AUDIO STARTUP scheduled id=\(generation)")
+        audioPreparationQueue.async { [weak self] in
+            guard let self else { return }
+            let devices = CoreAudioDeviceCatalog.outputDevices()
+            let devicesDiagnostic = Self.audioDevicesDiagnostic(devices)
+            AppLogger.shared.write("AUDIO DEVICES startup id=\(generation) \(devicesDiagnostic)")
+            let selection = VirtualAudioSelectionRecoveryPolicy.resolve(
+                selectedUID: selectedDeviceUID,
+                rememberedUID: rememberedDeviceUID,
+                availableDevices: devices,
+                hasHistoricalConfiguration: hasHistoricalAudioConfiguration
+            )
+            if selection.source != .currentSelection {
+                let phase = selection.uid == nil ? "skipped" : "candidate"
+                AppLogger.shared.write(
+                    "AUDIO SELECTION RECOVERY phase=\(phase) source=\(selection.source.rawValue) " +
+                        "reason=\(selection.reason?.rawValue ?? "none") " +
+                        "kind=\(selection.kind.rawValue) " +
+                        "supported_candidates=\(selection.supportedCandidateCount) " +
+                        "historical=\(hasHistoricalAudioConfiguration)"
+                )
+            }
+            AppLogger.shared.write(
+                "AUDIO REBIND begin reason=startup state={\(self.audioOutput.diagnosticState())}"
+            )
+            self.audioOutput.configureAsync(deviceUID: selection.uid ?? "") { [weak self] configured in
+                guard let self else { return }
+                let audioStatus = self.audioOutput.status
+                let isAudioOutputReady = self.audioOutput.isReadyForTestTone
+                let testToneStatus = isAudioOutputReady
+                    ? LocalizedMessage("audio.test_tone.ready")
+                    : LocalizedMessage("audio.output.none_or_unavailable")
+                let outputState = self.audioOutput.diagnosticState()
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    guard self.started, self.audioStartupGeneration == generation else {
+                        self.audioPreparationQueue.async { [weak self] in
+                            self?.audioOutput.stop()
+                        }
+                        return
+                    }
+                    if configured,
+                       selection.source != .currentSelection,
+                       let recoveredUID = selection.uid,
+                       self.settings.selectedAudioDeviceUID.isEmpty {
+                        self.settings.selectedAudioDeviceUID = recoveredUID
+                        AppLogger.shared.write(
+                            "AUDIO SELECTION RECOVERY phase=completed result=restored " +
+                            "source=\(selection.source.rawValue) kind=\(selection.kind.rawValue)"
+                        )
+                    } else if !configured, selection.source != .currentSelection {
+                        AppLogger.shared.write(
+                            "AUDIO SELECTION RECOVERY phase=failed result=not_restored " +
+                                "source=\(selection.source.rawValue) reason=configure_failed " +
+                                "kind=\(selection.kind.rawValue)"
+                        )
+                    }
+                    self.audioStartupPending = false
+                    self.publishAudioDevices(devices)
+                    self.audioStatus = audioStatus
+                    self.isAudioOutputReady = isAudioOutputReady
+                    self.testToneStatus = testToneStatus
+                    self.startObservingAudioHardware()
+                    if self.systemAudioSuspensionState.isSuspended {
+                        AppLogger.shared.write(
+                            "SYSTEM AUDIO startup_release reasons=\(self.systemAudioSuspensionState.diagnostic) " +
+                                "state={\(outputState)}"
+                        )
+                        self.releaseVirtualAudioOutputIfUnused(reason: "startup_system_suspended")
+                    }
+                    self.startBluetoothConnections()
+                    AppLogger.shared.write(
+                        "AUDIO REBIND finished reason=startup success=\(configured) status=\(audioStatus.key) " +
+                            "state={\(outputState)}"
+                    )
+                }
+            }
+        }
+    }
+
+    private func publishAudioDevices(_ devices: [AudioDeviceInfo]) {
+        audioDevices = devices
+        doubaoAudioStatus = DoubaoAudioDevicePolicy.status(in: devices)
+    }
+
+    private static func audioDevicesDiagnostic(_ devices: [AudioDeviceInfo]) -> String {
+        "outputs={\(CoreAudioDeviceCatalog.outputDevicesDiagnostic(devices))} " +
+            CoreAudioDeviceCatalog.routeDiagnostic()
+    }
+
+    var hasDoubaoAudioDevice: Bool {
+        DoubaoAudioDevicePolicy.device(in: audioDevices) != nil
+    }
+
+    func selectDoubaoAudioDevice() {
+        guard let device = DoubaoAudioDevicePolicy.device(in: audioDevices) else {
+            doubaoAudioStatus = LocalizedMessage(
+                "audio.compatibility.device_missing",
+                arguments: [DoubaoAudioDevicePolicy.deviceName]
+            )
+            return
+        }
+        settings.selectedAudioDeviceUID = device.uid
+        applyAudioSettings(reason: "doubao_device_selected")
+        doubaoAudioStatus = LocalizedMessage(
+            "audio.compatibility.device_selected",
+            arguments: [device.name]
+        )
+    }
+
+    func openDoubaoDriverInstructions(using localization: LocalizationStore) {
+        guard let instructions = localization.localizedURL(
+            forResource: "DoubaoInputMethodCompatibility",
+            withExtension: "md"
+        ) else {
+            return
+        }
+        NSWorkspace.shared.open(instructions)
+    }
+
+    func applyAudioSettings(
+        reason: String = "settings_change",
+        completion: @escaping (Bool) -> Void = { _ in }
+    ) {
+        stopLongRecording(reason: "audio_reconfigure")
+        guard shouldKeepVirtualAudioActive else {
+            releaseVirtualAudioOutputIfUnused(reason: reason)
+            completion(false)
+            return
+        }
+        configureVirtualAudioOutput(reason: reason, completion: completion)
+    }
+
+    func handleSystemAudioLifecycle(_ event: SystemAudioLifecycleEvent) {
+        let changed = systemAudioSuspensionState.apply(event)
+        AppLogger.shared.write(
+            "SYSTEM AUDIO event=\(event.rawValue) changed=\(changed) " +
+                "suspended=\(systemAudioSuspensionState.isSuspended) " +
+                "reasons=\(systemAudioSuspensionState.diagnostic) started=\(started) " +
+                "ready_bridges=\(readyBluetoothBridgeCount) " +
+                "configured_bridges=\(bluetoothBridges.count) " +
+                "discovery_bridge=\(discoveryBluetoothBridge != nil) " +
+                "bluetooth_voice=\(bluetoothVoiceActive) " +
+                "mobile_voice=\(activeMobileVoiceSource != nil) " +
+                "test_tone=\(isPlayingTestTone) audio_ready=\(isAudioOutputReady)"
+        )
+        guard started, changed else { return }
+        setBluetoothSystemSuspended(
+            systemAudioSuspensionState.isSuspended,
+            reason: event.rawValue
+        )
+        guard !audioStartupPending else {
+            AppLogger.shared.write(
+                "SYSTEM AUDIO lifecycle_deferred event=\(event.rawValue) cause=audio_startup_pending " +
+                    "suspended=\(systemAudioSuspensionState.isSuspended)"
+            )
+            if !systemAudioSuspensionState.isSuspended {
+                resumeBluetoothConnectionCyclesIfNeeded(reason: event.rawValue)
+            }
+            return
+        }
+
+        if event.isSuspending {
+            if hasActiveVirtualAudioSource {
+                AppLogger.shared.write(
+                    "SYSTEM AUDIO suspend_deferred event=\(event.rawValue) " +
+                        "bluetooth_voice=\(bluetoothVoiceActive) " +
+                        "mobile_voice=\(activeMobileVoiceSource != nil) " +
+                        "test_tone=\(isPlayingTestTone)"
+                )
+                return
+            }
+            releaseVirtualAudioOutputIfUnused(reason: "system_\(event.rawValue)")
+            return
+        }
+
+        guard !systemAudioSuspensionState.isSuspended else {
+            AppLogger.shared.write(
+                "SYSTEM AUDIO resume_deferred event=\(event.rawValue) " +
+                    "remaining_reasons=\(systemAudioSuspensionState.diagnostic)"
+            )
+            return
+        }
+        resumeVirtualAudioOutputIfNeeded(reason: "system_\(event.rawValue)")
+        if BluetoothWakeRecoveryPolicy.shouldForceReconnect(event: event, started: started) {
+            recoverBluetoothVoiceLink(reason: "system_wake")
+        } else if BluetoothWakeRecoveryPolicy.shouldRecoverVoiceLinkAfterResume(
+            started: started,
+            configuredBridgeCount: bluetoothBridges.count,
+            readyBridgeCount: readyBluetoothBridgeCount,
+            voiceLinkActive: hasActiveVirtualAudioSource
+        ) {
+            AppLogger.shared.write(
+                "SYSTEM AUDIO voice_link_recovery event=\(event.rawValue) " +
+                    "cause=no_ready_bridge ready_bridges=0 " +
+                    "configured_bridges=\(bluetoothBridges.count) " +
+                    "discovery_bridge=\(discoveryBluetoothBridge != nil) " +
+                    "audio_ready=\(isAudioOutputReady)"
+            )
+            recoverBluetoothVoiceLink(reason: "session_activated")
+        }
+        resumeBluetoothConnectionCyclesIfNeeded(reason: event.rawValue)
+    }
+
+    private func configureVirtualAudioOutput(
+        reason: String,
+        completion: @escaping (Bool) -> Void = { _ in }
+    ) {
+        cancelVirtualAudioReleaseIfPending(trigger: "rebind_\(reason)")
+        virtualAudioReleaseGeneration &+= 1
+        audioConfigurationGeneration &+= 1
+        let generation = audioConfigurationGeneration
+        let deviceUID = settings.selectedAudioDeviceUID
+        AppLogger.shared.write("AUDIO REBIND begin reason=\(reason) state={\(audioOutput.diagnosticState())}")
+        cancelTestToneIfNeeded(
+            statusMessage: LocalizedMessage("audio.test_tone.cancelled_device_changed"),
+            logReason: "device_reconfigure"
+        )
+        audioOutput.configureAsync(deviceUID: deviceUID) { [weak self] configured in
+            DispatchQueue.main.async {
+                guard let self,
+                      self.started,
+                      self.audioConfigurationGeneration == generation
+                else {
+                    completion(false)
+                    return
+                }
+                self.audioStatus = self.audioOutput.status
+                self.isAudioOutputReady = self.audioOutput.isReadyForTestTone
+                self.testToneStatus = self.isAudioOutputReady
+                    ? LocalizedMessage("audio.test_tone.ready")
+                    : LocalizedMessage("audio.output.none_or_unavailable")
+                AppLogger.shared.write(
+                    "AUDIO REBIND finished reason=\(reason) success=\(configured) status=\(self.audioStatus.key) " +
+                        "ready=\(self.isAudioOutputReady) selected_available=\(self.selectedAudioDeviceIsAvailable) " +
+                        "state={\(self.audioOutput.diagnosticState())}"
+                )
+                let publicReason: String
+                if reason.contains("voice") {
+                    publicReason = "voice_start"
+                } else if reason.contains("test_tone") {
+                    publicReason = "test_tone"
+                } else if reason.contains("startup") {
+                    publicReason = "startup"
+                } else {
+                    publicReason = "recovery"
+                }
+                self.recordPublicDiagnosticEvent(
+                    component: "audio",
+                    action: "configure",
+                    phase: "completed",
+                    result: configured && self.isAudioOutputReady ? "ready" : "failed",
+                    reason: publicReason,
+                    source: "app"
+                )
+                if configured {
+                    self.restoreManagedDefaultInputIfAppropriate(reason: reason)
+                }
+                completion(configured)
+            }
+        }
+    }
+
+    @discardableResult
+    private func ensureVirtualAudioOutputReady(reason: String) -> Bool {
+        isAudioOutputReady = audioOutput.isReadyForTestTone
+        guard !isAudioOutputReady else {
+            AppLogger.shared.write(
+                "AUDIO HEALTH ready reason=\(reason) state={\(audioOutput.diagnosticState())}"
+            )
+            return true
+        }
+        AppLogger.shared.write(
+            "AUDIO HEALTH stale reason=\(reason) state={\(audioOutput.diagnosticState())}"
+        )
+        configureVirtualAudioOutput(reason: reason)
+        return false
+    }
+
+    private func ensureVirtualAudioOutputReady(
+        reason: String,
+        completion: @escaping (Bool) -> Void
+    ) {
+        if audioOutput.isReadyForTestTone {
+            isAudioOutputReady = true
+            completion(true)
+            return
+        }
+        AppLogger.shared.write(
+            "AUDIO HEALTH stale reason=\(reason) state={\(audioOutput.diagnosticState())}"
+        )
+        configureVirtualAudioOutput(reason: reason, completion: completion)
+    }
+
+    private func startObservingAudioHardware() {
+        guard observedAudioHardwareAddresses.isEmpty else { return }
+        rememberCurrentUserInputDeviceIfNeeded(reason: "audio_monitor_start")
+        for selector in [
+            kAudioHardwarePropertyDevices,
+            kAudioHardwarePropertyDefaultInputDevice,
+            kAudioHardwarePropertyDefaultOutputDevice,
+            kAudioHardwarePropertyDefaultSystemOutputDevice,
+        ] {
+            var address = AudioObjectPropertyAddress(
+                mSelector: selector,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMain
+            )
+            let result = AudioObjectAddPropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                audioHardwareListenerQueue,
+                audioHardwareListener
+            )
+            if result == noErr {
+                observedAudioHardwareAddresses.append(address)
+            } else {
+                AppLogger.shared.write(
+                    "AUDIO RECOVERY listener_failed selector=\(selector) " +
+                        AppLogger.errorFields(domain: "os_status", code: Int(result))
+                )
+            }
+        }
+        AppLogger.shared.write("AUDIO ROUTE_MONITOR started properties=\(Self.audioHardwarePropertyNames(for: observedAudioHardwareAddresses))")
+    }
+
+    private func stopObservingAudioHardware() {
+        for var address in observedAudioHardwareAddresses {
+            _ = AudioObjectRemovePropertyListenerBlock(
+                AudioObjectID(kAudioObjectSystemObject),
+                &address,
+                audioHardwareListenerQueue,
+                audioHardwareListener
+            )
+        }
+        if !observedAudioHardwareAddresses.isEmpty {
+            AppLogger.shared.write("AUDIO ROUTE_MONITOR stopped properties=\(Self.audioHardwarePropertyNames(for: observedAudioHardwareAddresses))")
+        }
+        observedAudioHardwareAddresses.removeAll()
+    }
+
+    private func scheduleAudioRecovery(reason: String, details: String = "") {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, self.started else { return }
+            if details == "properties=default_input" {
+                self.rememberCurrentUserInputDeviceIfNeeded(reason: "hardware_change")
+            }
+            guard !self.settings.selectedAudioDeviceUID.isEmpty else {
+                AppLogger.shared.write("AUDIO RECOVERY ignored reason=\(reason) detail=\(details) no_selected_device")
+                return
+            }
+            guard details != "properties=default_input" else {
+                self.refreshAudioDevices()
+                AppLogger.shared.write(
+                    "AUDIO RECOVERY ignored reason=\(reason) detail=\(details) explicit_output_unchanged"
+                )
+                return
+            }
+            let configurationHealthy = self.audioOutput.isConfigurationHealthyForDiagnostics
+            guard !VirtualAudioRecoveryPolicy.shouldIgnoreDefaultSystemOutputChange(
+                details: details,
+                configurationHealthy: configurationHealthy
+            ) else {
+                self.refreshAudioDevices()
+                AppLogger.shared.write(
+                    "AUDIO RECOVERY ignored reason=\(reason) detail=\(details) " +
+                        "explicit_output_healthy=true state={\(self.audioOutput.diagnosticState())}"
+                )
+                return
+            }
+            guard self.shouldKeepVirtualAudioActive else {
+                self.refreshAudioDevices()
+                AppLogger.shared.write(
+                    "AUDIO RECOVERY ignored reason=\(reason) detail=\(details) virtual_audio_inactive"
+                )
+                return
+            }
+            self.audioRecoveryCoalescingState.recordEvent(reason: reason)
+            self.audioRecoveryGeneration &+= 1
+            let generation = self.audioRecoveryGeneration
+            self.audioRecoveryWorkItem?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self,
+                      self.started,
+                      self.audioRecoveryGeneration == generation
+                else { return }
+                let startedAtUptime = ProcessInfo.processInfo.systemUptime
+                let coalesced = self.audioRecoveryCoalescingState.consumePendingEvents()
+                let effectiveReason = coalesced.includesHardwareChange
+                    ? "hardware_change"
+                    : reason
+                AppLogger.shared.write(
+                    "AUDIO RECOVERY operation_id=\(generation) phase=started result=pending " +
+                        "requested_reason=\(reason) effective_reason=\(effectiveReason) " +
+                        "detail=\(details) coalesced_events=\(coalesced.count) " +
+                        "includes_hardware_change=\(coalesced.includesHardwareChange)"
+                )
+                if reason == "engine_configuration_change" && !coalesced.includesHardwareChange {
+                    let snapshot = self.audioOutput.diagnosticSnapshot()
+                    let configurationHealthy = snapshot.engineRunning &&
+                        snapshot.playerPlaying &&
+                        snapshot.boundToSelectedDevice == true
+                    guard AudioEngineConfigurationChangePolicy.needsRecovery(
+                        boundToSelectedDevice: snapshot.boundToSelectedDevice,
+                        configurationHealthy: configurationHealthy,
+                        hasActiveAudioSource: self.hasActiveVirtualAudioSource,
+                        pendingVoiceBufferCount: snapshot.pendingBuffers
+                    ) else {
+                        let ignoredReason = configurationHealthy
+                            ? "configuration_healthy"
+                            : "still_bound_idle"
+                        AppLogger.shared.write(
+                            "AUDIO RECOVERY operation_id=\(generation) phase=completed result=ignored " +
+                                "reason=engine_configuration_change decision=\(ignoredReason) " +
+                                "detail=\(details) coalesced_events=\(coalesced.count) " +
+                                "includes_hardware_change=false " +
+                                "active_audio=\(self.hasActiveVirtualAudioSource) " +
+                                "pending_buffers=\(snapshot.pendingBuffers) pending_samples=\(snapshot.pendingSamples) " +
+                                "engine_running=\(snapshot.engineRunning) player_playing=\(snapshot.playerPlaying) " +
+                                "bound_to_selected=\(self.optionalDiagnosticBool(snapshot.boundToSelectedDevice)) " +
+                                "elapsed_ms=\(self.elapsedMilliseconds(since: startedAtUptime)) " +
+                                "state={\(self.audioOutput.diagnosticState())}"
+                        )
+                        self.audioRecoveryWorkItem = nil
+                        return
+                    }
+                }
+                AppLogger.shared.write(
+                    "AUDIO RECOVERY operation_id=\(generation) phase=applying result=pending " +
+                        "reason=\(effectiveReason) detail=\(details) " +
+                        "coalesced_events=\(coalesced.count) " +
+                        "includes_hardware_change=\(coalesced.includesHardwareChange) " +
+                        "state={\(self.audioOutput.diagnosticState())}"
+                )
+                self.refreshAudioDevices()
+                self.applyAudioSettings(reason: "recovery_\(effectiveReason)") { [weak self] _ in
+                    guard let self,
+                          self.audioRecoveryGeneration == generation
+                    else { return }
+                    let completedSnapshot = self.audioOutput.diagnosticSnapshot()
+                    let ready = completedSnapshot.engineRunning &&
+                        completedSnapshot.playerPlaying &&
+                        completedSnapshot.boundToSelectedDevice == true
+                    AppLogger.shared.write(
+                        "AUDIO RECOVERY operation_id=\(generation) phase=completed " +
+                            "result=\(ready ? "ready" : "degraded") reason=\(effectiveReason) " +
+                            "engine_running=\(completedSnapshot.engineRunning) " +
+                            "player_playing=\(completedSnapshot.playerPlaying) " +
+                            "bound_to_selected=\(self.optionalDiagnosticBool(completedSnapshot.boundToSelectedDevice)) " +
+                            "pending_buffers=\(completedSnapshot.pendingBuffers) " +
+                            "pending_samples=\(completedSnapshot.pendingSamples) " +
+                            "elapsed_ms=\(self.elapsedMilliseconds(since: startedAtUptime)) " +
+                            "state={\(self.audioOutput.diagnosticState())}"
+                    )
+                    self.audioRecoveryWorkItem = nil
+                }
+            }
+            self.audioRecoveryWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1, execute: work)
+        }
+    }
+
+    private static func audioHardwarePropertyNames(
+        count: UInt32,
+        addresses: UnsafePointer<AudioObjectPropertyAddress>
+    ) -> String {
+        guard count > 0 else { return "none" }
+        return (0..<Int(count))
+            .map { audioHardwarePropertyName(addresses[$0].mSelector) }
+            .joined(separator: ",")
+    }
+
+    private static func audioHardwarePropertyNames(
+        for addresses: [AudioObjectPropertyAddress]
+    ) -> String {
+        addresses.map { audioHardwarePropertyName($0.mSelector) }.joined(separator: ",")
+    }
+
+    private static func audioHardwarePropertyName(
+        _ selector: AudioObjectPropertySelector
+    ) -> String {
+        switch selector {
+        case kAudioHardwarePropertyDevices:
+            return "devices"
+        case kAudioHardwarePropertyDefaultInputDevice:
+            return "default_input"
+        case kAudioHardwarePropertyDefaultOutputDevice:
+            return "default_output"
+        case kAudioHardwarePropertyDefaultSystemOutputDevice:
+            return "default_system_output"
+        default:
+            return "selector_\(selector)"
+        }
+    }
+
+    var canSendTestTone: Bool {
+        TestToneGate.canPlay(
+            hasSelectedDevice: selectedAudioDeviceIsAvailable,
+            isStreaming: isStreaming,
+            isPlaying: isPlayingTestTone
+        )
+    }
+
+    func sendTestTone() {
+        guard TestToneGate.canPlay(
+            hasSelectedDevice: selectedAudioDeviceIsAvailable,
+            isStreaming: isStreaming,
+            isPlaying: isPlayingTestTone
+        ) else {
+            if isStreaming {
+                testToneStatus = LocalizedMessage("audio.test_tone.blocked_voice_active")
+                AppLogger.shared.write("AUDIO TEST_TONE rejected_streaming")
+            } else if isPlayingTestTone {
+                testToneStatus = LocalizedMessage("audio.test_tone.already_playing")
+            } else {
+                testToneStatus = LocalizedMessage("audio.output.none_or_unavailable")
+            }
+            return
+        }
+
+        cancelVirtualAudioReleaseIfPending(trigger: "test_tone_start")
+        if !audioOutput.isReadyForTestTone {
+            ensureVirtualAudioOutputReady(reason: "test_tone") { [weak self] ready in
+                self?.startTestToneAfterAudioReady(ready)
+            }
+            return
+        }
+        startTestToneAfterAudioReady(true)
+    }
+
+    private func startTestToneAfterAudioReady(_ ready: Bool) {
+        guard ready else {
+            testToneStatus = LocalizedMessage("audio.test_tone.device_not_ready")
+            releaseVirtualAudioOutputIfUnused(reason: "test_tone_configure_failed")
+            return
+        }
+        testToneGeneration &+= 1
+        let generation = testToneGeneration
+        let started = audioOutput.playTestTone { [weak self] finished in
+            DispatchQueue.main.async {
+                self?.handleTestToneCompletion(generation: generation, finished: finished)
+            }
+        }
+        guard started else {
+            testToneStatus = LocalizedMessage("audio.test_tone.device_not_ready")
+            releaseVirtualAudioOutputIfUnused(reason: "test_tone_start_failed")
+            return
+        }
+        isPlayingTestTone = true
+        testToneStatus = LocalizedMessage("audio.test_tone.playing")
+        AppLogger.shared.write("AUDIO TEST_TONE played")
+    }
+
+    private func handleTestToneCompletion(generation: Int, finished: Bool) {
+        guard generation == testToneGeneration, isPlayingTestTone else { return }
+        isPlayingTestTone = false
+        testToneStatus = LocalizedMessage(finished ? "audio.test_tone.completed" : "audio.test_tone.cancelled")
+        AppLogger.shared.write("AUDIO TEST_TONE \(finished ? "finished" : "cut_short")")
+        releaseVirtualAudioOutputIfUnused(reason: "test_tone_finished")
+    }
+
+    private func cancelTestToneIfNeeded(statusMessage: LocalizedMessage, logReason: String) {
+        guard isPlayingTestTone else { return }
+        testToneGeneration &+= 1
+        isPlayingTestTone = false
+        audioOutput.cancelTestTone()
+        testToneStatus = statusMessage
+        AppLogger.shared.write("AUDIO TEST_TONE cancelled reason=\(logReason)")
+    }
+
+    func applyHIDSettings(
+        allowVoiceKeyModeFallback: Bool = true,
+        restartSiriRemote: Bool = true
+    ) {
+        let permissionSnapshot = HIDPermissionSnapshot.current
+        appliedHIDPermissionSnapshot = permissionSnapshot
+        if !permissionSnapshot.accessibilityGranted {
+            _ = releaseVoiceKeyIfNeeded()
+        }
+        if started, permissionSnapshot.inputMonitoringGranted {
+            preferredInputSourceMonitor.start()
+        } else {
+            preferredInputSourceMonitor.stop(
+                preservingExplicitVoiceSession: VoiceKeySessionPreservationPolicy
+                    .shouldPreserveInputSourceSession(
+                        latchHeld: voiceKeyLatch.isHeld,
+                        heldMode: heldVoiceKeyMode,
+                        pendingMode: pendingVoiceKeyMode
+                    )
+            )
+        }
+        if !settings.customMappingEnabled {
+            stopLongRecording(reason: "mapping_disabled")
+        }
+        if !settings.experimentalContinuousRecordingEnabled {
+            stopLongRecording(reason: "feature_disabled")
+        }
+
+        let requestedVoiceKeyMode = settings.voiceKeyMode
+        let accessibilityGranted = KeyboardInjector.isAccessibilityTrusted
+        let requestedFnTapMode = settings.voiceFnTapModeEnabled && requestedVoiceKeyMode == .function
+        if settings.voiceFnTapModeEnabled != requestedFnTapMode {
+            settings.voiceFnTapModeEnabled = requestedFnTapMode
+        }
+        if !requestedFnTapMode, voiceFnTapSession.requiresCleanupBeforeMapping {
+            voiceFnTapSession.setEnabled(false) { [weak self] in
+                self?.applyHIDSettings(
+                    allowVoiceKeyModeFallback: allowVoiceKeyModeFallback,
+                    restartSiriRemote: restartSiriRemote
+                )
+            }
+            return
+        }
+        requestNextHIDPermissionIfNeeded(
+            voiceFnTapModeRequested: requestedFnTapMode,
+            voiceKeyModeRequested: requestedVoiceKeyMode
+        )
+        let canFallbackVoiceKeyMode = Self.canFallbackVoiceKeyMode(
+            isStreaming: isStreaming,
+            allowVoiceKeyModeFallback: allowVoiceKeyModeFallback
+        )
+        var powerKeySuppressed: Bool
+        if requestedFnTapMode, accessibilityGranted {
+            powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: true)
+            if voiceFunctionMapper.isVoiceKeyNeutralized {
+                voiceFnTapSession.setEnabled(true)
+            } else if !canFallbackVoiceKeyMode, isStreaming {
+                AppLogger.shared.write(
+                    "VOICE FN TAP mode_preserved reason=voice_active_mapping_failed"
+                )
+            } else if !canFallbackVoiceKeyMode {
+                AppLogger.shared.write(
+                    "VOICE FN TAP mode_preserved reason=voice_start_mapping_failed"
+                )
+            } else if HIDMappingRecoveryPolicy.shouldPreserveFnTapPreferenceAfterMappingFailure(
+                hasMatchingServices: voiceFunctionMapper.hasMatchingServices
+            ) {
+                voiceFnTapSession.setEnabled(false)
+                AppLogger.shared.write(
+                    "VOICE FN TAP mode_pending_mapping reason=no_matching_service"
+                )
+                scheduleHIDMappingRecoveryIfNeeded(
+                    restartSiriRemote: restartSiriRemote
+                )
+            } else {
+                settings.voiceFnTapModeEnabled = false
+                voiceFnTapSession.setEnabled(false)
+                powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: false)
+            }
+        } else if requestedVoiceKeyMode != .function {
+            powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: true)
+            if !voiceFunctionMapper.isVoiceKeyNeutralized {
+                if voiceFunctionMapper.hasMatchingServices {
+                    if isStreaming {
+                        voiceShortcutStatus = LocalizedMessage("voice_button.status.waiting")
+                        AppLogger.shared.write(
+                            "VOICE KEY mode_preserved reason=voice_active_mapping_failed " +
+                                "mode=\(requestedVoiceKeyMode.rawValue)"
+                        )
+                    } else if canFallbackVoiceKeyMode {
+                        settings.voiceKeyMode = .function
+                        powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: false)
+                        AppLogger.shared.write(
+                            "VOICE KEY mode_fallback reason=voice_mapping_failed " +
+                                "mode=\(requestedVoiceKeyMode.rawValue)"
+                        )
+                    } else {
+                        voiceShortcutStatus = LocalizedMessage("voice_button.status.waiting")
+                        AppLogger.shared.write(
+                            "VOICE KEY mode_preserved reason=voice_start_mapping_failed " +
+                                "mode=\(requestedVoiceKeyMode.rawValue)"
+                        )
+                    }
+                } else if !accessibilityGranted {
+                    voiceShortcutStatus = LocalizedMessage(
+                        "connection.voice_key_mode.command_permission"
+                    )
+                    AppLogger.shared.write(
+                        "VOICE KEY mode_pending_permission_and_mapping " +
+                            "mode=\(requestedVoiceKeyMode.rawValue)"
+                    )
+                } else {
+                    voiceShortcutStatus = LocalizedMessage("voice_button.status.waiting")
+                    AppLogger.shared.write(
+                        "VOICE KEY mode_pending_mapping reason=no_matching_service " +
+                            "mode=\(requestedVoiceKeyMode.rawValue)"
+                    )
+                }
+            } else if !accessibilityGranted {
+                voiceShortcutStatus = LocalizedMessage(
+                    "connection.voice_key_mode.command_permission"
+                )
+                AppLogger.shared.write(
+                    "VOICE KEY mode_pending_permission mode=\(requestedVoiceKeyMode.rawValue)"
+                )
+            }
+        } else {
+            if requestedFnTapMode {
+                settings.voiceFnTapModeEnabled = false
+            }
+            voiceFnTapSession.setEnabled(false)
+            powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: false)
+        }
+        startHIDMonitors(powerKeySuppressed: powerKeySuppressed)
+#if SAYALL_SIRI_REMOTE_ENABLED
+        if started, restartSiriRemote, settings.siriRemoteEnabled {
+            siriRemoteFeature.restart(customMappingEnabled: settings.customMappingEnabled)
+        } else if started, settings.siriRemoteEnabled {
+            AppLogger.shared.write(
+                "SIRI REMOTE SETTINGS phase=completed result=preserved " +
+                    "reason=voice_key_configuration_change"
+            )
+        }
+        refreshAppleRemoteHIDStatus()
+#endif
+#if SAYALL_CHROMECAST_ENABLED
+        syncChromecastRuntimeState()
+#endif
+        completeHIDMappingRecoveryIfNeeded()
+        refreshVoiceKeyCompatibilityWarning()
+    }
+
+    func enableSiriRemoteForOnboarding() {
+        settings.beginOnboardingSiriRemoteTrial()
+        let wasEnabled = settings.siriRemoteEnabled
+        setSiriRemoteEnabled(true)
+        if !wasEnabled {
+            AppLogger.shared.write(
+                "ONBOARDING SIRI_REMOTE phase=changed result=temporarily_enabled"
+            )
+        }
+    }
+
+    func completeOnboarding() {
+        let shouldDisable = settings.shouldDisableOnboardingSiriRemote(
+            accessDecision: membershipFeature.buttonProfilesAccessDecision
+        )
+        if shouldDisable {
+            setSiriRemoteEnabled(false)
+            guard !settings.siriRemoteEnabled else {
+                AppLogger.shared.write(
+                    "ONBOARDING SIRI_REMOTE phase=blocked reason=voice_session_active"
+                )
+                return
+            }
+        }
+        AppLogger.shared.write(
+            "ONBOARDING SIRI_REMOTE phase=completed result=\(shouldDisable ? "disabled" : "preserved") " +
+                "reason=\(shouldDisable ? "membership_required" : "existing_state_or_access")"
+        )
+        settings.completeOnboarding()
+    }
+
+    func setSiriRemoteEnabled(_ enabled: Bool) {
+        guard enabled || activePhysicalVoiceControlSource != .siriRemote else { return }
+        settings.siriRemoteEnabled = enabled
+#if SAYALL_SIRI_REMOTE_ENABLED
+        if enabled {
+            prepareSiriRemoteFromUserAction()
+        } else {
+            siriRemoteFeature.stop()
+            siriRemoteCursorFeedback.stop()
+            resetAllAppleRemoteState(reason: "feature_disabled")
+            siriRemoteAudioStatus = "disabled"
+        }
+#endif
+        AppLogger.shared.write("SIRI REMOTE ACTIVATION phase=changed enabled=\(enabled)")
+    }
+
+    /// Call only from enable/retry controls, never from startup or device discovery.
+    func prepareSiriRemoteFromUserAction() {
+#if SAYALL_SIRI_REMOTE_ENABLED
+        guard settings.siriRemoteEnabled else { return }
+        guard activePhysicalVoiceControlSource != .siriRemote else { return }
+        settings.siriRemoteNeedsUserAction = false
+        if siriRemoteAudioStatus == "disabled" { siriRemoteAudioStatus = "preparing_hci" }
+        AppLogger.shared.write("SIRI REMOTE ACTIVATION phase=requested source=user_action")
+        siriRemoteFeature.start(userInitiated: true)
+        siriRemoteFeature.restart(customMappingEnabled: settings.customMappingEnabled)
+#endif
+    }
+
+    private func scheduleHIDMappingRecoveryIfNeeded(
+        restartSiriRemote: Bool = true
+    ) {
+        guard hidMappingRecoveryWorkItem == nil else { return }
+        guard let delay = HIDMappingRecoveryPolicy.retryDelay(
+            forAttempt: hidMappingRecoveryAttempt,
+            started: started,
+            readyBridgeCount: readyBluetoothBridgeCount,
+            hasMatchingServices: voiceFunctionMapper.hasMatchingServices
+        ) else {
+            if started,
+               readyBluetoothBridgeCount > 0,
+               !voiceFunctionMapper.hasMatchingServices,
+               hidMappingRecoveryAttempt == HIDMappingRecoveryPolicy.retryDelays.count {
+                AppLogger.shared.write(
+                    "HID MAPPING RECOVERY exhausted attempts=\(hidMappingRecoveryAttempt) " +
+                        "ready_bridges=\(readyBluetoothBridgeCount)"
+                )
+            }
+            return
+        }
+
+        let attempt = hidMappingRecoveryAttempt + 1
+        hidMappingRecoveryAttempt = attempt
+        hidMappingRecoveryGeneration &+= 1
+        let generation = hidMappingRecoveryGeneration
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, self.hidMappingRecoveryGeneration == generation else { return }
+            self.hidMappingRecoveryWorkItem = nil
+            guard self.started,
+                  self.readyBluetoothBridgeCount > 0,
+                  !self.voiceFunctionMapper.hasMatchingServices
+            else {
+                self.cancelHIDMappingRecovery(reason: "conditions_changed")
+                return
+            }
+            AppLogger.shared.write(
+                "HID MAPPING RECOVERY applying attempt=\(attempt) " +
+                    "ready_bridges=\(self.readyBluetoothBridgeCount)"
+            )
+            self.applyHIDSettings(restartSiriRemote: restartSiriRemote)
+            if !self.voiceFunctionMapper.hasMatchingServices {
+                self.scheduleHIDMappingRecoveryIfNeeded(
+                    restartSiriRemote: restartSiriRemote
+                )
+            }
+        }
+        hidMappingRecoveryWorkItem = workItem
+        AppLogger.shared.write(
+            "HID MAPPING RECOVERY scheduled attempt=\(attempt) " +
+                "delay_ms=\(Int(delay * 1_000)) ready_bridges=\(readyBluetoothBridgeCount)"
+        )
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    private func completeHIDMappingRecoveryIfNeeded() {
+        guard voiceFunctionMapper.hasMatchingServices,
+              hidMappingRecoveryWorkItem != nil || hidMappingRecoveryAttempt > 0
+        else { return }
+        let attempts = hidMappingRecoveryAttempt
+        hidMappingRecoveryGeneration &+= 1
+        hidMappingRecoveryWorkItem?.cancel()
+        hidMappingRecoveryWorkItem = nil
+        hidMappingRecoveryAttempt = 0
+        AppLogger.shared.write(
+            "HID MAPPING RECOVERY completed attempts=\(attempts) " +
+                "matched=\(voiceFunctionMapper.matchedServiceCount)"
+        )
+    }
+
+    private func cancelHIDMappingRecovery(reason: String) {
+        guard hidMappingRecoveryWorkItem != nil || hidMappingRecoveryAttempt > 0 else { return }
+        let attempts = hidMappingRecoveryAttempt
+        hidMappingRecoveryGeneration &+= 1
+        hidMappingRecoveryWorkItem?.cancel()
+        hidMappingRecoveryWorkItem = nil
+        hidMappingRecoveryAttempt = 0
+        AppLogger.shared.write(
+            "HID MAPPING RECOVERY cancelled reason=\(reason) attempts=\(attempts)"
+        )
+    }
+
+    private func startHIDMonitors(powerKeySuppressed: Bool) {
+        stopHIDMonitors()
+        let backOnlyMode = !settings.customMappingEnabled && (
+            settings.onboardingControlMethod == .physicalRemote ||
+            settings.onboardingRemoteAvailability == .hasRemote ||
+            settings.remoteDeviceProfiles.contains { $0.hidFingerprint != nil }
+        )
+        hidPowerKeySuppressed = powerKeySuppressed
+        hidAllowedLocationIDs = settings.customMappingEnabled
+            ? voiceFunctionMapper.powerSuppressedLocationIDs
+            : nil
+        guard settings.customMappingEnabled || backOnlyMode else {
+            hidStatus = LocalizedMessage("button_mapping.status.system_managed")
+            return
+        }
+        if settings.customMappingEnabled { _ = hidEventSuppressor.start() }
+        for profile in settings.remoteDeviceProfiles {
+            // 苹果遥控器与 Chromecast 都由各自的私有链路驱动；它们的档案不能被小米 HID
+            // 发现链路当成候选，否则会给一个不存在的小米设备建监视器。
+            guard !profile.model.usesPrivateAdapter,
+                  let fingerprint = profile.hidFingerprint
+            else { continue }
+            let monitor = makeHIDMonitor(
+                profileID: profile.id,
+                targetFingerprint: fingerprint
+            )
+            hidMonitors[fingerprint] = monitor
+            monitor.start(
+                powerKeySuppressed: powerKeySuppressed,
+                allowedLocationIDs: hidAllowedLocationIDs,
+                allowBackOnly: backOnlyMode
+            )
+        }
+        startHIDDiscoveryIfNeeded(allowBackOnly: backOnlyMode)
+    }
+
+    private func cancelButtonMappingInteractions(device: UUID?) {
+        hidMonitors.values.filter { $0.profileID == device }.forEach { $0.cancelMappingInteractions() }
+        if discoveryHIDMonitor?.profileID == device { discoveryHIDMonitor?.cancelMappingInteractions() }
+        if settings.selectedRemoteProfileID == device {
+            resetMobileButtonGestures(source: .nearbyPhone)
+            resetMobileButtonGestures(source: .webRemote)
+        }
+        #if SAYALL_CHROMECAST_ENABLED
+        if chromecastProfileID == device { resetChromecastButtonState(reason: "mapping_changed") }
+        #endif
+        #if SAYALL_SIRI_REMOTE_ENABLED
+        let devices = appleRemoteProfileIDs.filter { $0.value == device }.map(\.key)
+        if appleRemoteAppSwitcherProfileID == device, appleRemoteAppSwitcherSession.isActive {
+            finishAppleRemoteAppSwitcher(reason: "mapping_changed", confirmed: false)
+        }
+        for siriDevice in devices {
+            let doubleKeys = appleRemoteDoubleClickTimers.keys.filter { $0.device == siriDevice }
+            doubleKeys.forEach { appleRemoteDoubleClickTimers.removeValue(forKey: $0)?.cancel() }
+            let longKeys = appleRemoteLongPressTimers.keys.filter { $0.device == siriDevice }
+            longKeys.forEach { appleRemoteLongPressTimers.removeValue(forKey: $0)?.cancel() }
+            let repeatKeys = appleRemoteRepeatTimers.keys.filter { $0.device == siriDevice }
+            repeatKeys.forEach { cancelAppleRemoteRepeat(for: $0.button, device: siriDevice, reason: "mapping_changed") }
+            appleRemoteGestureRecognizers.removeValue(forKey: siriDevice)
+            appleRemoteActiveButtons.removeValue(forKey: siriDevice)
+        }
+        refreshAppleRemoteActiveButtons()
+        #endif
+        AppLogger.shared.write("BUTTON CONFIGURATION phase=completed result=interactions_cancelled")
+    }
+
+    private func stopHIDMonitors() {
+        hidMonitors.values.forEach { $0.stop() }
+        discoveryHIDMonitor?.stop()
+        hidMonitors.removeAll()
+        discoveryHIDMonitor = nil
+        hidEventSuppressor.stop()
+        activeRemoteButtons = []
+    }
+
+    private func startHIDDiscoveryIfNeeded(allowBackOnly: Bool = false) {
+        guard (settings.customMappingEnabled || allowBackOnly), discoveryHIDMonitor == nil else { return }
+        let monitor = makeHIDMonitor(
+            profileID: nil,
+            targetFingerprint: nil,
+            excludedFingerprints: { [weak self] in
+                guard let self else { return [] }
+                return Set(self.hidMonitors.keys)
+            }
+        )
+        discoveryHIDMonitor = monitor
+        monitor.start(
+            powerKeySuppressed: hidPowerKeySuppressed,
+            allowedLocationIDs: hidAllowedLocationIDs,
+            allowBackOnly: allowBackOnly
+        )
+    }
+
+    private func makeHIDMonitor(
+        profileID: UUID?,
+        targetFingerprint: String?,
+        excludedFingerprints: @escaping () -> Set<String> = { [] }
+    ) -> HIDRemoteMonitor {
+        let monitor = HIDRemoteMonitor(
+            settings: settings,
+            profileID: profileID,
+            targetFingerprint: targetFingerprint,
+            excludedFingerprints: excludedFingerprints,
+            eventSuppressor: hidEventSuppressor,
+            ownsEventSuppressor: false,
+            actionPerformer: { [weak self] _, _, configured in
+                self?.performExternalConfiguredAction(configured) ?? false
+            },
+            overrideActionPerformer: { [weak self] profileID, button, trigger in
+                self?.performButtonProfileBoundAction(
+                    profileID: profileID,
+                    button: button,
+                    trigger: trigger,
+                    source: Self.commonPhraseHIDSource(profileID)
+                ) == true
+            },
+            hasOverrideBinding: { [weak self] profileID, button, trigger in
+                self?.macroFeature.hasActiveBinding(
+                    profileID: profileID,
+                    button: button,
+                    trigger: trigger
+                ) == true
+            }
+        )
+        monitor.claimsRuntimeButton = { [weak self] profileID, button in
+            self?.membershipFeature.claimsCommonPhrase(
+                button: button.rawValue,
+                source: Self.commonPhraseHIDSource(profileID)
+            ) == true
+        }
+        monitor.onRuntimeButton = { [weak self] profileID, button, phase in
+            self?.membershipFeature.handleCommonPhrase(
+                button: button.rawValue,
+                phase: phase.rawValue,
+                source: Self.commonPhraseHIDSource(profileID)
+            ) == true
+        }
+        monitor.onInputReset = { [weak self] profileID in
+            self?.membershipFeature.resetCommonPhrases(source: Self.commonPhraseHIDSource(profileID))
+        }
+        monitor.onStatus = { [weak self, weak monitor] value in
+            guard let self, let monitor else { return }
+            if self.settings.selectedRemoteProfile?.model.isAppleSiriRemote == true {
+                return
+            }
+            if monitor.profileID == self.settings.selectedRemoteProfileID || monitor.profileID == nil {
+                self.hidStatus = value
+                self.refreshVoiceKeyCompatibilityWarning()
+            }
+        }
+        monitor.onActiveButtons = { [weak self] profileID, buttons in
+            guard let self, profileID == self.settings.selectedRemoteProfileID else { return }
+            self.activeRemoteButtons = buttons
+        }
+        monitor.onButtonPressed = { [weak self, weak monitor] profileID, fingerprint, button in
+            guard let self, let monitor else {
+                return profileID.map { ($0, true) }
+            }
+            let existingProfileID = profileID
+                ?? self.settings.profileID(forHIDFingerprint: fingerprint)
+            let resolvedProfileID = existingProfileID
+                ?? self.settings.registerHIDRemote(fingerprint: fingerprint)
+            if resolvedProfileID == self.settings.selectedRemoteProfileID,
+               self.macroFeature.isEditorActive {
+                self.macroFeature.noteButtonInteraction(button: button)
+            }
+            let isNewBinding = existingProfileID == nil
+            if isNewBinding {
+                monitor.assignProfileID(resolvedProfileID)
+                self.hidMonitors[fingerprint] = monitor
+                if self.discoveryHIDMonitor === monitor {
+                    self.discoveryHIDMonitor = nil
+                    self.startHIDDiscoveryIfNeeded()
+                }
+            }
+            self.selectRemoteProfile(resolvedProfileID)
+            self.lastRemoteButtonPress = button
+            self.settings.recordButtonPress(
+                control: .remoteButton(button),
+                source: .bluetoothRemote
+            )
+            if self.macroFeature.isEditorActive {
+                AppLogger.shared.write(
+                    "HID BUTTON button=\(button.rawValue) path=binding_editor_capture"
+                )
+            }
+            let suppressConfiguredAction = OnboardingControlValidationPolicy
+                .suppressConfiguredActions(
+                    at: self.settings.onboardingStep,
+                    source: self.settings.onboardingControlSource
+                )
+            if suppressConfiguredAction {
+                AppLogger.shared.write(
+                    "ONBOARDING CONTROLS button=\(button.rawValue) action=suppressed"
+                )
+            }
+            return (
+                resolvedProfileID,
+                !self.macroFeature.isEditorActive && !suppressConfiguredAction
+            )
+        }
+        monitor.onInternalAction = { [weak self] profileID, action in
+            guard let self else { return }
+            if let profileID { self.selectRemoteProfile(profileID) }
+            self.performInternalAction(action, source: Self.commonPhraseHIDSource(profileID))
+        }
+        return monitor
+    }
+
+    func setExperimentalContinuousRecordingEnabled(_ enabled: Bool) {
+        if !enabled {
+            stopLongRecording(reason: "feature_disabled")
+        }
+        settings.setExperimentalContinuousRecordingEnabled(enabled)
+        applyHIDSettings()
+    }
+
+    func setVoiceFnTapModeEnabled(_ enabled: Bool) {
+        guard settings.voiceKeyMode == .function else {
+            settings.voiceFnTapModeEnabled = false
+            return
+        }
+        if enabled {
+            enableVoiceFnTapMode()
+            return
+        }
+        settings.voiceFnTapModeEnabled = false
+        voiceFnTapSession.setEnabled(false) { [weak self] in
+            self?.applyHIDSettings(restartSiriRemote: false)
+        }
+    }
+
+    func restoreCompleteConfiguration(_ backup: MacConfigurationBackup) throws {
+        let host = try settings.validatedCompleteConfigurationSnapshot(backup.host)
+        try macroFeature.validateConfigurationArchive(backup.components)
+        guard !isStreaming, releaseVoiceKeyIfNeeded() else { throw AppConfigurationError.unsafeVoiceKeyChange }
+        if try !macroFeature.restoreConfigurationArchive(backup.components, hostAfter: host) {
+            let before = try settings.portableLocalSnapshot()
+            do { try settings.applyPortableLocalSnapshot(host) }
+            catch {
+                try settings.applyPortableLocalSnapshot(before)
+                throw error
+            }
+        }
+        preferredInputSourceMonitor.endVoiceSession()
+        applyAudioSettings(reason: "configuration_import")
+        applyHIDSettings()
+    }
+
+    func importConfiguration(from data: Data) throws {
+        let changedVoiceKeyConfiguration: Bool
+        do {
+            changedVoiceKeyConfiguration = try Self.importConfiguration(
+                from: data,
+                into: settings,
+                isStreaming: isStreaming,
+                releaseVoiceKey: { releaseVoiceKeyIfNeeded() }
+            )
+        } catch AppConfigurationError.unsafeVoiceKeyChange {
+            AppLogger.shared.write(
+                "CONFIGURATION IMPORT rejected reason=unsafe_voice_key_change"
+            )
+            throw AppConfigurationError.unsafeVoiceKeyChange
+        }
+        if changedVoiceKeyConfiguration {
+            preferredInputSourceMonitor.endVoiceSession()
+        }
+        applyAudioSettings(reason: "configuration_import")
+        applyHIDSettings()
+    }
+
+    func setVoiceKeyMode(_ mode: VoiceKeyMode) {
+        guard mode != settings.voiceKeyMode else { return }
+        let previousMode = settings.voiceKeyMode.rawValue
+        AppLogger.shared.write(
+            "VOICE KEY mode_change requested from=\(previousMode) to=\(mode.rawValue)"
+        )
+        guard !isStreaming else {
+            AppLogger.shared.write(
+                "VOICE KEY mode_change_rejected reason=voice_active requested=\(mode.rawValue)"
+            )
+            return
+        }
+
+        guard releaseVoiceKeyIfNeeded() else {
+            AppLogger.shared.write(
+                "VOICE KEY mode_change_rejected reason=release_failed requested=\(mode.rawValue)"
+            )
+            return
+        }
+        preferredInputSourceMonitor.endVoiceSession()
+        if mode != .function {
+            settings.voiceFnTapModeEnabled = false
+            voiceFnTapSession.setEnabled(false) { [weak self] in
+                guard let self else { return }
+                self.settings.voiceKeyMode = mode
+                self.applyHIDSettings(restartSiriRemote: false)
+                AppLogger.shared.write(
+                    "VOICE KEY mode_change completed from=\(previousMode) to=\(mode.rawValue) result=applied"
+                )
+            }
+            return
+        }
+
+        settings.voiceKeyMode = .function
+        applyHIDSettings(restartSiriRemote: false)
+        AppLogger.shared.write(
+            "VOICE KEY mode_change completed from=\(previousMode) to=fn result=applied"
+        )
+    }
+
+    private func enableVoiceFnTapMode() {
+        guard KeyboardInjector.isAccessibilityTrusted else {
+            settings.voiceFnTapModeEnabled = false
+            requestNextHIDPermissionIfNeeded(voiceFnTapModeRequested: true)
+            applyHIDSettings(restartSiriRemote: false)
+            return
+        }
+
+        var powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: true)
+        guard voiceFunctionMapper.isVoiceKeyNeutralized else {
+            voiceFnTapSession.setEnabled(false)
+            if HIDMappingRecoveryPolicy.shouldPreserveFnTapPreferenceAfterMappingFailure(
+                hasMatchingServices: voiceFunctionMapper.hasMatchingServices
+            ) {
+                settings.voiceFnTapModeEnabled = true
+                AppLogger.shared.write(
+                    "VOICE FN TAP mode_pending_mapping reason=no_matching_service"
+                )
+                startHIDMonitors(powerKeySuppressed: powerKeySuppressed)
+                scheduleHIDMappingRecoveryIfNeeded(restartSiriRemote: false)
+                return
+            }
+            settings.voiceFnTapModeEnabled = false
+            powerKeySuppressed = applyVoiceFunctionMapping(neutralizeVoiceKey: false)
+            startHIDMonitors(powerKeySuppressed: powerKeySuppressed)
+            return
+        }
+        settings.voiceFnTapModeEnabled = true
+        voiceFnTapSession.setEnabled(true)
+        startHIDMonitors(powerKeySuppressed: powerKeySuppressed)
+    }
+
+    private func handleVoiceFnTapFailure(_ failure: VoiceFnTapFailure) {
+        AppLogger.shared.write("VOICE FN TAP failed reason=\(failure.rawValue) fallback=hardware_fn")
+        settings.voiceFnTapModeEnabled = false
+        voiceFnTapSession.setEnabled(false)
+        applyHIDSettings(restartSiriRemote: false)
+    }
+
+    private func requestNextHIDPermissionIfNeeded(
+        voiceFnTapModeRequested: Bool? = nil,
+        voiceKeyModeRequested: VoiceKeyMode? = nil
+    ) {
+        let request = HIDPermissionGate.nextPermissionRequest(
+            mappingEnabled: settings.customMappingEnabled,
+            voiceFnTapModeEnabled: voiceFnTapModeRequested ?? settings.voiceFnTapModeEnabled,
+            voiceKeyMode: voiceKeyModeRequested ?? settings.voiceKeyMode,
+            inputMonitoringGranted: HIDRemoteMonitor.isInputMonitoringGranted,
+            accessibilityGranted: KeyboardInjector.isAccessibilityTrusted
+        )
+        switch request {
+        case .none:
+            break
+        case .inputMonitoring:
+            _ = HIDRemoteMonitor.requestInputMonitoringAccess()
+        case .accessibility:
+            _ = KeyboardInjector.requestAccessibilityAccess()
+        }
+    }
+
+    func requestInputMonitoringPermission() {
+        _ = HIDRemoteMonitor.requestInputMonitoringAccess()
+        openPrivacyPane("Privacy_ListenEvent")
+    }
+
+    func requestAccessibilityPermission() {
+        _ = KeyboardInjector.requestAccessibilityAccess()
+        openPrivacyPane("Privacy_Accessibility")
+    }
+
+    func openLogFolder() {
+        NSWorkspace.shared.open(AppLogger.shared.logDirectoryURL)
+    }
+
+    private func recordPublicDiagnosticEvent(
+        operationID: String? = nil,
+        component: String,
+        action: String,
+        phase: String,
+        result: String,
+        reason: String,
+        source: String? = nil,
+        remoteModelFamily: String? = nil,
+        elapsedMS: Int? = nil,
+        receivedSamples: Int? = nil,
+        scheduledSamples: Int? = nil,
+        playedSamples: Int? = nil,
+        interruptedSamples: Int? = nil,
+        pendingSamples: Int? = nil,
+        failureCount: Int? = nil
+    ) {
+        let commonArguments = (
+            component: component,
+            action: action,
+            phase: phase,
+            result: result,
+            reason: reason,
+            source: source,
+            remoteModelFamily: remoteModelFamily,
+            audioDeviceKind: ["environment", "audio", "voice", "onboarding"].contains(component)
+                ? AppEnvironmentSnapshot.audioDeviceKind(for: settings.selectedAudioDeviceUID)
+                : nil,
+            voiceTool: ["environment", "voice", "onboarding"].contains(component)
+                ? settings.onboardingVoiceTool.rawValue
+                : nil,
+            elapsedMS: elapsedMS,
+            receivedSamples: receivedSamples,
+            scheduledSamples: scheduledSamples,
+            playedSamples: playedSamples,
+            interruptedSamples: interruptedSamples,
+            pendingSamples: pendingSamples,
+            failureCount: failureCount
+        )
+        let event: PublicDiagnosticEvent?
+        if let operationID {
+            event = PublicDiagnosticEvent(
+                operationID: operationID,
+                component: commonArguments.component,
+                action: commonArguments.action,
+                phase: commonArguments.phase,
+                result: commonArguments.result,
+                reason: commonArguments.reason,
+                elapsedMS: commonArguments.elapsedMS,
+                receivedSamples: commonArguments.receivedSamples,
+                scheduledSamples: commonArguments.scheduledSamples,
+                playedSamples: commonArguments.playedSamples,
+                interruptedSamples: commonArguments.interruptedSamples,
+                pendingSamples: commonArguments.pendingSamples,
+                failureCount: commonArguments.failureCount,
+                source: commonArguments.source,
+                remoteModelFamily: commonArguments.remoteModelFamily,
+                audioDeviceKind: commonArguments.audioDeviceKind,
+                voiceTool: commonArguments.voiceTool
+            )
+        } else {
+            event = PublicDiagnosticEvent(
+                component: commonArguments.component,
+                action: commonArguments.action,
+                phase: commonArguments.phase,
+                result: commonArguments.result,
+                reason: commonArguments.reason,
+                elapsedMS: commonArguments.elapsedMS,
+                receivedSamples: commonArguments.receivedSamples,
+                scheduledSamples: commonArguments.scheduledSamples,
+                playedSamples: commonArguments.playedSamples,
+                interruptedSamples: commonArguments.interruptedSamples,
+                pendingSamples: commonArguments.pendingSamples,
+                failureCount: commonArguments.failureCount,
+                source: commonArguments.source,
+                remoteModelFamily: commonArguments.remoteModelFamily,
+                audioDeviceKind: commonArguments.audioDeviceKind,
+                voiceTool: commonArguments.voiceTool
+            )
+        }
+        guard let event, event.isApprovedForUpload else { return }
+        AppLogger.shared.record(event)
+    }
+
+    private func recordVoiceSessionCompletion(
+        operationID: String,
+        source: String,
+        remoteModelFamily: String?,
+        startedAt: Date?,
+        receivedSamples: Int,
+        failureCount: Int,
+        stopReason: String
+    ) {
+        let diagnostic = voiceAudioDeliveryDiagnostic
+        let received = max(receivedSamples, diagnostic.receivedSamples)
+        let scheduled = diagnostic.scheduledSamples
+        let played = diagnostic.playedSamples
+        let interrupted = diagnostic.interruptedSamples
+        let pending = diagnostic.outputAtObservation.pendingSamples
+        let totalFailures = max(failureCount, diagnostic.enqueueFailures)
+        let failureReason: String?
+        if received == 0 {
+            failureReason = "no_samples"
+        } else if totalFailures > 0 {
+            failureReason = "audio_enqueue_failed"
+        } else if interrupted > 0 {
+            failureReason = "playback_interrupted"
+        } else if pending > 0 || scheduled < received || played < received {
+            failureReason = "audio_incomplete"
+        } else {
+            failureReason = nil
+        }
+        recordPublicDiagnosticEvent(
+            operationID: operationID,
+            component: "voice",
+            action: "session",
+            phase: failureReason == nil ? "completed" : "failed",
+            result: failureReason == nil ? "passed" : "failed",
+            reason: failureReason ?? Self.publicVoiceStopReason(stopReason),
+            source: source,
+            remoteModelFamily: remoteModelFamily,
+            elapsedMS: startedAt.map { max(0, Int(Date().timeIntervalSince($0) * 1_000)) },
+            receivedSamples: received,
+            scheduledSamples: scheduled,
+            playedSamples: played,
+            interruptedSamples: interrupted,
+            pendingSamples: pending,
+            failureCount: totalFailures
+        )
+    }
+
+    private static func publicVoiceStopReason(_ reason: String) -> String {
+        let approvedReasons: Set<String> = [
+            "released", "voice_stop", "voice_stopped", "hold_release",
+            "toggle_second_tap", "host_stop", "cancelled.link_unavailable",
+            "app_stop", "device_disconnected",
+        ]
+        return approvedReasons.contains(reason) ? reason : "session_stopped"
+    }
+
+    func sendDiagnosticLogs() {
+        guard !isSendingDiagnosticLogs else { return }
+        isSendingDiagnosticLogs = true
+        diagnosticUploadStatus = LocalizedMessage("diagnostics.upload.sending")
+        AppLogger.shared.write("DIAGNOSTIC UPLOAD requested_by_user")
+        diagnosticLogUploader.upload { [weak self] result in
+            guard let self else { return }
+            self.isSendingDiagnosticLogs = false
+            switch result {
+            case let .success(count):
+                self.diagnosticUploadStatus = LocalizedMessage(
+                    "diagnostics.upload.success",
+                    arguments: [String(count)]
+                )
+                AppLogger.shared.write("DIAGNOSTIC UPLOAD completed count=\(count)")
+            case let .failure(error):
+                switch error {
+                case .serviceNotConfigured:
+                    self.diagnosticUploadStatus = LocalizedMessage(
+                        "diagnostics.upload.not_configured"
+                    )
+                case .noLogs:
+                    self.diagnosticUploadStatus = LocalizedMessage("diagnostics.upload.no_logs")
+                case .invalidServiceConfiguration, .uploadFailed:
+                    self.diagnosticUploadStatus = LocalizedMessage("diagnostics.upload.failed")
+                }
+                AppLogger.shared.write("DIAGNOSTIC UPLOAD failed reason=\(error)")
+            }
+        }
+    }
+
+    func openProjectFolder() {
+        let executable = URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
+        var candidate = executable.deletingLastPathComponent()
+        if candidate.path.contains(".app/Contents/MacOS") {
+            candidate.deleteLastPathComponent()
+            candidate.deleteLastPathComponent()
+            candidate.deleteLastPathComponent()
+        }
+        NSWorkspace.shared.open(candidate)
+    }
+
+    private func openPrivacyPane(_ pane: String) {
+        guard let url = URL(
+            string: "x-apple.systempreferences:com.apple.preference.security?\(pane)"
+        ) else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    private var selectedBluetoothBridge: XiaomiBluetoothBridge? {
+        guard let identifier = settings.selectedRemoteProfile?.bluetoothIdentifier else { return nil }
+        return bluetoothBridges[identifier]
+    }
+
+    private func startBluetoothConnections() {
+        let identifiers = Set(settings.remoteDeviceProfiles.compactMap(\.bluetoothIdentifier))
+        for identifier in identifiers where bluetoothBridges[identifier] == nil {
+            let bridge = XiaomiBluetoothBridge(
+                settings: settings,
+                delegate: self,
+                targetIdentifier: identifier
+            )
+            bluetoothBridges[identifier] = bridge
+            bridge.setSystemSuspended(
+                systemAudioSuspensionState.isSuspended,
+                reason: "bridge_start"
+            )
+            bridge.start()
+        }
+        startBluetoothDiscoveryIfNeeded()
+    }
+
+    private func startBluetoothDiscoveryIfNeeded() {
+        guard started, discoveryBluetoothBridge == nil else { return }
+        let bridge = XiaomiBluetoothBridge(
+            settings: settings,
+            delegate: self,
+            excludedIdentifiers: { [weak self] in
+                guard let self else { return [] }
+                return Set(self.bluetoothBridges.keys)
+            }
+        )
+        discoveryBluetoothBridge = bridge
+        bridge.setSystemSuspended(
+            systemAudioSuspensionState.isSuspended,
+            reason: "bridge_start"
+        )
+        bridge.start()
+    }
+
+    private func registerBluetoothBridgeIfNeeded(_ bridge: XiaomiBluetoothBridge) -> UUID? {
+        guard let identifier = bluetoothIdentifier(for: bridge) else { return nil }
+        let existingProfileID = settings.profileID(forBluetoothIdentifier: identifier)
+        let profileID = existingProfileID ?? settings.registerBluetoothRemote(identifier: identifier)
+        if discoveryBluetoothBridge === bridge {
+            discoveryBluetoothBridge = nil
+            bluetoothBridges[identifier] = bridge
+            startBluetoothDiscoveryIfNeeded()
+        } else if bluetoothBridges[identifier] == nil {
+            bluetoothBridges[identifier] = bridge
+        }
+        applyPendingRemoteTelemetry(identifier: identifier, profileID: profileID)
+        AppLogger.shared.write(
+            "REMOTE PROFILE phase=completed result=persisted reason=verified_remote_path " +
+                "created=\(existingProfileID == nil)"
+        )
+        return profileID
+    }
+
+    private func applyPendingRemoteTelemetry(identifier: UUID, profileID: UUID) {
+        let hadBattery = pendingRemoteBatteryLevels[identifier] != nil
+        let hadPower = pendingRemotePowerStates[identifier] != nil
+        let hadModel = pendingRemoteModels[identifier] != nil
+        if let level = pendingRemoteBatteryLevels.removeValue(forKey: identifier) {
+            remoteBatteryLevels[profileID] = min(100, max(0, level))
+        }
+        if let powerState = pendingRemotePowerStates.removeValue(forKey: identifier) {
+            remotePowerStates[profileID] = powerState
+        }
+        if let model = pendingRemoteModels.removeValue(forKey: identifier) {
+            settings.updateRemoteProfileModel(profileID, model: model)
+            refreshRemoteDeviceNames(reason: .connection)
+        }
+        if hadBattery || hadPower || hadModel {
+            AppLogger.shared.write(
+                "REMOTE PROFILE_TELEMETRY phase=completed result=applied reason=profile_ready " +
+                    "battery=\(hadBattery) power=\(hadPower) model=\(hadModel)"
+            )
+        }
+    }
+
+    private func bluetoothIdentifier(for bridge: XiaomiBluetoothBridge) -> UUID? {
+        bridge.deviceIdentifier ?? bluetoothBridges.first(where: { $0.value === bridge })?.key
+    }
+
+    private func remoteProfileID(for bridge: XiaomiBluetoothBridge) -> UUID? {
+        guard let identifier = bluetoothIdentifier(for: bridge) else { return nil }
+        return settings.profileID(forBluetoothIdentifier: identifier)
+    }
+
+    func selectRemoteProfile(_ profileID: UUID) {
+        settings.selectRemoteProfile(profileID)
+        refreshAppleRemoteHIDStatus()
+        refreshBluetoothPresentation()
+    }
+
+    func selectDefaultMappingRemoteIfAvailable() {
+        let localization = LocalizationStore(settings: settings)
+        let connectedProfiles = RemoteDeviceNamePolicy.sortedForCards(
+            settings.remoteDeviceProfiles.filter { isRemoteConnected($0.id) },
+            modelName: { profile in
+                RemoteDeviceNamePolicy.displayName(
+                    for: profile,
+                    among: self.settings.remoteDeviceProfiles,
+                    defaultName: localization.text(profile.model.localizationKey)
+                )
+            },
+            systemName: { self.systemDeviceName(for: $0) }
+        )
+        guard let profile = RemoteDeviceNamePolicy.defaultMappingProfile(
+            from: connectedProfiles
+        ) else {
+            AppLogger.shared.write(
+                "REMOTE MAPPING_DEFAULT phase=completed result=preserved " +
+                    "reason=xiaomi_unavailable"
+            )
+            return
+        }
+        guard profile.id != settings.selectedRemoteProfileID else {
+            AppLogger.shared.write(
+                "REMOTE MAPPING_DEFAULT phase=completed result=preserved " +
+                    "reason=xiaomi_already_selected"
+            )
+            return
+        }
+        AppLogger.shared.write(
+            "REMOTE MAPPING_DEFAULT phase=completed result=selected " +
+                "reason=xiaomi_default family=xiaomi"
+        )
+        if ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_DIR"] != nil {
+            settings.selectRemoteProfile(profile.id)
+            return
+        }
+        selectRemoteProfile(profile.id)
+    }
+
+    private func activateRemoteProfile(for bridge: XiaomiBluetoothBridge) -> UUID? {
+        guard let profileID = registerBluetoothBridgeIfNeeded(bridge) else { return nil }
+        selectRemoteProfile(profileID)
+        return profileID
+    }
+
+    /// Refresh display metadata without starting discovery, reconnecting, or changing device identity.
+    func refreshRemoteDeviceNames(reason: RemoteDeviceNameRefreshReason) {
+        guard started, CBManager.authorization == .allowedAlways else { return }
+        remoteDeviceNameRefreshOperation &+= 1
+        var requested = 0
+        var resolved = 0
+        var changed = 0
+        for (identifier, bridge) in bluetoothBridges {
+            guard let profileID = settings.profileID(forBluetoothIdentifier: identifier),
+                  connectedRemoteProfileIDs.contains(profileID)
+            else { continue }
+            requested += 1
+            bridge.refreshBatteryTelemetry(reason: reason.rawValue)
+            let name = bridge.currentSystemDeviceName()
+            if let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                resolved += 1
+            }
+            if let name = RemoteDeviceNamePolicy.observedSystemName(from: name) {
+                remoteSystemDeviceNames[profileID] = name
+            }
+            if settings.updateRemoteProfileSystemName(profileID, name: name) { changed += 1 }
+        }
+        let appleProfiles = settings.remoteDeviceProfiles.filter {
+            connectedAppleRemoteProfileIDs.contains($0.id)
+        }
+        if !appleProfiles.isEmpty {
+            let names = RemoteDeviceNameReader.readHIDNames()
+            for profile in appleProfiles {
+                requested += 1
+                let observation = profile.hidFingerprint.flatMap { names[$0] }
+                let name = observation?.name
+                if let name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    resolved += 1
+                }
+                if let name = RemoteDeviceNamePolicy.observedSystemName(from: name) {
+                    remoteSystemDeviceNames[profile.id] = name
+                }
+                if settings.updateRemoteProfileSystemName(
+                    profile.id, name: name, serialNumber: observation?.serialNumber
+                ) { changed += 1 }
+            }
+        }
+        AppLogger.shared.write(
+            "REMOTE NAME REFRESH operation_id=\(remoteDeviceNameRefreshOperation) " +
+                "phase=completed reason=\(reason.rawValue) requested=\(requested) " +
+                "resolved=\(resolved) changed=\(changed) unavailable=\(requested - resolved)"
+        )
+    }
+
+    private func refreshBluetoothPresentation() {
+        let allStates = bluetoothBridgeStates.values
+        let connectedBluetoothProfileIDs = Set<UUID>(bluetoothBridges.compactMap { identifier, bridge in
+            guard let profileID = settings.profileID(forBluetoothIdentifier: identifier),
+                  let state = bluetoothBridgeStates[ObjectIdentifier(bridge)],
+                  case .ready = state
+            else { return nil }
+            return profileID
+        })
+        connectedRemoteProfileIDs = connectedBluetoothProfileIDs
+            .union(connectedAppleRemoteProfileIDs)
+            .union(connectedChromecastProfileIDs)
+        let bluetoothIsReady = allStates.contains { state in
+            if case .ready = state { return true }
+            return false
+        }
+        isConnected = bluetoothIsReady
+            || !connectedAppleRemoteProfileIDs.isEmpty
+            || !connectedChromecastProfileIDs.isEmpty
+        if let selectedRemoteProfileID = settings.selectedRemoteProfileID,
+           connectedAppleRemoteProfileIDs.contains(selectedRemoteProfileID) {
+            connectionStatus = LocalizedMessage("connection.status.apple_remote_connected")
+        } else if let selectedRemoteProfileID = settings.selectedRemoteProfileID,
+                  connectedChromecastProfileIDs.contains(selectedRemoteProfileID) {
+            connectionStatus = LocalizedMessage("connection.status.chromecast_connected")
+        } else if let selectedBluetoothBridge,
+           let state = bluetoothBridgeStates[ObjectIdentifier(selectedBluetoothBridge)] {
+            connectionStatus = state.message
+        } else if let ready = allStates.first(where: { state in
+            if case .ready = state { return true }
+            return false
+        }) {
+            connectionStatus = ready.message
+        } else if !connectedAppleRemoteProfileIDs.isEmpty {
+            connectionStatus = LocalizedMessage("connection.status.apple_remote_connected")
+        } else if !connectedChromecastProfileIDs.isEmpty {
+            connectionStatus = LocalizedMessage("connection.status.chromecast_connected")
+        } else if let state = allStates.first {
+            connectionStatus = state.message
+        } else {
+            connectionStatus = LocalizedMessage("connection.status.searching")
+        }
+    }
+
+    private func handleAppleRemoteConnection(_ connection: SiriRemoteConnection) {
+        if connection.isConnected {
+            let profileID = settings.profileID(forHIDFingerprint: connection.fingerprint)
+                ?? settings.registerAppleSiriRemote(
+                    fingerprint: connection.fingerprint,
+                    model: connection.model
+                )
+            settings.updateRemoteProfileModel(profileID, model: connection.model)
+            appleRemoteProfileIDs[connection.device] = profileID
+            connectedAppleRemoteProfileIDs.insert(profileID)
+            if appleRemoteActiveButtons[connection.device] == nil {
+                appleRemoteActiveButtons[connection.device] = []
+            }
+            if appleRemoteActiveControlIDs[connection.device] == nil {
+                appleRemoteActiveControlIDs[connection.device] = []
+            }
+            AppLogger.shared.write(
+                "APPLE REMOTE CONNECTION phase=completed result=connected " +
+                    "model=\(connection.model.rawValue) " +
+                    "connected_devices=\(connectedAppleRemoteProfileIDs.count)"
+            )
+        } else {
+            if let profileID = appleRemoteProfileIDs.removeValue(forKey: connection.device) {
+                membershipFeature.resetCommonPhrases(source: "apple:\(profileID.uuidString)")
+                connectedAppleRemoteProfileIDs.remove(profileID)
+                remoteBatteryLevels.removeValue(forKey: profileID)
+                remotePowerStates.removeValue(forKey: profileID)
+            }
+            resetAppleRemoteState(for: connection.device, reason: "device_disconnected")
+            AppLogger.shared.write(
+                "APPLE REMOTE CONNECTION phase=completed result=disconnected " +
+                    "model=\(connection.model.rawValue) " +
+                    "connected_devices=\(connectedAppleRemoteProfileIDs.count)"
+            )
+        }
+        refreshAppleRemoteActiveButtons()
+        refreshAppleRemoteActiveControlIDs()
+        refreshAppleRemoteHIDStatus()
+        refreshBluetoothPresentation()
+        if connection.isConnected { refreshRemoteDeviceNames(reason: .connection) }
+    }
+
+    private func handleAppleRemotePowerSnapshot(_ snapshot: SiriRemotePowerSnapshot) {
+        guard let profileID = appleRemoteProfileIDs[snapshot.device] else {
+            AppLogger.shared.write(
+                "APPLE REMOTE POWER_BRIDGE phase=ignored result=profile_unavailable " +
+                    "model=\(snapshot.model.rawValue) availability=\(snapshot.availability.rawValue)"
+            )
+            return
+        }
+        if snapshot.availability == .available {
+            if let level = snapshot.level {
+                remoteBatteryLevels[profileID] = min(100, max(0, level))
+            } else {
+                remoteBatteryLevels.removeValue(forKey: profileID)
+            }
+            remotePowerStates[profileID] = snapshot.powerState
+        } else {
+            remoteBatteryLevels.removeValue(forKey: profileID)
+            remotePowerStates.removeValue(forKey: profileID)
+        }
+        AppLogger.shared.write(
+            "APPLE REMOTE POWER_BRIDGE phase=completed result=\(snapshot.availability.rawValue) " +
+                "model=\(snapshot.model.rawValue) " +
+                "level=\(snapshot.level.map(String.init) ?? "unknown") " +
+                "state=\(snapshot.powerState.logValue) source=\(snapshot.source)"
+        )
+    }
+
+    private func handleAppleRemoteControlEvent(_ event: SiriRemoteControlEvent) {
+        let control = event.control
+        if event.phase == .cancelled {
+            resetAppleRemoteState(
+                for: event.device,
+                reason: event.cancellationReason ?? "unknown"
+            )
+            return
+        }
+        let suppressConfiguredAction = OnboardingControlValidationPolicy
+            .suppressConfiguredActions(
+                at: settings.onboardingStep,
+                source: settings.onboardingControlSource
+            )
+        if suppressConfiguredAction, control == .siri {
+            AppLogger.shared.write(
+                "ONBOARDING CONTROLS button=siri source=apple_remote action=suppressed"
+            )
+            return
+        }
+        if control == .siri {
+            guard let profileID = appleRemoteProfileIDs[event.device] else {
+                AppLogger.shared.write(
+                    "APPLE REMOTE VOICE phase=failed result=profile_unavailable"
+                )
+                return
+            }
+            if event.phase == .began {
+                selectRemoteProfile(profileID)
+            }
+            var activeControlIDs = appleRemoteActiveControlIDs[event.device, default: []]
+            if event.phase == .began {
+                activeControlIDs.insert(control.rawValue)
+            } else {
+                activeControlIDs.remove(control.rawValue)
+            }
+            appleRemoteActiveControlIDs[event.device] = activeControlIDs
+            refreshAppleRemoteActiveControlIDs()
+            switch event.phase {
+            case .began:
+                beginAppleRemoteVoice(for: event.device)
+            case .ended:
+                endAppleRemoteVoice(for: event.device, reason: "released")
+            case .cancelled:
+                break
+            }
+            return
+        }
+        if control == .select {
+            let nativeEdge: RemoteEventEdge = event.phase == .began ? .down : .up
+            if !suppressConfiguredAction,
+               event.phase == .began,
+               siriRemoteCursorFeedback.activateHoveredElementIfAvailable() {
+                appleRemoteHoverClickDevices.insert(event.device)
+                hidEventSuppressor.arm(nativeEvents: control.nativeEvents, edge: nativeEdge)
+                AppLogger.shared.write(
+                    "APPLE REMOTE HOVER_CLICK phase=began result=activated action=ax_press"
+                )
+                return
+            }
+            if !suppressConfiguredAction,
+               event.phase == .ended,
+               appleRemoteHoverClickDevices.remove(event.device) != nil {
+                hidEventSuppressor.arm(nativeEvents: control.nativeEvents, edge: nativeEdge)
+                AppLogger.shared.write(
+                    "APPLE REMOTE HOVER_CLICK phase=ended result=consumed"
+                )
+                return
+            }
+        }
+        guard settings.customMappingEnabled || suppressConfiguredAction else {
+            if event.phase == .began {
+                AppLogger.shared.write(
+                    "APPLE REMOTE ACTION phase=completed result=system_managed " +
+                        "control=\(control.rawValue)"
+                )
+            }
+            return
+        }
+        guard let profileID = appleRemoteProfileIDs[event.device] else {
+            AppLogger.shared.write(
+                "APPLE REMOTE ACTION phase=failed result=profile_unavailable " +
+                    "control=\(control.rawValue)"
+            )
+            return
+        }
+        if event.phase == .began {
+            selectRemoteProfile(profileID)
+        }
+        var activeControlIDs = appleRemoteActiveControlIDs[event.device, default: []]
+        if event.phase == .began {
+            activeControlIDs.insert(control.rawValue)
+        } else {
+            activeControlIDs.remove(control.rawValue)
+        }
+        appleRemoteActiveControlIDs[event.device] = activeControlIDs
+        refreshAppleRemoteActiveControlIDs()
+        guard let button = control.remoteButton else {
+            if event.phase == .began {
+                AppLogger.shared.write(
+                    "APPLE REMOTE ACTION phase=completed result=unmapped " +
+                        "control=\(control.rawValue)"
+                )
+            }
+            return
+        }
+        let nativeEdge: RemoteEventEdge = event.phase == .began ? .down : .up
+        hidEventSuppressor.arm(nativeEvents: control.nativeEvents, edge: nativeEdge)
+        AppLogger.shared.write(
+            "APPLE REMOTE NATIVE_EVENT phase=armed control=\(control.rawValue) " +
+                "edge=\(nativeEdge == .down ? "down" : "up") " +
+                "candidates=\(control.nativeEvents.count)"
+        )
+        handleAppleRemoteButton(
+            button,
+            phase: event.phase == .began ? .press : .release,
+            device: event.device,
+            profileID: profileID
+        )
+    }
+
+    private func handleAppleRemoteButton(
+        _ button: RemoteButton,
+        phase: RemoteButtonPhase,
+        device: SiriRemoteDeviceIdentity,
+        profileID: UUID
+    ) {
+        if phase == .release {
+            cancelAppleRemoteRepeat(
+                for: button,
+                device: device,
+                reason: "released"
+            )
+        }
+        var buttons = appleRemoteActiveButtons[device, default: []]
+        if phase == .press {
+            buttons.insert(button)
+            lastRemoteButtonPress = button
+        } else {
+            buttons.remove(button)
+        }
+        appleRemoteActiveButtons[device] = buttons
+        refreshAppleRemoteActiveButtons()
+
+        if OnboardingControlValidationPolicy.suppressConfiguredActions(
+            at: settings.onboardingStep,
+            source: settings.onboardingControlSource
+        ) {
+            if phase == .press {
+                AppLogger.shared.write(
+                    "ONBOARDING CONTROLS button=\(button.rawValue) source=apple_remote action=suppressed"
+                )
+            }
+            return
+        }
+
+        if !macroFeature.isEditorActive,
+           membershipFeature.handleCommonPhrase(
+               button: button.rawValue,
+               phase: phase.rawValue,
+               source: "apple:\(profileID.uuidString)"
+           ) { return }
+
+        if appleRemoteAppSwitcherSession.isActive {
+            if phase == .release {
+                AppLogger.shared.write(
+                    "APPLE REMOTE APP SWITCHER " +
+                        "operation_id=\(appleRemoteAppSwitcherOperationLabel) " +
+                        "phase=release_ignored button=\(button.rawValue)"
+                )
+                return
+            }
+            if handleAppleRemoteAppSwitcherControlPress(button) {
+                return
+            }
+            finishAppleRemoteAppSwitcher(
+                reason: "unrelated_button_\(button.rawValue)",
+                confirmed: false
+            )
+        }
+
+        if macroFeature.isEditorActive {
+            if phase == .press {
+                macroFeature.noteButtonInteraction(button: button)
+            }
+            AppLogger.shared.write(
+                "APPLE REMOTE BUTTON phase=\(phase.rawValue) button=\(button.rawValue) " +
+                    "path=binding_editor_capture"
+            )
+            return
+        }
+
+        let recognizesDoubleClick = settings.configuredAction(
+            for: button,
+            trigger: .doubleClick,
+            profileID: profileID
+        ).action != .disabled || macroFeature.hasActiveBinding(
+            profileID: profileID,
+            button: button,
+            trigger: .doubleClick
+        )
+        let recognizesLongPress = settings.configuredAction(
+            for: button,
+            trigger: .longPress,
+            profileID: profileID
+        ).action != .disabled || macroFeature.hasActiveBinding(
+            profileID: profileID,
+            button: button,
+            trigger: .longPress
+        )
+        var recognizer = appleRemoteGestureRecognizers[device]
+            ?? RemoteButtonGestureRecognizer()
+        if phase == .press,
+           !recognizesDoubleClick,
+           !recognizesLongPress,
+           !recognizer.isTracking(button) {
+            let handled = performAppleRemoteConfiguredAction(
+                for: button,
+                trigger: .singleClick,
+                profileID: profileID
+            )
+            if handled {
+                startAppleRemoteRepeatIfNeeded(
+                    for: button,
+                    device: device,
+                    profileID: profileID
+                )
+            }
+            return
+        }
+        let commands = recognizer.handle(
+            phase,
+            button: button,
+            recognizesDoubleClick: recognizesDoubleClick,
+            recognizesLongPress: recognizesLongPress
+        )
+        appleRemoteGestureRecognizers[device] = recognizer
+        _ = processAppleRemoteGestureCommands(commands, device: device, profileID: profileID)
+    }
+
+    private func startAppleRemoteRepeatIfNeeded(
+        for button: RemoteButton,
+        device: SiriRemoteDeviceIdentity,
+        profileID: UUID
+    ) {
+        let configured = settings.configuredAction(
+            for: button,
+            trigger: .singleClick,
+            profileID: profileID
+        )
+        let hasSecondaryAction = appleRemoteHasSecondaryAction(
+            for: button,
+            profileID: profileID
+        )
+        guard let interval = AppleRemoteInteractionPolicy.repeatIntervalMilliseconds(
+            for: button,
+            configured: configured,
+            hasSecondaryAction: hasSecondaryAction,
+            hasSingleActionOverride: macroFeature.hasActiveBinding(
+                profileID: profileID,
+                button: button,
+                trigger: .singleClick
+            ),
+            frontmostBundleIdentifier: NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        ) else { return }
+
+        let key = AppleRemoteButtonGestureKey(device: device, button: button)
+        cancelAppleRemoteRepeat(for: button, device: device, reason: "replaced")
+        appleRemoteRepeatOperationCounter &+= 1
+        let operationID = appleRemoteRepeatOperationCounter
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(
+            deadline: .now() + .milliseconds(Int(HIDRemoteTiming.repeatStartMilliseconds)),
+            repeating: .milliseconds(Int(interval))
+        )
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            guard self.appleRemoteActiveButtons[device]?.contains(button) == true,
+                  self.appleRemoteProfileIDs[device] == profileID
+            else {
+                self.cancelAppleRemoteRepeat(
+                    for: button,
+                    device: device,
+                    reason: "input_inactive"
+                )
+                return
+            }
+            let current = self.settings.configuredAction(
+                for: button,
+                trigger: .singleClick,
+                profileID: profileID
+            )
+            guard current == configured,
+                  AppleRemoteInteractionPolicy.repeatIntervalMilliseconds(
+                      for: button,
+                      configured: current,
+                      hasSecondaryAction: self.appleRemoteHasSecondaryAction(
+                          for: button,
+                          profileID: profileID
+                      ),
+                      hasSingleActionOverride: self.macroFeature.hasActiveBinding(
+                          profileID: profileID,
+                          button: button,
+                          trigger: .singleClick
+                      ),
+                      frontmostBundleIdentifier:
+                          NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+                  ) != nil
+            else {
+                self.cancelAppleRemoteRepeat(
+                    for: button,
+                    device: device,
+                    reason: "configuration_changed"
+                )
+                return
+            }
+            guard KeyboardInjector.isAccessibilityTrusted else {
+                _ = KeyboardInjector.requestAccessibilityAccess()
+                self.cancelAppleRemoteRepeat(
+                    for: button,
+                    device: device,
+                    reason: "accessibility_required"
+                )
+                return
+            }
+            guard self.performExternalConfiguredAction(current) else {
+                self.cancelAppleRemoteRepeat(
+                    for: button,
+                    device: device,
+                    reason: "submission_failed"
+                )
+                return
+            }
+            self.appleRemoteRepeatCounts[key, default: 0] += 1
+        }
+        appleRemoteRepeatTimers[key] = timer
+        appleRemoteRepeatCounts[key] = 0
+        appleRemoteRepeatOperationIDs[key] = operationID
+        timer.resume()
+        AppLogger.shared.write(
+            "APPLE REMOTE REPEAT operation_id=\(operationID) phase=started result=scheduled " +
+                "button=\(button.rawValue) action=\(configured.action.rawValue) " +
+                "start_delay_ms=\(HIDRemoteTiming.repeatStartMilliseconds) interval_ms=\(interval)"
+        )
+    }
+
+    private func cancelAppleRemoteRepeat(
+        for button: RemoteButton,
+        device: SiriRemoteDeviceIdentity,
+        reason: String
+    ) {
+        let key = AppleRemoteButtonGestureKey(device: device, button: button)
+        guard let timer = appleRemoteRepeatTimers.removeValue(forKey: key) else { return }
+        timer.cancel()
+        let repeatCount = appleRemoteRepeatCounts.removeValue(forKey: key) ?? 0
+        let operationID = appleRemoteRepeatOperationIDs.removeValue(forKey: key) ?? 0
+        AppLogger.shared.write(
+            "APPLE REMOTE REPEAT operation_id=\(operationID) phase=completed result=stopped " +
+                "button=\(button.rawValue) reason=\(reason) repeat_count=\(repeatCount)"
+        )
+    }
+
+    private func appleRemoteHasSecondaryAction(
+        for button: RemoteButton,
+        profileID: UUID
+    ) -> Bool {
+        settings.hasSecondaryAction(for: button, profileID: profileID) ||
+            [.doubleClick, .longPress].contains { trigger in
+                macroFeature.hasActiveBinding(
+                    profileID: profileID,
+                    button: button,
+                    trigger: trigger
+                )
+            }
+    }
+
+    private func processAppleRemoteGestureCommands(
+        _ commands: [RemoteButtonGestureRecognizer.Command],
+        device: SiriRemoteDeviceIdentity,
+        profileID: UUID
+    ) -> Bool {
+        for command in commands {
+            switch command {
+            case let .scheduleDoubleClickTimeout(button):
+                scheduleAppleRemoteDoubleClickTimeout(
+                    for: button,
+                    device: device,
+                    profileID: profileID
+                )
+            case let .cancelDoubleClickTimeout(button):
+                appleRemoteDoubleClickTimers.removeValue(forKey: .init(
+                    device: device,
+                    button: button
+                ))?.cancel()
+            case let .scheduleLongPressTimeout(button):
+                scheduleAppleRemoteLongPressTimeout(
+                    for: button,
+                    device: device,
+                    profileID: profileID
+                )
+            case let .cancelLongPressTimeout(button):
+                appleRemoteLongPressTimers.removeValue(forKey: .init(
+                    device: device,
+                    button: button
+                ))?.cancel()
+            case let .trigger(button, trigger):
+                guard performAppleRemoteConfiguredAction(
+                    for: button,
+                    trigger: trigger,
+                    profileID: profileID
+                ) else { return false }
+            }
+        }
+        return true
+    }
+
+    private func scheduleAppleRemoteDoubleClickTimeout(
+        for button: RemoteButton,
+        device: SiriRemoteDeviceIdentity,
+        profileID: UUID
+    ) {
+        let key = AppleRemoteButtonGestureKey(device: device, button: button)
+        appleRemoteDoubleClickTimers.removeValue(forKey: key)?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .milliseconds(300))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            appleRemoteDoubleClickTimers.removeValue(forKey: key)
+            guard var recognizer = appleRemoteGestureRecognizers[device] else { return }
+            let commands = recognizer.doubleClickTimedOut(button)
+            appleRemoteGestureRecognizers[device] = recognizer
+            _ = processAppleRemoteGestureCommands(
+                commands,
+                device: device,
+                profileID: profileID
+            )
+        }
+        appleRemoteDoubleClickTimers[key] = timer
+        timer.resume()
+    }
+
+    private func scheduleAppleRemoteLongPressTimeout(
+        for button: RemoteButton,
+        device: SiriRemoteDeviceIdentity,
+        profileID: UUID
+    ) {
+        let key = AppleRemoteButtonGestureKey(device: device, button: button)
+        appleRemoteLongPressTimers.removeValue(forKey: key)?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .milliseconds(550))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            appleRemoteLongPressTimers.removeValue(forKey: key)
+            guard var recognizer = appleRemoteGestureRecognizers[device] else { return }
+            let commands = recognizer.longPressTimedOut(button)
+            appleRemoteGestureRecognizers[device] = recognizer
+            _ = processAppleRemoteGestureCommands(
+                commands,
+                device: device,
+                profileID: profileID
+            )
+        }
+        appleRemoteLongPressTimers[key] = timer
+        timer.resume()
+    }
+
+    private func performAppleRemoteConfiguredAction(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        profileID: UUID
+    ) -> Bool {
+        if performButtonProfileBoundAction(
+            profileID: profileID,
+            button: button,
+            trigger: trigger,
+            source: "apple:\(profileID.uuidString)"
+        ) {
+            settings.recordButtonPress(
+                control: .remoteButton(button),
+                source: .bluetoothRemote
+            )
+            AppLogger.shared.write(
+                "APPLE REMOTE BUTTON phase=completed result=submitted " +
+                    "button=\(button.rawValue) trigger=\(trigger.rawValue) action=private_feature"
+            )
+            return true
+        }
+        let configured = settings.configuredAction(
+            for: button,
+            trigger: trigger,
+            profileID: profileID
+        )
+        if configured.action == .appSwitcher {
+            return performAppleRemoteAppSwitcher(for: button, trigger: trigger, profileID: profileID)
+        }
+        let handled: Bool
+        if configured.action.isAppInternal {
+            handled = performInternalAction(configured.action, source: "apple:\(profileID.uuidString)")
+        } else {
+            guard KeyboardInjector.isAccessibilityTrusted else {
+                _ = KeyboardInjector.requestAccessibilityAccess()
+                AppLogger.shared.write(
+                    "APPLE REMOTE BUTTON phase=failed result=accessibility_required " +
+                        "button=\(button.rawValue) trigger=\(trigger.rawValue)"
+                )
+                return false
+            }
+            handled = performExternalConfiguredAction(configured)
+        }
+        if handled {
+            settings.recordButtonPress(
+                control: .remoteButton(button),
+                source: .bluetoothRemote
+            )
+        }
+        AppLogger.shared.write(
+            "APPLE REMOTE BUTTON phase=completed result=\(handled ? "submitted" : "failed") " +
+                "button=\(button.rawValue) trigger=\(trigger.rawValue) " +
+                "action=\(configured.action.rawValue)"
+        )
+        return handled
+    }
+
+    private func performAppleRemoteAppSwitcher(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        profileID: UUID? = nil
+    ) -> Bool {
+        let wasActive = appleRemoteAppSwitcherSession.isActive
+        if !wasActive {
+            appleRemoteAppSwitcherProfileID = profileID
+            beginAppleRemoteAppSwitcherDiagnostics()
+        }
+        let phase = wasActive ? "tab" : "start"
+        appleRemoteAppSwitcherTabCount += 1
+        let submitted = appleRemoteAppSwitcherSession.trigger()
+        AppLogger.shared.write(
+            "APPLE REMOTE APP SWITCHER " +
+                "operation_id=\(appleRemoteAppSwitcherOperationLabel) phase=\(phase) " +
+                "button=\(button.rawValue) trigger=\(trigger.rawValue) " +
+                "is_active_before=\(wasActive) " +
+                "is_active_after=\(appleRemoteAppSwitcherSession.isActive) " +
+                "success=\(submitted)"
+        )
+        if submitted {
+            if !wasActive {
+                appleRemoteCircularNavigation.reset()
+                siriRemoteFeature.setTouchRoutingMode(.circularNavigation)
+                startAppleRemoteAppSwitcherLifecycle()
+                AppLogger.shared.write(
+                    "APPLE REMOTE TOUCH_CONTEXT " +
+                        "operation_id=\(appleRemoteAppSwitcherOperationLabel) " +
+                        "phase=started result=active " +
+                        "context=app_switcher direction=clockwise_next"
+                )
+            }
+            scheduleAppleRemoteAppSwitcherTimeout()
+        } else if wasActive {
+            finishAppleRemoteAppSwitcher(reason: "tab_failed", confirmed: false)
+        } else {
+            finishAppleRemoteAppSwitcher(reason: "start_failed", confirmed: false)
+        }
+        return submitted
+    }
+
+    private func handleAppleRemoteContextualScroll(_ pixels: Double) -> Bool {
+        guard appleRemoteAppSwitcherSession.isActive else {
+            AppLogger.shared.write(
+                "APPLE REMOTE TOUCH_CONTEXT operation_id=none " +
+                    "phase=ignored result=context_inactive " +
+                    "context=app_switcher"
+            )
+            return false
+        }
+
+        let steps = appleRemoteCircularNavigation.consume(pixels)
+        guard steps != 0 else {
+            AppLogger.shared.write(
+                "APPLE REMOTE TOUCH_CONTEXT " +
+                    "operation_id=\(appleRemoteAppSwitcherOperationLabel) " +
+                    "phase=accumulating result=pending " +
+                    "context=app_switcher pixels=\(pixels)"
+            )
+            return true
+        }
+
+        let movesLeft = AppleRemoteCircularNavigationAccumulator.movesLeft(for: steps)
+        appleRemoteAppSwitcherTouchNavigationSteps += abs(steps)
+        for completedStep in 0..<abs(steps) {
+            guard appleRemoteAppSwitcherSession.moveSelection(left: movesLeft) else {
+                AppLogger.shared.write(
+                    "APPLE REMOTE TOUCH_CONTEXT " +
+                        "operation_id=\(appleRemoteAppSwitcherOperationLabel) " +
+                        "phase=navigate result=failed " +
+                        "context=app_switcher direction=\(movesLeft ? "left" : "right") " +
+                        "completed_steps=\(completedStep) requested_steps=\(abs(steps))"
+                )
+                finishAppleRemoteAppSwitcher(
+                    reason: "touch_navigate_failed",
+                    confirmed: false
+                )
+                return false
+            }
+        }
+
+        scheduleAppleRemoteAppSwitcherTimeout()
+        AppLogger.shared.write(
+            "APPLE REMOTE TOUCH_CONTEXT " +
+                "operation_id=\(appleRemoteAppSwitcherOperationLabel) " +
+                "phase=navigate result=submitted " +
+                "context=app_switcher direction=\(movesLeft ? "left" : "right") " +
+                "steps=\(abs(steps)) pixels=\(pixels)"
+        )
+        return true
+    }
+
+    private func handleAppleRemoteAppSwitcherControlPress(
+        _ button: RemoteButton
+    ) -> Bool {
+        switch button {
+        case .ok:
+            appleRemoteAppSwitcherButtonConfirmationCount += 1
+            let confirmed = appleRemoteAppSwitcherSession.confirm()
+            finishAppleRemoteAppSwitcher(
+                reason: confirmed ? "confirmed" : "confirm_failed",
+                confirmed: confirmed
+            )
+            return true
+        case .back:
+            finishAppleRemoteAppSwitcher(reason: "back", confirmed: false)
+            return true
+        case .left, .right:
+            if button == .left {
+                appleRemoteAppSwitcherButtonLeftCount += 1
+            } else {
+                appleRemoteAppSwitcherButtonRightCount += 1
+            }
+            let moved = appleRemoteAppSwitcherSession.moveSelection(left: button == .left)
+            AppLogger.shared.write(
+                "APPLE REMOTE APP SWITCHER " +
+                    "operation_id=\(appleRemoteAppSwitcherOperationLabel) " +
+                    "phase=navigate button=\(button.rawValue) " +
+                    "direction=\(button == .left ? "left" : "right") success=\(moved)"
+            )
+            if moved {
+                scheduleAppleRemoteAppSwitcherTimeout()
+            } else {
+                finishAppleRemoteAppSwitcher(reason: "navigate_failed", confirmed: false)
+            }
+            return true
+        case .up, .down:
+            AppLogger.shared.write(
+                "APPLE REMOTE APP SWITCHER " +
+                    "operation_id=\(appleRemoteAppSwitcherOperationLabel) " +
+                    "phase=navigate button=\(button.rawValue) " +
+                    "direction=unsupported success=true"
+            )
+            return true
+        case .tv:
+            return performAppleRemoteAppSwitcher(for: button, trigger: .singleClick)
+        default:
+            return false
+        }
+    }
+
+    private func scheduleAppleRemoteAppSwitcherTimeout() {
+        appleRemoteAppSwitcherTimeout?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(
+            deadline: .now() + .milliseconds(Int(HIDRemoteTiming.appSwitcherTimeoutMilliseconds))
+        )
+        timer.setEventHandler { [weak self] in
+            self?.finishAppleRemoteAppSwitcher(reason: "timeout", confirmed: false)
+        }
+        appleRemoteAppSwitcherTimeout = timer
+        timer.resume()
+    }
+
+    private func startAppleRemoteAppSwitcherLifecycle() {
+        scheduleAppleRemoteAppSwitcherTimeout()
+        appleRemoteAppSwitcherFrontmostMonitor?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(
+            deadline: .now() + .milliseconds(Int(HIDRemoteTiming.appSwitcherFrontmostPollMilliseconds)),
+            repeating: .milliseconds(Int(HIDRemoteTiming.appSwitcherFrontmostPollMilliseconds))
+        )
+        timer.setEventHandler { [weak self] in
+            guard let self,
+                  self.appleRemoteAppSwitcherSession.isActive,
+                  let origin = self.appleRemoteAppSwitcherOriginBundleIdentifier,
+                  let current = NSWorkspace.shared.frontmostApplication?.bundleIdentifier,
+                  current != origin
+            else { return }
+            self.finishAppleRemoteAppSwitcher(reason: "frontmost_changed", confirmed: false)
+        }
+        appleRemoteAppSwitcherFrontmostMonitor = timer
+        timer.resume()
+    }
+
+    private var appleRemoteAppSwitcherOperationLabel: String {
+        appleRemoteAppSwitcherOperationID.map(String.init) ?? "none"
+    }
+
+    private func beginAppleRemoteAppSwitcherDiagnostics() {
+        appleRemoteAppSwitcherOperationCounter &+= 1
+        appleRemoteAppSwitcherOperationID = appleRemoteAppSwitcherOperationCounter
+        appleRemoteAppSwitcherStartedUptime = ProcessInfo.processInfo.systemUptime
+        appleRemoteAppSwitcherOriginBundleIdentifier =
+            NSWorkspace.shared.frontmostApplication?.bundleIdentifier
+        appleRemoteAppSwitcherTabCount = 0
+        appleRemoteAppSwitcherTouchNavigationSteps = 0
+        appleRemoteAppSwitcherButtonLeftCount = 0
+        appleRemoteAppSwitcherButtonRightCount = 0
+        appleRemoteAppSwitcherTouchConfirmationCount = 0
+        appleRemoteAppSwitcherButtonConfirmationCount = 0
+    }
+
+    private func appleRemoteAppSwitcherSummary() -> String {
+        let elapsedMilliseconds = Int(
+            max(
+                0,
+                (ProcessInfo.processInfo.systemUptime -
+                    (appleRemoteAppSwitcherStartedUptime ?? ProcessInfo.processInfo.systemUptime)) * 1_000
+            )
+        )
+        return "tab_count=\(appleRemoteAppSwitcherTabCount) " +
+            "touch_navigation_steps=\(appleRemoteAppSwitcherTouchNavigationSteps) " +
+            "button_left_count=\(appleRemoteAppSwitcherButtonLeftCount) " +
+            "button_right_count=\(appleRemoteAppSwitcherButtonRightCount) " +
+            "touch_confirmation_count=\(appleRemoteAppSwitcherTouchConfirmationCount) " +
+            "button_confirmation_count=\(appleRemoteAppSwitcherButtonConfirmationCount) " +
+            "elapsed_ms=\(elapsedMilliseconds)"
+    }
+
+    private func resetAppleRemoteAppSwitcherDiagnostics() {
+        appleRemoteAppSwitcherProfileID = nil
+        appleRemoteAppSwitcherOperationID = nil
+        appleRemoteAppSwitcherStartedUptime = nil
+        appleRemoteAppSwitcherOriginBundleIdentifier = nil
+        appleRemoteAppSwitcherTabCount = 0
+        appleRemoteAppSwitcherTouchNavigationSteps = 0
+        appleRemoteAppSwitcherButtonLeftCount = 0
+        appleRemoteAppSwitcherButtonRightCount = 0
+        appleRemoteAppSwitcherTouchConfirmationCount = 0
+        appleRemoteAppSwitcherButtonConfirmationCount = 0
+    }
+
+    private func appleRemoteAppSwitcherTerminalResult(
+        reason: String,
+        commandReleased: Bool
+    ) -> String {
+        guard commandReleased else { return "submission_failed" }
+        if reason == "timeout" { return "timed_out" }
+        if reason.contains("failed") { return "submission_failed" }
+        if reason == "frontmost_changed" { return "diagnostic_unknown" }
+        return "cancelled"
+    }
+
+    private func finishAppleRemoteAppSwitcher(reason: String, confirmed: Bool) {
+        let operationID = appleRemoteAppSwitcherOperationID.map(String.init)
+        let origin = appleRemoteAppSwitcherOriginBundleIdentifier ?? "unknown"
+        let summary = appleRemoteAppSwitcherSummary()
+        let wasActive = appleRemoteAppSwitcherSession.isActive
+        appleRemoteAppSwitcherTimeout?.cancel()
+        appleRemoteAppSwitcherTimeout = nil
+        appleRemoteAppSwitcherFrontmostMonitor?.cancel()
+        appleRemoteAppSwitcherFrontmostMonitor = nil
+        appleRemoteCircularNavigation.reset()
+        siriRemoteFeature.setTouchRoutingMode(.standard)
+        let releaseSubmitted: Bool
+        if appleRemoteAppSwitcherSession.isActive {
+            releaseSubmitted = appleRemoteAppSwitcherSession.cancel()
+        } else {
+            releaseSubmitted = true
+        }
+        let current = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown"
+        guard let operationID else {
+            AppLogger.shared.write(
+                "APPLE REMOTE APP SWITCHER operation_id=none " +
+                    "phase=finish_ignored result=no_active_operation reason=\(reason) " +
+                    "is_active_before=\(wasActive) " +
+                    "is_active_after=\(appleRemoteAppSwitcherSession.isActive) " +
+                    "command_release=\(releaseSubmitted)"
+            )
+            resetAppleRemoteAppSwitcherDiagnostics()
+            return
+        }
+        AppLogger.shared.write(
+            "APPLE REMOTE APP SWITCHER operation_id=\(operationID) " +
+                "phase=ended reason=\(reason) confirmed=\(confirmed) " +
+                "origin=\(origin) current=\(current) " +
+                "is_active_before=\(wasActive) " +
+                "is_active_after=\(appleRemoteAppSwitcherSession.isActive) " +
+                "command_release=\(releaseSubmitted) \(summary)"
+        )
+        if confirmed {
+            scheduleAppleRemoteAppSwitcherVisibilityProbe(
+                operationID: operationID,
+                origin: origin,
+                summary: summary,
+                probeIndex: 0,
+                targetBundleIdentifier: nil
+            )
+        } else {
+            let terminalResult = appleRemoteAppSwitcherTerminalResult(
+                reason: reason,
+                commandReleased: releaseSubmitted
+            )
+            AppLogger.shared.write(
+                "APPLE REMOTE APP SWITCHER operation_id=\(operationID) " +
+                    "phase=terminal terminal_result=\(terminalResult) " +
+                    "reason=\(reason) \(summary)"
+            )
+        }
+        resetAppleRemoteAppSwitcherDiagnostics()
+    }
+
+    private func scheduleAppleRemoteAppSwitcherVisibilityProbe(
+        operationID: String,
+        origin: String,
+        summary: String,
+        probeIndex: Int,
+        targetBundleIdentifier: String?
+    ) {
+        let delays = HIDRemoteTiming.appSwitcherVisibilityProbeMilliseconds
+        guard probeIndex < delays.count else { return }
+        let delay = probeIndex == 0 ? delays[0] : delays[probeIndex] - delays[probeIndex - 1]
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + .milliseconds(Int(delay))
+        ) { [weak self] in
+            guard let self else { return }
+            let frontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "unknown"
+            let originIsKnown = origin != "unknown"
+            let target = targetBundleIdentifier ?? (
+                originIsKnown && frontmost != origin && frontmost != "unknown" ? frontmost : nil
+            )
+            let snapshot = target.map {
+                KeyboardInjector.applicationVisibilitySnapshot(bundleIdentifier: $0)
+            }
+            let probeResult: String
+            if target == nil {
+                probeResult = "awaiting_target"
+            } else if frontmost != target {
+                probeResult = "frontmost_mismatch"
+            } else if snapshot?.isUserVisible == true {
+                probeResult = "visible"
+            } else if snapshot?.isUserVisible == false {
+                probeResult = "no_visible_window"
+            } else {
+                probeResult = "diagnostic_unknown"
+            }
+            AppLogger.shared.write(
+                "APPLE REMOTE APP SWITCHER operation_id=\(operationID) " +
+                    "phase=visibility_probe result=\(probeResult) " +
+                    "probe_delay_ms=\(delays[probeIndex]) origin=\(origin) " +
+                    "target_bundle=\(target ?? "unknown") frontmost_bundle=\(frontmost) " +
+                    "process_active=\(self.optionalDiagnosticBool(snapshot?.processActive)) " +
+                    "process_hidden=\(self.optionalDiagnosticBool(snapshot?.processHidden)) " +
+                    "process_terminated=\(self.optionalDiagnosticBool(snapshot?.processTerminated)) " +
+                    "activation_policy=\(snapshot?.activationPolicy ?? "unknown") " +
+                    "ordinary_window_count=\(self.optionalDiagnosticInt(snapshot?.ordinaryWindowCount)) " +
+                    "onscreen_window_count=\(self.optionalDiagnosticInt(snapshot?.onscreenWindowCount)) " +
+                    "visible_window_area_positive=\(self.optionalDiagnosticBool(snapshot?.hasVisibleWindow)) " +
+                    "user_visible=\(self.optionalDiagnosticBool(snapshot?.isUserVisible)) " +
+                    "diagnostic_boundary=window_content_unavailable"
+            )
+
+            if probeIndex + 1 < delays.count {
+                self.scheduleAppleRemoteAppSwitcherVisibilityProbe(
+                    operationID: operationID,
+                    origin: origin,
+                    summary: summary,
+                    probeIndex: probeIndex + 1,
+                    targetBundleIdentifier: target
+                )
+                return
+            }
+
+            let terminalResult: String
+            if !originIsKnown {
+                terminalResult = "diagnostic_unknown"
+            } else if target == nil {
+                terminalResult = "frontmost_unchanged"
+            } else if frontmost != target {
+                terminalResult = "diagnostic_unknown"
+            } else if snapshot?.isUserVisible == true {
+                terminalResult = "visible_target_confirmed"
+            } else if snapshot?.isUserVisible == false {
+                terminalResult = "frontmost_changed_no_visible_window"
+            } else {
+                terminalResult = "diagnostic_unknown"
+            }
+            AppLogger.shared.write(
+                "APPLE REMOTE APP SWITCHER operation_id=\(operationID) " +
+                    "phase=terminal terminal_result=\(terminalResult) " +
+                    "target_bundle=\(target ?? "unknown") frontmost_bundle=\(frontmost) " +
+                    summary
+            )
+        }
+    }
+
+    private func optionalDiagnosticBool(_ value: Bool?) -> String {
+        value.map(String.init) ?? "unknown"
+    }
+
+    private func optionalDiagnosticInt(_ value: Int?) -> String {
+        value.map(String.init) ?? "unknown"
+    }
+
+    private func elapsedMilliseconds(since uptime: TimeInterval) -> Int {
+        max(0, Int((ProcessInfo.processInfo.systemUptime - uptime) * 1_000))
+    }
+
+    private func beginAppleRemoteVoice(for device: SiriRemoteDeviceIdentity) {
+        let outputReadyAtStart = audioOutput.isReadyForTestTone
+        var shouldStartConfiguration = false
+        if !outputReadyAtStart {
+            shouldStartConfiguration = pendingAppleRemoteVoiceStarts.isEmpty
+            pendingAppleRemoteVoiceStarts.insert(device)
+            if shouldStartConfiguration {
+                pendingAppleRemoteVoiceAudio.begin()
+            }
+        }
+        if appleRemoteAppSwitcherSession.isActive {
+            finishAppleRemoteAppSwitcher(reason: "voice_started", confirmed: false)
+        }
+        guard appleRemoteVoiceDevices.insert(device).inserted else { return }
+        appleRemoteVoiceCaptureRetryWorkItem?.cancel()
+        appleRemoteVoiceCaptureRetryWorkItem = nil
+        appleRemoteVoiceCaptureRetryAttempt = 0
+        siriRemoteCursorFeedback.cancelInteraction(reason: "voice_started")
+        siriRemoteFeature.setVoiceTouchSuppressed(true)
+        if appleRemoteVoiceStopping {
+            if siriRemoteFeature.resumeCaptureIfStopping() {
+                appleRemoteVoiceStopOperation &+= 1
+                appleRemoteVoiceStopping = false
+                audioOutput.cancelPendingDrain()
+                AppLogger.shared.write(
+                    "APPLE REMOTE VOICE phase=resumed result=continued_session " +
+                        "reason=rapid_repress stage=capture_closing"
+                )
+                return
+            }
+            if siriRemoteFeature.beginCapture() {
+                appleRemoteVoiceStopOperation &+= 1
+                appleRemoteVoiceStopping = false
+                audioOutput.cancelPendingDrain()
+                AppLogger.shared.write(
+                    "APPLE REMOTE VOICE phase=resumed result=continued_session " +
+                        "reason=rapid_repress stage=playback_draining"
+                )
+                return
+            }
+            AppLogger.shared.write(
+                "APPLE REMOTE VOICE phase=deferred reason=previous_session_draining"
+            )
+            return
+        }
+        guard appleRemoteVoiceDevices.count == 1 else {
+            AppLogger.shared.write(
+                "APPLE REMOTE VOICE phase=completed result=joined_active_session"
+            )
+            return
+        }
+        appleRemoteVoiceOperationCounter &+= 1
+        let operationID = "apple_remote_voice_\(appleRemoteVoiceOperationCounter)"
+        appleRemoteAudioBatchCount = 0
+        appleRemoteAudioSampleCount = 0
+        appleRemoteAudioEnqueueFailureCount = 0
+        appleRemoteAudioStopPendingBuffers = 0
+        appleRemoteAudioStopPendingSamples = 0
+        appleRemoteAudioStopInterruptedBuffers = 0
+        appleRemoteAudioStopInterruptedSamples = 0
+        loggedAppleRemoteAudioDevice = false
+        if outputReadyAtStart {
+            guard ensureVirtualAudioOutputReady(reason: "apple_remote_voice_start") else {
+                appleRemoteVoiceDevices.remove(device)
+                siriRemoteFeature.setVoiceTouchSuppressed(false)
+                AppLogger.shared.write(
+                    "APPLE REMOTE VOICE phase=failed result=audio_output_unavailable route=MiRemoteV_2ch"
+                )
+                recordPublicDiagnosticEvent(
+                    operationID: operationID,
+                    component: "voice",
+                    action: "session",
+                    phase: "failed",
+                    result: "failed",
+                    reason: "audio_output_unavailable",
+                    source: "bluetooth",
+                    remoteModelFamily: "apple_remote"
+                )
+                return
+            }
+        }
+        guard updateVoiceKeyState(
+            streaming: true,
+            forceSoftware: true,
+            owner: .appleRemote
+        ) else {
+            appleRemoteVoiceDevices.remove(device)
+            if shouldStartConfiguration {
+                pendingAppleRemoteVoiceStarts.remove(device)
+                pendingAppleRemoteVoiceAudio.cancel()
+                pendingAppleRemoteVoiceStopRequested = false
+            }
+            siriRemoteFeature.setVoiceTouchSuppressed(false)
+            AppLogger.shared.write(
+                "APPLE REMOTE VOICE phase=failed result=voice_key_press_failed"
+            )
+            recordPublicDiagnosticEvent(
+                operationID: operationID,
+                component: "voice",
+                action: "session",
+                phase: "failed",
+                result: "failed",
+                reason: "voice_key_press_failed",
+                source: "bluetooth",
+                remoteModelFamily: "apple_remote"
+            )
+            return
+        }
+        beginVoiceSessionIfNeeded()
+        activeAppleRemoteVoiceOperationID = operationID
+        activeAppleRemoteVoiceStartedAt = Date()
+        guard siriRemoteFeature.beginCapture() else {
+            if shouldStartConfiguration {
+                pendingAppleRemoteVoiceStarts.remove(device)
+                pendingAppleRemoteVoiceAudio.cancel()
+                pendingAppleRemoteVoiceStopRequested = false
+            }
+            AppLogger.shared.write(
+                "APPLE REMOTE VOICE phase=pending result=audio_capture_not_ready " +
+                    "retry_attempt=\(appleRemoteVoiceCaptureRetryAttempt)"
+            )
+            scheduleAppleRemoteVoiceCaptureRetry(for: device)
+            AppLogger.shared.write(
+                "APPLE REMOTE VOICE phase=held result=input_method_wake_preserved"
+            )
+            return
+        }
+        AppLogger.shared.write(
+            "APPLE REMOTE VOICE phase=started result=triggered audio_capture=requested " +
+                "audio_source=apple_remote_microphone route=MiRemoteV_2ch"
+        )
+        recordPublicDiagnosticEvent(
+            operationID: operationID,
+            component: "voice",
+            action: "session",
+            phase: "started",
+            result: "accepted",
+            reason: "voice_start",
+            source: "bluetooth",
+            remoteModelFamily: "apple_remote"
+        )
+        if !outputReadyAtStart, shouldStartConfiguration {
+            AppLogger.shared.write(
+                "SYSTEM AUDIO voice_start_recovery configured=pending " +
+                    "suspended=\(systemAudioSuspensionState.isSuspended) " +
+                    "reasons=\(systemAudioSuspensionState.diagnostic)"
+            )
+            ensureVirtualAudioOutputReady(reason: "apple_remote_voice_start") { [weak self] ready in
+                guard let self else { return }
+                let pendingDevices = self.pendingAppleRemoteVoiceStarts
+                self.pendingAppleRemoteVoiceStarts.removeAll()
+                let stopRequested = self.pendingAppleRemoteVoiceStopRequested
+                self.pendingAppleRemoteVoiceStopRequested = false
+                let bufferedAudio = self.pendingAppleRemoteVoiceAudio.drain()
+                guard ready else {
+                    self.pendingAppleRemoteVoiceAudio.cancel()
+                    for pendingDevice in pendingDevices {
+                        self.endAppleRemoteVoice(
+                            for: pendingDevice,
+                            reason: "audio_output_unavailable"
+                        )
+                    }
+                    return
+                }
+                if !bufferedAudio.isEmpty {
+                    AppLogger.shared.write(
+                        "APPLE REMOTE AUDIO flush_after_configuration samples=\(bufferedAudio.count)"
+                    )
+                    self.receiveAppleRemoteAudio(bufferedAudio)
+                }
+                if stopRequested, let pendingDevice = pendingDevices.first {
+                    self.endAppleRemoteVoice(
+                        for: pendingDevice,
+                        reason: "released_before_audio_ready"
+                    )
+                }
+            }
+        }
+    }
+
+    private func endAppleRemoteVoice(
+        for device: SiriRemoteDeviceIdentity,
+        reason: String
+    ) {
+        if pendingAppleRemoteVoiceStarts.contains(device) {
+            if appleRemoteVoiceDevices.contains(device) {
+                pendingAppleRemoteVoiceStopRequested = true
+                AppLogger.shared.write(
+                    "APPLE REMOTE VOICE phase=deferred result=pending_tail " +
+                        "reason=\(reason)"
+                )
+            } else {
+                pendingAppleRemoteVoiceStarts.remove(device)
+                pendingAppleRemoteVoiceAudio.cancel()
+                AppLogger.shared.write(
+                    "APPLE REMOTE VOICE phase=completed result=cancelled_before_audio_ready " +
+                        "reason=\(reason)"
+                )
+            }
+            return
+        }
+        guard appleRemoteVoiceDevices.remove(device) != nil else { return }
+        appleRemoteVoiceCaptureRetryWorkItem?.cancel()
+        appleRemoteVoiceCaptureRetryWorkItem = nil
+        if appleRemoteVoiceStopping {
+            AppLogger.shared.write(
+                "APPLE REMOTE VOICE phase=completed result=deferred_session_cancelled " +
+                    "reason=\(reason)"
+            )
+            return
+        }
+        guard appleRemoteVoiceDevices.isEmpty else { return }
+        appleRemoteVoiceStopping = true
+        appleRemoteVoiceStopOperation &+= 1
+        let stopOperation = appleRemoteVoiceStopOperation
+        let deliveryGeneration = voiceAudioDeliveryDiagnostic.generation
+        let outputBeforeStop = audioOutput.diagnosticSnapshot(
+            deliveryGeneration: deliveryGeneration
+        )
+        appleRemoteAudioStopPendingBuffers = outputBeforeStop.pendingBuffers
+        appleRemoteAudioStopPendingSamples = outputBeforeStop.pendingSamples
+        AppLogger.shared.write(
+            "APPLE REMOTE AUDIO playback_stop phase=waiting_for_capture_tail " +
+                "reason=\(reason) generation=\(deliveryGeneration) " +
+                "pending_buffers=\(outputBeforeStop.pendingBuffers) " +
+                "pending_samples=\(outputBeforeStop.pendingSamples)"
+        )
+        siriRemoteFeature.stopCapture { [weak self] in
+            guard let self,
+                  self.appleRemoteVoiceStopping,
+                  self.appleRemoteVoiceStopOperation == stopOperation
+            else { return }
+            self.audioOutput.endSessionAfterDraining(
+                source: "apple_remote",
+                operationID: stopOperation,
+                maximumDelay: nil
+            ) { [weak self] outcome in
+                self?.completeAppleRemoteVoiceStop(
+                    operation: stopOperation,
+                    deliveryGeneration: deliveryGeneration,
+                    reason: reason,
+                    drainOutcome: outcome
+                )
+            }
+        }
+    }
+
+    private func scheduleAppleRemoteVoiceCaptureRetry(
+        for device: SiriRemoteDeviceIdentity
+    ) {
+        guard appleRemoteVoiceCaptureRetryWorkItem == nil else { return }
+        let delays: [TimeInterval] = [0.1, 0.25, 0.5, 1.0, 2.0]
+        guard appleRemoteVoiceCaptureRetryAttempt < delays.count else {
+            AppLogger.shared.write(
+                "APPLE REMOTE VOICE phase=failed result=audio_capture_retry_exhausted " +
+                    "attempts=\(appleRemoteVoiceCaptureRetryAttempt)"
+            )
+            if let operationID = activeAppleRemoteVoiceOperationID {
+                recordPublicDiagnosticEvent(
+                    operationID: operationID,
+                    component: "voice",
+                    action: "session",
+                    phase: "failed",
+                    result: "failed",
+                    reason: "audio_capture_retry_exhausted",
+                    source: "bluetooth",
+                    remoteModelFamily: "apple_remote"
+                )
+            }
+            return
+        }
+        let attempt = appleRemoteVoiceCaptureRetryAttempt
+        appleRemoteVoiceCaptureRetryAttempt += 1
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.appleRemoteVoiceCaptureRetryWorkItem = nil
+            guard self.appleRemoteVoiceDevices.contains(device),
+                  !self.appleRemoteVoiceStopping
+            else { return }
+            if self.siriRemoteFeature.beginCapture() {
+                AppLogger.shared.write(
+                    "APPLE REMOTE VOICE phase=started result=retry_succeeded " +
+                        "retry_attempt=\(attempt + 1) audio_source=apple_remote_microphone " +
+                        "route=MiRemoteV_2ch"
+                )
+                if let operationID = self.activeAppleRemoteVoiceOperationID {
+                    self.recordPublicDiagnosticEvent(
+                        operationID: operationID,
+                        component: "voice",
+                        action: "session",
+                        phase: "started",
+                        result: "accepted",
+                        reason: "voice_start_retry",
+                        source: "bluetooth",
+                        remoteModelFamily: "apple_remote"
+                    )
+                }
+                return
+            }
+            AppLogger.shared.write(
+                "APPLE REMOTE VOICE phase=pending result=retry_not_ready " +
+                    "retry_attempt=\(attempt + 1)"
+            )
+            self.scheduleAppleRemoteVoiceCaptureRetry(for: device)
+        }
+        appleRemoteVoiceCaptureRetryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delays[attempt], execute: workItem)
+    }
+
+    private func completeAppleRemoteVoiceStop(
+        operation: UInt64,
+        deliveryGeneration: Int,
+        reason: String,
+        drainOutcome: VirtualAudioDrainOutcome
+    ) {
+        guard appleRemoteVoiceStopping,
+              appleRemoteVoiceStopOperation == operation
+        else { return }
+        let deferredDevices = appleRemoteVoiceDevices
+        appleRemoteVoiceDevices.removeAll()
+        let released = releaseVoiceKeyIfNeeded(owner: .appleRemote, forceSoftware: true)
+        appleRemoteVoiceStopping = false
+        siriRemoteFeature.setVoiceTouchSuppressed(false)
+        endVoiceSessionIfNeeded(flushAudio: false)
+        let outputAfterStop = audioOutput.diagnosticSnapshot(
+            deliveryGeneration: deliveryGeneration
+        )
+        appleRemoteAudioStopInterruptedBuffers = outputAfterStop.counters.interruptedBuffers
+        appleRemoteAudioStopInterruptedSamples = outputAfterStop.counters.interruptedSamples
+        voiceAudioDeliveryDiagnostic.outputAtObservation = outputAfterStop
+        AppLogger.shared.write(
+            "APPLE REMOTE AUDIO playback_stop phase=completed " +
+                "result=completed completion=\(drainOutcome.rawValue) reason=\(reason) " +
+                "generation=\(deliveryGeneration) " +
+                "pending_before_buffers=\(appleRemoteAudioStopPendingBuffers) " +
+                "pending_before_samples=\(appleRemoteAudioStopPendingSamples) " +
+                "pending_after_buffers=\(outputAfterStop.pendingBuffers) " +
+                "pending_after_samples=\(outputAfterStop.pendingSamples) " +
+                "played_buffers=\(outputAfterStop.counters.playedBuffers) " +
+                "played_samples=\(outputAfterStop.counters.playedSamples) " +
+                "interrupted_buffers=\(appleRemoteAudioStopInterruptedBuffers) " +
+                "interrupted_samples=\(appleRemoteAudioStopInterruptedSamples)"
+        )
+        AppLogger.shared.write(
+            "APPLE REMOTE VOICE phase=completed result=\(released ? "stopped" : "release_failed") " +
+                "reason=\(reason) audio_batches=\(appleRemoteAudioBatchCount) " +
+                "audio_samples=\(appleRemoteAudioSampleCount) " +
+                "enqueue_failures=\(appleRemoteAudioEnqueueFailureCount) route=MiRemoteV_2ch"
+        )
+        if let operationID = activeAppleRemoteVoiceOperationID {
+            recordVoiceSessionCompletion(
+                operationID: operationID,
+                source: "bluetooth",
+                remoteModelFamily: "apple_remote",
+                startedAt: activeAppleRemoteVoiceStartedAt,
+                receivedSamples: appleRemoteAudioSampleCount,
+                failureCount: appleRemoteAudioEnqueueFailureCount + (released ? 0 : 1),
+                stopReason: reason
+            )
+        }
+        activeAppleRemoteVoiceOperationID = nil
+        activeAppleRemoteVoiceStartedAt = nil
+        if !deferredDevices.isEmpty {
+            deferredDevices.forEach { beginAppleRemoteVoice(for: $0) }
+        }
+    }
+
+    private func receiveAppleRemoteAudio(_ samples: [Int16]) {
+        guard (!appleRemoteVoiceDevices.isEmpty || appleRemoteVoiceStopping),
+              !samples.isEmpty
+        else { return }
+        if !pendingAppleRemoteVoiceStarts.isEmpty,
+           pendingAppleRemoteVoiceAudio.appendIfWaiting(samples) {
+            AppLogger.shared.write(
+                "APPLE REMOTE AUDIO buffered_during_configuration samples=\(samples.count) " +
+                    "total=\(pendingAppleRemoteVoiceAudio.bufferedSampleCount)"
+            )
+            return
+        }
+        recordingAssetCoordinator.append(samples: samples)
+        publishCurrentVoiceSampleReceiptIfNeeded(sampleCount: samples.count)
+        let deliveryGeneration = voiceAudioDeliveryDiagnostic.generation
+        let accepted = audioOutput.enqueue(
+            samples: samples,
+            deliveryGeneration: deliveryGeneration
+        )
+        recordVoiceAudioReceipt(samples: samples, route: .virtualAudioDirect)
+        recordVoiceAudioEnqueueOutcome(
+            accepted: accepted,
+            deliveryGeneration: deliveryGeneration
+        )
+        appleRemoteAudioBatchCount += 1
+        appleRemoteAudioSampleCount += samples.count
+        if !accepted { appleRemoteAudioEnqueueFailureCount += 1 }
+        if !loggedAppleRemoteAudioDevice {
+            loggedAppleRemoteAudioDevice = true
+            AppLogger.shared.write(
+                "APPLE REMOTE AUDIO routed source=apple_remote_microphone " +
+                    "route=virtual_audio device=MiRemoteV_2ch accepted=\(accepted) " +
+                    "first_batch_samples=\(samples.count) " +
+                    "pending_buffers=\(audioOutput.pendingVoiceBufferCountForDiagnostics)"
+            )
+        }
+    }
+
+    private func resetAppleRemoteState(
+        for device: SiriRemoteDeviceIdentity,
+        reason: String
+    ) {
+        if appleRemoteAppSwitcherSession.isActive {
+            finishAppleRemoteAppSwitcher(reason: "input_reset_\(reason)", confirmed: false)
+        }
+        let doubleClickKeys = appleRemoteDoubleClickTimers.keys.filter { $0.device == device }
+        doubleClickKeys.forEach {
+            appleRemoteDoubleClickTimers.removeValue(forKey: $0)?.cancel()
+        }
+        let longPressKeys = appleRemoteLongPressTimers.keys.filter { $0.device == device }
+        longPressKeys.forEach {
+            appleRemoteLongPressTimers.removeValue(forKey: $0)?.cancel()
+        }
+        let repeatKeys = appleRemoteRepeatTimers.keys.filter { $0.device == device }
+        repeatKeys.forEach {
+            cancelAppleRemoteRepeat(
+                for: $0.button,
+                device: $0.device,
+                reason: reason
+            )
+        }
+        appleRemoteGestureRecognizers.removeValue(forKey: device)
+        appleRemoteActiveButtons.removeValue(forKey: device)
+        appleRemoteActiveControlIDs.removeValue(forKey: device)
+        appleRemoteHoverClickDevices.remove(device)
+        siriRemoteCursorFeedback.cancelInteraction(reason: "device_reset")
+        endAppleRemoteVoice(for: device, reason: reason)
+        refreshAppleRemoteActiveButtons()
+        refreshAppleRemoteActiveControlIDs()
+    }
+
+    private func resetAllAppleRemoteState(reason: String) {
+        let devices = Set(appleRemoteProfileIDs.keys)
+            .union(appleRemoteGestureRecognizers.keys)
+            .union(appleRemoteVoiceDevices)
+        devices.forEach { resetAppleRemoteState(for: $0, reason: reason) }
+        appleRemoteProfileIDs.removeAll()
+        connectedAppleRemoteProfileIDs.removeAll()
+        appleRemoteActiveButtons.removeAll()
+        appleRemoteActiveControlIDs.removeAll()
+        appleRemoteHoverClickDevices.removeAll()
+        activeAppleRemoteControlIDs = []
+        refreshBluetoothPresentation()
+    }
+
+    private func refreshAppleRemoteActiveButtons() {
+        guard let selectedProfileID = settings.selectedRemoteProfileID,
+              settings.selectedRemoteProfile?.model.isAppleSiriRemote == true
+        else { return }
+        activeRemoteButtons = appleRemoteProfileIDs.reduce(into: Set<RemoteButton>()) {
+            result, entry in
+            guard entry.value == selectedProfileID else { return }
+            result.formUnion(appleRemoteActiveButtons[entry.key] ?? [])
+        }
+    }
+
+    private func refreshAppleRemoteActiveControlIDs() {
+        guard let selectedProfileID = settings.selectedRemoteProfileID,
+              settings.selectedRemoteProfile?.model.isAppleSiriRemote == true
+        else { return }
+        activeAppleRemoteControlIDs = appleRemoteProfileIDs.reduce(into: Set<String>()) {
+            result, entry in
+            guard entry.value == selectedProfileID else { return }
+            result.formUnion(appleRemoteActiveControlIDs[entry.key] ?? [])
+        }
+    }
+
+    private func refreshAppleRemoteHIDStatus() {
+        guard settings.selectedRemoteProfile?.model.isAppleSiriRemote == true else { return }
+        if !settings.customMappingEnabled {
+            hidStatus = LocalizedMessage("button_mapping.status.system_managed")
+        } else if !HIDRemoteMonitor.isInputMonitoringGranted {
+            hidStatus = LocalizedMessage("button_mapping.permission.input_monitoring_required")
+        } else if !KeyboardInjector.isAccessibilityTrusted {
+            hidStatus = LocalizedMessage("button_mapping.permission.accessibility_required")
+        } else if let profileID = settings.selectedRemoteProfileID,
+                  connectedAppleRemoteProfileIDs.contains(profileID) {
+            hidStatus = LocalizedMessage("button_mapping.status.connected")
+        } else {
+            hidStatus = LocalizedMessage("button_mapping.status.waiting_for_device")
+        }
+    }
+
+    private static func publicBluetoothConnectionState(
+        _ state: BluetoothBridgeState
+    ) -> (phase: String, result: String, reason: String) {
+        switch state {
+        case .stopped:
+            return ("stopped", "stopped", "bridge_stopped")
+        case .bluetoothUnavailable:
+            return ("failed", "unavailable", "bluetooth_unavailable")
+        case .scanning:
+            return ("started", "pending", "scanning")
+        case .connecting:
+            return ("started", "pending", "connecting")
+        case .discovering:
+            return ("started", "pending", "discovering")
+        case .ready:
+            return ("completed", "connected", "ready")
+        case .reconnecting:
+            return ("started", "pending", "reconnecting")
+        case .failed:
+            return ("failed", "failed", "bridge_failed")
+        }
+    }
+
+    func bluetoothBridge(
+        _ bridge: XiaomiBluetoothBridge,
+        didChange state: BluetoothBridgeState
+    ) {
+        let publicState = Self.publicBluetoothConnectionState(state)
+        recordPublicDiagnosticEvent(
+            component: "remote",
+            action: "connection",
+            phase: publicState.phase,
+            result: publicState.result,
+            reason: publicState.reason,
+            source: "bluetooth",
+            remoteModelFamily: "xiaomi"
+        )
+        let bridgeObjectID = ObjectIdentifier(bridge)
+        let previousState = bluetoothBridgeStates[bridgeObjectID]
+        let shouldReapplyHIDSettings = Self.shouldReapplyHIDSettings(
+            previousState: previousState,
+            currentState: state
+        )
+        bluetoothBridgeStates[bridgeObjectID] = state
+        if case .ready = state {
+            _ = registerBluetoothBridgeIfNeeded(bridge)
+            voiceFnTapSession.resume()
+            if shouldReapplyHIDSettings {
+                applyHIDSettings()
+                scheduleHIDMappingRecoveryIfNeeded()
+            }
+        } else {
+            if readyBluetoothBridgeCount == 0 {
+                cancelHIDMappingRecovery(reason: "bluetooth_not_ready")
+            }
+            let identifier = bluetoothIdentifier(for: bridge)
+            if let identifier {
+                let hadBattery = pendingRemoteBatteryLevels.removeValue(forKey: identifier) != nil
+                let hadPower = pendingRemotePowerStates.removeValue(forKey: identifier) != nil
+                let hadModel = pendingRemoteModels.removeValue(forKey: identifier) != nil
+                if hadBattery || hadPower || hadModel {
+                    AppLogger.shared.write(
+                        "REMOTE PROFILE_TELEMETRY phase=cancelled result=discarded " +
+                            "reason=bridge_not_ready battery=\(hadBattery) " +
+                            "power=\(hadPower) model=\(hadModel)"
+                    )
+                }
+                if let profileID = settings.profileID(forBluetoothIdentifier: identifier) {
+                    remoteBatteryLevels.removeValue(forKey: profileID)
+                    remotePowerStates.removeValue(forKey: profileID)
+                }
+            }
+            let voiceWasActive = identifier == activeBluetoothVoiceDeviceIdentifier
+            if voiceWasActive {
+                if rc003VoiceExtensionTestEnabled,
+                   rc003VoiceExtensionActive,
+                   rc003VoiceExtensionBridge === bridge {
+                    finishRC003VoiceExtensionTest(reason: "bluetooth_not_ready")
+                }
+                cancelVoiceSessionWarningTracking()
+                bluetoothVoiceActive = false
+                activeBluetoothVoiceDeviceIdentifier = nil
+                releaseVoiceKeyIfNeeded(owner: .bluetooth, forceSoftware: false)
+                endVoiceSessionIfNeeded(flushAudio: false)
+            }
+            if longRecordingRequested {
+                finishLongRecording(reason: "bluetooth_not_ready")
+            }
+        }
+        refreshBluetoothPresentation()
+        if case .ready = state { refreshRemoteDeviceNames(reason: .connection) }
+        if isConnected {
+            voiceFnTapSession.resume()
+            if shouldKeepVirtualAudioActive {
+                cancelVirtualAudioReleaseIfPending(trigger: "bluetooth_ready")
+                _ = ensureVirtualAudioOutputReady(reason: "bluetooth_ready")
+            } else if !isAudioOutputReady {
+                AppLogger.shared.write(
+                    "AUDIO REBIND deferred reason=bluetooth_ready " +
+                        "system_suspended=\(systemAudioSuspensionState.isSuspended) " +
+                        "reasons=\(systemAudioSuspensionState.diagnostic)"
+                )
+            }
+        } else {
+            voiceFnTapSession.suspend { [weak self] in
+                self?.releaseVirtualAudioOutputIfUnused(reason: "bluetooth_not_ready")
+            }
+        }
+    }
+
+    func bluetoothBridgeDeviceNameDidChange(_ bridge: XiaomiBluetoothBridge) {
+        guard bluetoothBridges.values.contains(where: { $0 === bridge }) else { return }
+        refreshRemoteDeviceNames(reason: .peripheralEvent)
+    }
+
+    func bluetoothBridgeDidStartVoice(_ bridge: XiaomiBluetoothBridge) {
+        guard let identifier = bridge.deviceIdentifier else {
+            bridge.audioDiagnostics?.rejectStart(reason: "device_context_unavailable")
+            return
+        }
+        if let pendingIdentifier = pendingBluetoothVoiceStartIdentifier,
+           pendingIdentifier != identifier {
+            _ = bridge.requestMicrophoneClose()
+            bridge.audioDiagnostics?.rejectStart(reason: "pending_start_busy")
+            AppLogger.shared.write("ATVV STREAM rejected_busy reason=pending_start")
+            return
+        }
+        let outputReadyAtStart = audioOutput.isReadyForTestTone
+        if !outputReadyAtStart {
+            let shouldStartConfiguration = pendingBluetoothVoiceStartIdentifier == nil
+            if shouldStartConfiguration {
+                pendingBluetoothVoiceStartIdentifier = identifier
+                pendingBluetoothVoiceAudioDiagnostic = bridge.audioDiagnostics
+                pendingBluetoothVoiceAudio.begin()
+            }
+        }
+        if identifier == activeBluetoothVoiceDeviceIdentifier, bluetoothVoiceActive {
+            AppLogger.shared.write("ATVV STREAM ignored_duplicate_start")
+            recordPublicDiagnosticEvent(
+                component: "voice",
+                action: "session",
+                phase: "rejected",
+                result: "duplicate",
+                reason: "duplicate_start",
+                source: "bluetooth",
+                remoteModelFamily: "xiaomi"
+            )
+            return
+        }
+        let isRC003Continuation = rc003VoiceExtensionTestEnabled &&
+            rc003VoiceExtensionActive &&
+            rc003VoiceExtensionAwaitingReopen &&
+            rc003VoiceExtensionBridge === bridge
+        let profileID = activateRemoteProfile(for: bridge)
+        if let activeBluetoothVoiceDeviceIdentifier,
+           activeBluetoothVoiceDeviceIdentifier != identifier {
+            _ = bridge.requestMicrophoneClose()
+            bridge.audioDiagnostics?.rejectStart(reason: "another_session_active")
+            AppLogger.shared.write("ATVV STREAM rejected_busy")
+            recordPublicDiagnosticEvent(
+                component: "voice",
+                action: "session",
+                phase: "rejected",
+                result: "busy",
+                reason: "another_session_active",
+                source: "bluetooth",
+                remoteModelFamily: "xiaomi"
+            )
+            return
+        }
+        if settings.voiceKeyMode != .function || settings.voiceFnTapModeEnabled {
+            applyHIDSettings(allowVoiceKeyModeFallback: false)
+        }
+        guard Self.canStartBluetoothVoice(
+            mode: settings.voiceKeyMode,
+            voiceFnTapModeEnabled: settings.voiceFnTapModeEnabled,
+            isVoiceKeyNeutralized: voiceFunctionMapper.isVoiceKeyNeutralized
+        ) else {
+            _ = bridge.requestMicrophoneClose()
+            bridge.audioDiagnostics?.rejectStart(reason: "voice_key_not_neutralized")
+            AppLogger.shared.write(
+                "ATVV STREAM rejected reason=voice_key_not_neutralized " +
+                    "mode=\(settings.voiceKeyMode.rawValue)"
+            )
+            recordPublicDiagnosticEvent(
+                component: "voice",
+                action: "session",
+                phase: "rejected",
+                result: "failed",
+                reason: "voice_key_not_neutralized",
+                source: "bluetooth",
+                remoteModelFamily: "xiaomi"
+            )
+            return
+        }
+        if outputReadyAtStart {
+            guard ensureVirtualAudioOutputReady(reason: "bluetooth_voice_start") else {
+                _ = bridge.requestMicrophoneClose()
+                bridge.audioDiagnostics?.rejectStart(reason: "audio_output_unavailable")
+                AppLogger.shared.write("ATVV STREAM rejected_audio_output")
+                recordPublicDiagnosticEvent(
+                    component: "voice",
+                    action: "session",
+                    phase: "rejected",
+                    result: "failed",
+                    reason: "audio_output_unavailable",
+                    source: "bluetooth",
+                    remoteModelFamily: "xiaomi"
+                )
+                return
+            }
+        }
+        let pendingStartAudio: [Int16]
+        if outputReadyAtStart, pendingBluetoothVoiceStartIdentifier == identifier {
+            pendingStartAudio = pendingBluetoothVoiceAudio.drain()
+            pendingBluetoothVoiceStartIdentifier = nil
+        } else {
+            pendingStartAudio = []
+        }
+        cancelPendingCommandVoiceAudio(reason: "new_stream")
+        activeBluetoothVoiceDeviceIdentifier = identifier
+        loggedBluetoothVoiceAudioDeviceIdentifier = nil
+        bluetoothVoiceActive = true
+        guard updateVoiceKeyState(
+            streaming: true,
+            forceSoftware: false,
+            owner: .bluetooth,
+            audioDiagnostic: bridge.audioDiagnostics
+        ) else {
+            _ = bridge.requestMicrophoneClose()
+            cancelVoiceSessionWarningTracking()
+            bluetoothVoiceActive = false
+            activeBluetoothVoiceDeviceIdentifier = nil
+            pendingBluetoothVoiceStartIdentifier = nil
+            cancelPendingBluetoothVoiceAudio(reason: "voice_key_press_failed")
+            pendingBluetoothVoiceStopRequested = false
+            bridge.audioDiagnostics?.rejectStart(reason: "voice_key_press_failed")
+            AppLogger.shared.write(
+                "ATVV STREAM rejected reason=voice_key mode=\(settings.voiceKeyMode.rawValue)"
+            )
+            recordPublicDiagnosticEvent(
+                component: "voice",
+                action: "session",
+                phase: "rejected",
+                result: "failed",
+                reason: "voice_key_press_failed",
+                source: "bluetooth",
+                remoteModelFamily: "xiaomi"
+            )
+            return
+        }
+        let model = profileID
+            .flatMap { id in settings.remoteDeviceProfiles.first(where: { $0.id == id })?.model }
+            ?? .unknown
+        startVoiceSessionWarningTracking(for: model)
+        bluetoothVoiceTraceCounter &+= 1
+        activeBluetoothVoiceTraceID = bluetoothVoiceTraceCounter
+        bluetoothVoiceTraceStartedAt = Date()
+        bluetoothVoiceTraceModel = model
+        bluetoothVoiceDecodedBatchCount = 0
+        bluetoothVoiceDecodedSampleCount = 0
+        resetCurrentVoiceSampleReceipt()
+        bluetoothVoiceEnqueueFailureCount = 0
+        bluetoothVoiceIdentifierDropCount = 0
+        bluetoothVoiceTraceRoute = "none"
+        bluetoothVoiceTailDiagnostics.reset()
+        AppLogger.shared.write(
+            "ATVV STREAM accepted trace=\(bluetoothVoiceTraceCounter) model=\(model.rawValue) operation_id=\(bridge.audioDiagnostics?.operationID ?? 0)"
+        )
+        recordPublicDiagnosticEvent(
+            operationID: "voice_bluetooth_\(bluetoothVoiceTraceCounter)",
+            component: "voice",
+            action: "session",
+            phase: "started",
+            result: "accepted",
+            reason: "trigger_observed",
+            source: "bluetooth",
+            remoteModelFamily: "xiaomi"
+        )
+        cancelVirtualAudioReleaseIfPending(trigger: "bluetooth_voice_start")
+        if longRecordingRequested {
+            longRecordingOpenTimer?.cancel()
+            longRecordingOpenTimer = nil
+            AppLogger.shared.write("LONG RECORDING started")
+        }
+        if isRC003Continuation {
+            rc003VoiceExtensionAwaitingReopen = false
+            rc003VoiceExtensionDidReceiveAudio = false
+            rc003VoiceExtensionOpenTimer?.cancel()
+            rc003VoiceExtensionOpenTimer = nil
+            AppLogger.shared.write(
+                "RC003 EXTENSION physical_segment_reopened trace=\(activeBluetoothVoiceTraceID ?? 0)"
+            )
+        } else {
+            _ = voiceFnTapSession.startVoice()
+            beginVoiceSessionIfNeeded(audioDiagnosticOperationID: bridge.audioDiagnostics?.operationID)
+            if rc003VoiceExtensionTestEnabled {
+                rc003VoiceExtensionActive = true
+                rc003VoiceExtensionAwaitingReopen = false
+                rc003VoiceExtensionDidReceiveAudio = false
+                rc003VoiceExtensionBridge = bridge
+                rc003VoiceExtensionGeneration &+= 1
+                scheduleRC003VoiceExtensionDeadline(
+                    generation: rc003VoiceExtensionGeneration
+                )
+                AppLogger.shared.write(
+                    "RC003 EXTENSION test_started max_duration_s=\(Int(Self.rc003VoiceExtensionMaximumDuration))"
+                )
+            }
+        }
+        if !outputReadyAtStart {
+            let configurationDiagnostic = bridge.audioDiagnostics
+            AppLogger.shared.write(
+                "SYSTEM AUDIO voice_start_recovery configured=pending " +
+                    "suspended=\(systemAudioSuspensionState.isSuspended) " +
+                    "reasons=\(systemAudioSuspensionState.diagnostic)"
+            )
+            ensureVirtualAudioOutputReady(reason: "bluetooth_voice_start") { [weak self, weak bridge] ready in
+                guard let self, let bridge,
+                      self.pendingBluetoothVoiceStartIdentifier == identifier
+                else { return }
+                let stopRequested = self.pendingBluetoothVoiceStopRequested
+                self.pendingBluetoothVoiceStopRequested = false
+                self.pendingBluetoothVoiceStartIdentifier = nil
+                let bufferedAudio = self.pendingBluetoothVoiceAudio.drain()
+                guard ready else {
+                    configurationDiagnostic?.bufferLost(samples: bufferedAudio.count, stage: "configuration", reason: "configuration_failed")
+                    self.cancelPendingBluetoothVoiceAudio(reason: "configuration_failed")
+                    _ = bridge.requestMicrophoneClose()
+                    configurationDiagnostic?.rejectStart(reason: "audio_output_unavailable")
+                    AppLogger.shared.write("ATVV STREAM rejected_audio_output")
+                    self.bluetoothBridgeDidStopVoice(bridge)
+                    return
+                }
+                if !bufferedAudio.isEmpty {
+                    AppLogger.shared.write(
+                        "ATVV AUDIO flush_after_configuration samples=\(bufferedAudio.count)"
+                    )
+                    self.routeBluetoothVoiceSamples(
+                        bufferedAudio,
+                        from: bridge,
+                        identifier: identifier
+                    )
+                }
+                if stopRequested {
+                    self.bluetoothBridgeDidStopVoice(bridge)
+                }
+            }
+        }
+        let generation = voiceAudioDeliveryDiagnostic.generation
+        let operationID = bridge.audioDiagnostics?.operationID
+        if latestBluetoothAudioDiagnosticGeneration == generation {
+            sharedBluetoothAudioDiagnosticGenerations.append(generation)
+            if sharedBluetoothAudioDiagnosticGenerations.count > 32 {
+                sharedBluetoothAudioDiagnosticGenerations.removeFirst()
+            }
+        }
+        let initiallyIsolated = audioOutput.diagnosticSnapshot(deliveryGeneration: generation).pendingSamples == 0
+        latestBluetoothAudioDiagnosticOperationID = operationID
+        latestBluetoothAudioDiagnosticGeneration = generation
+        bridge.audioDiagnostics?.bindOutput(
+            generation: generation,
+            snapshot: { [weak self] in
+                guard let self else { return nil }
+                var observation = self.audioOutput.atvvPlaybackObservation(deliveryGeneration: generation)
+                observation.sessionIsolated = initiallyIsolated &&
+                    !self.sharedBluetoothAudioDiagnosticGenerations.contains(generation) &&
+                    (self.latestBluetoothAudioDiagnosticOperationID == operationID ||
+                     self.voiceAudioDeliveryDiagnostic.generation != generation)
+                return observation
+            },
+            fn: { [weak self] in
+                (self?.preferredInputSourceMonitor.lastFunctionKeyDownAtForDiagnostics,
+                 self?.preferredInputSourceMonitor.lastFunctionKeyUpAtForDiagnostics)
+            }
+        )
+        flushPendingCommandVoiceAudio(for: bridge)
+        if !pendingStartAudio.isEmpty {
+            AppLogger.shared.write(
+                "ATVV AUDIO flush_after_configuration samples=\(pendingStartAudio.count)"
+            )
+            routeBluetoothVoiceSamples(
+                pendingStartAudio,
+                from: bridge,
+                identifier: identifier
+            )
+        }
+    }
+
+    func bluetoothBridgeDidStopVoice(_ bridge: XiaomiBluetoothBridge) {
+        guard let identifier = bridge.deviceIdentifier else { return }
+        if pendingBluetoothVoiceStartIdentifier == identifier,
+           activeBluetoothVoiceDeviceIdentifier == nil {
+            pendingBluetoothVoiceStartIdentifier = nil
+            cancelPendingBluetoothVoiceAudio(reason: "stop_before_audio_ready")
+            pendingBluetoothVoiceStopRequested = false
+            AppLogger.shared.write("ATVV STREAM stop_before_audio_ready result=cancelled")
+            return
+        }
+        if pendingBluetoothVoiceStartIdentifier == identifier {
+            pendingBluetoothVoiceStopRequested = true
+            AppLogger.shared.write(
+                "ATVV STREAM stop_deferred_until_audio_ready result=pending_tail " +
+                    "pending_samples=\(pendingBluetoothVoiceAudio.bufferedSampleCount)"
+            )
+            return
+        }
+        guard identifier == activeBluetoothVoiceDeviceIdentifier else { return }
+        if rc003VoiceExtensionTestEnabled,
+           rc003VoiceExtensionActive,
+           rc003VoiceExtensionBridge === bridge {
+            cancelVoiceSessionWarningTracking()
+            bluetoothVoiceActive = false
+            loggedBluetoothVoiceAudioDeviceIdentifier = nil
+            rc003VoiceExtensionAwaitingReopen = true
+            rc003VoiceExtensionDidReceiveAudio = false
+            rc003VoiceExtensionTimer?.cancel()
+            rc003VoiceExtensionTimer = nil
+            rc003VoiceExtensionGeneration &+= 1
+            let opened = bridge.requestMicrophoneOpen()
+            if opened {
+                scheduleRC003VoiceExtensionOpenTimeout(
+                    generation: rc003VoiceExtensionGeneration
+                )
+            } else {
+                finishRC003VoiceExtensionTest(reason: "reopen_rejected")
+            }
+            AppLogger.shared.write(
+                "RC003 EXTENSION physical_stop reopen_requested=\(opened) " +
+                    "generation=\(rc003VoiceExtensionGeneration)"
+            )
+            return
+        }
+        activeBluetoothVoiceDeviceIdentifier = nil
+        loggedBluetoothVoiceAudioDeviceIdentifier = nil
+        cancelVoiceSessionWarningTracking()
+        bluetoothVoiceActive = false
+        pendingBluetoothVoiceStartIdentifier = nil
+        cancelPendingBluetoothVoiceAudio(reason: "remote_stop")
+        pendingBluetoothVoiceStopRequested = false
+        releaseVoiceKeyIfNeeded(owner: .bluetooth, forceSoftware: false, audioDiagnostic: bridge.audioDiagnostics)
+        cancelPendingCommandVoiceAudio(reason: "remote_stop")
+        if longRecordingRequested {
+            finishLongRecording(reason: "remote_stop")
+        } else if longRecordingCloseTimer != nil {
+            longRecordingCloseTimer?.cancel()
+            longRecordingCloseTimer = nil
+            AppLogger.shared.write("LONG RECORDING close_confirmed")
+        }
+        let handledByFnTapMode = voiceFnTapSession.stopVoice()
+        let traceID = activeBluetoothVoiceTraceID ?? 0
+        let durationMilliseconds = bluetoothVoiceTraceStartedAt.map {
+            max(0, Int(Date().timeIntervalSince($0) * 1_000))
+        } ?? 0
+        let shouldFlushAudio = BluetoothVoiceStopPolicy.shouldFlushAudio(
+            handledByFnTapMode: handledByFnTapMode
+        )
+        let pendingBuffers = audioOutput.pendingVoiceBufferCountForDiagnostics
+        let tailSnapshot = bluetoothVoiceTailDiagnostics.snapshot(
+            at: ProcessInfo.processInfo.systemUptime
+        )
+        let frameSamples = bridge.audioFrameSampleCount
+        let expectedBatches = ATVVProtocol.expectedFrameCount(
+            durationMilliseconds: durationMilliseconds,
+            frameSamples: frameSamples
+        )
+        let coveragePercent = ATVVProtocol.audioCoveragePercent(
+            receivedSamples: bluetoothVoiceDecodedSampleCount,
+            durationMilliseconds: durationMilliseconds
+        )
+        AppLogger.shared.write(
+            "ATVV STREAM summary trace=\(traceID) model=\(bluetoothVoiceTraceModel.rawValue) " +
+                "duration_ms=\(durationMilliseconds) batches=\(bluetoothVoiceDecodedBatchCount) " +
+                "samples=\(bluetoothVoiceDecodedSampleCount) " +
+                "enqueue_failures=\(bluetoothVoiceEnqueueFailureCount) " +
+                "route=\(bluetoothVoiceTraceRoute) pending_buffers=\(pendingBuffers) " +
+                "flush=\(shouldFlushAudio) audio_ready=\(audioOutput.isReadyForTestTone) " +
+                "expected_batches=\(expectedBatches) " +
+                "coverage_pct=\(String(format: "%.1f", coveragePercent)) " +
+                "operation_id=\(bridge.audioDiagnostics?.operationID ?? 0) " +
+                "summary_phase=stop_requested coverage_basis=main_callback_processing " +
+                "identifier_drops=\(bluetoothVoiceIdentifierDropCount) " +
+                "audio_state={\(audioOutput.diagnosticState())}"
+        )
+        AppLogger.shared.write(
+            "ATVV STREAM tail trace=\(traceID) model=\(bluetoothVoiceTraceModel.rawValue) " +
+                "route=\(bluetoothVoiceTraceRoute) " +
+                "fn_pressed_at_stop=\(preferredInputSourceMonitor.functionKeyIsPressedForDiagnostics) " +
+                "last_audio_age_ms=\(tailSnapshot.lastAudioAgeMilliseconds.map(String.init) ?? "none") " +
+                "tail_ms=\(tailSnapshot.durationMilliseconds) " +
+                "tail_samples=\(tailSnapshot.sampleCount) " +
+                "tail_nonzero=\(tailSnapshot.nonZeroSampleCount) " +
+                "tail_peak=\(tailSnapshot.peak) tail_rms=\(tailSnapshot.rms) " +
+                "final_window_ms=\(tailSnapshot.finalWindowDurationMilliseconds) " +
+                "final_window_samples=\(tailSnapshot.finalWindowSampleCount) " +
+                "final_window_nonzero=\(tailSnapshot.finalWindowNonZeroSampleCount) " +
+                "final_window_peak=\(tailSnapshot.finalWindowPeak) " +
+                "final_window_rms=\(tailSnapshot.finalWindowRMS)"
+        )
+        audioOutput.logWhenPendingVoiceAudioDrains(
+            context: "trace=\(traceID) model=\(bluetoothVoiceTraceModel.rawValue)"
+        )
+        let delivery = voiceAudioDeliveryDiagnosticSnapshot()
+        let publicVoiceResult: (phase: String, result: String, reason: String) =
+            bluetoothVoiceDecodedSampleCount == 0
+                ? ("failed", "failed", "no_samples")
+                : bluetoothVoiceEnqueueFailureCount > 0
+                    ? ("failed", "failed", "audio_enqueue_failed")
+                    : ("stopping", "pending", "voice_stopped")
+        recordPublicDiagnosticEvent(
+            operationID: "voice_bluetooth_\(traceID)",
+            component: "voice",
+            action: "session",
+            phase: publicVoiceResult.phase,
+            result: publicVoiceResult.result,
+            reason: publicVoiceResult.reason,
+            source: "bluetooth",
+            remoteModelFamily: "xiaomi",
+            elapsedMS: durationMilliseconds,
+            receivedSamples: delivery.receivedSamples,
+            scheduledSamples: delivery.scheduledSamples,
+            playedSamples: delivery.playedSamples,
+            interruptedSamples: delivery.interruptedSamples,
+            pendingSamples: delivery.outputAtObservation.pendingSamples,
+            failureCount: delivery.enqueueFailures
+        )
+        activeBluetoothVoiceTraceID = nil
+        bluetoothVoiceTraceStartedAt = nil
+        bluetoothVoiceTailDiagnostics.reset()
+        endVoiceSessionIfNeeded(flushAudio: shouldFlushAudio)
+        if systemAudioSuspensionState.isSuspended {
+            releaseVirtualAudioOutputIfUnused(reason: "system_suspended_after_bluetooth_voice")
+        }
+    }
+
+    func bluetoothBridge(_ bridge: XiaomiBluetoothBridge, didDecode samples: [Int16]) {
+        guard let identifier = bridge.deviceIdentifier else {
+            bridge.audioDiagnostics?.reject(.identifier, samples: samples.count)
+            return
+        }
+        let configurationSamplesBefore = pendingBluetoothVoiceAudio.bufferedSampleCount
+        if identifier == pendingBluetoothVoiceStartIdentifier,
+           pendingBluetoothVoiceAudio.appendIfWaiting(samples) {
+            bridge.audioDiagnostics?.bufferLost(
+                samples: configurationSamplesBefore + samples.count - pendingBluetoothVoiceAudio.bufferedSampleCount,
+                stage: "configuration", reason: "overflow"
+            )
+            bridge.audioDiagnostics?.buffered(samples: samples.count)
+            return
+        }
+        guard identifier == activeBluetoothVoiceDeviceIdentifier else {
+            bluetoothVoiceIdentifierDropCount += 1
+            bridge.audioDiagnostics?.reject(.identifier, samples: samples.count)
+            return
+        }
+        let commandSamplesBefore = pendingCommandVoiceAudio.bufferedSampleCount
+        if pendingCommandVoiceAudio.appendIfWaiting(samples) {
+            bridge.audioDiagnostics?.bufferLost(
+                samples: commandSamplesBefore + samples.count - pendingCommandVoiceAudio.bufferedSampleCount,
+                stage: "command", reason: "overflow"
+            )
+            bridge.audioDiagnostics?.buffered(samples: samples.count)
+            return
+        }
+        routeBluetoothVoiceSamples(samples, from: bridge, identifier: identifier)
+    }
+
+    private func cancelPendingBluetoothVoiceAudio(reason: String) {
+        pendingBluetoothVoiceAudioDiagnostic?.bufferLost(
+            samples: pendingBluetoothVoiceAudio.bufferedSampleCount,
+            stage: "configuration", reason: "cancelled", cause: reason
+        )
+        pendingBluetoothVoiceAudio.cancel()
+        pendingBluetoothVoiceAudioDiagnostic = nil
+    }
+
+    private func cancelPendingCommandVoiceAudio(reason: String) {
+        pendingCommandVoiceAudioDiagnostic?.bufferLost(
+            samples: pendingCommandVoiceAudio.bufferedSampleCount,
+            stage: "command", reason: "cancelled", cause: reason
+        )
+        pendingCommandVoiceAudio.cancel()
+        pendingCommandVoiceAudioDiagnostic = nil
+    }
+
+    private func flushPendingCommandVoiceAudio(for bridge: XiaomiBluetoothBridge) {
+        let samples = pendingCommandVoiceAudio.drain()
+        guard !samples.isEmpty, let identifier = bridge.deviceIdentifier else { return }
+        AppLogger.shared.write("ATVV AUDIO flush_before_command samples=\(samples.count)")
+        routeBluetoothVoiceSamples(samples, from: bridge, identifier: identifier)
+    }
+
+    private func routeBluetoothVoiceSamples(
+        _ samples: [Int16],
+        from bridge: XiaomiBluetoothBridge,
+        identifier: UUID
+    ) {
+        guard identifier == activeBluetoothVoiceDeviceIdentifier else {
+            bluetoothVoiceIdentifierDropCount += 1
+            bridge.audioDiagnostics?.reject(.identifier, samples: samples.count)
+            return
+        }
+        recordingAssetCoordinator.append(samples: samples)
+        let deliveryGeneration = voiceAudioDeliveryDiagnostic.generation
+        let handledByFnTapMode = voiceFnTapSession.receive(samples)
+        let enqueued: Bool
+        if handledByFnTapMode {
+            enqueued = true
+        } else {
+            enqueued = audioOutput.enqueue(
+                samples: samples,
+                deliveryGeneration: deliveryGeneration
+            )
+            recordVoiceAudioEnqueueOutcome(
+                accepted: enqueued,
+                deliveryGeneration: deliveryGeneration
+            )
+        }
+        recordVoiceAudioReceipt(
+            samples: samples,
+            route: handledByFnTapMode ? .virtualAudioViaFnTap : .virtualAudioDirect
+        )
+        bridge.audioDiagnostics?.routed(samples: samples.count, enqueued: enqueued)
+        bluetoothVoiceDecodedBatchCount += 1
+        bluetoothVoiceDecodedSampleCount += samples.count
+        bluetoothVoiceTailDiagnostics.append(samples, at: ProcessInfo.processInfo.systemUptime)
+        publishCurrentVoiceSampleReceiptIfNeeded(sampleCount: samples.count)
+        if !enqueued {
+            bluetoothVoiceEnqueueFailureCount += 1
+        }
+        bluetoothVoiceTraceRoute = handledByFnTapMode ? "fn_tap" : "virtual_audio"
+        if loggedBluetoothVoiceAudioDeviceIdentifier != identifier {
+            loggedBluetoothVoiceAudioDeviceIdentifier = identifier
+            let model = settings.profileID(forBluetoothIdentifier: identifier)
+                .flatMap { id in settings.remoteDeviceProfiles.first(where: { $0.id == id })?.model }
+                ?? .unknown
+            AppLogger.shared.write(
+                "ATVV AUDIO routed trace=\(activeBluetoothVoiceTraceID ?? 0) " +
+                    "model=\(model.rawValue) route=\(bluetoothVoiceTraceRoute) " +
+                    "accepted=\(enqueued) first_batch_samples=\(samples.count) " +
+                    "pending_buffers=\(audioOutput.pendingVoiceBufferCountForDiagnostics)"
+            )
+        }
+        if rc003VoiceExtensionTestEnabled,
+           rc003VoiceExtensionActive,
+           rc003VoiceExtensionBridge === bridge,
+           !rc003VoiceExtensionAwaitingReopen,
+           !rc003VoiceExtensionDidReceiveAudio {
+            rc003VoiceExtensionDidReceiveAudio = true
+            startRC003VoiceExtensionTimer()
+            AppLogger.shared.write(
+                "RC003 EXTENSION AUDIO_READY session_segment=\(activeBluetoothVoiceTraceID ?? 0) " +
+                    "samples=\(samples.count)"
+            )
+        }
+    }
+
+    func bluetoothBridge(_ bridge: XiaomiBluetoothBridge, didUpdateBatteryLevel level: Int?) {
+        guard let profileID = remoteProfileID(for: bridge) else {
+            if let identifier = bluetoothIdentifier(for: bridge) {
+                pendingRemoteBatteryLevels[identifier] = level
+                AppLogger.shared.write(
+                    "REMOTE PROFILE_TELEMETRY phase=buffered " +
+                        "result=\(level == nil ? "invalidated" : "deferred") " +
+                        "reason=handshake_pending kind=battery"
+                )
+            }
+            return
+        }
+        if let level {
+            remoteBatteryLevels[profileID] = min(100, max(0, level))
+        } else {
+            remoteBatteryLevels.removeValue(forKey: profileID)
+        }
+    }
+
+    func bluetoothBridge(
+        _ bridge: XiaomiBluetoothBridge,
+        didIdentifyRemoteModel model: XiaomiRemoteModel
+    ) {
+        guard let profileID = remoteProfileID(for: bridge) else {
+            if let identifier = bluetoothIdentifier(for: bridge) {
+                pendingRemoteModels[identifier] = model
+                AppLogger.shared.write(
+                    "REMOTE PROFILE_TELEMETRY phase=buffered result=deferred " +
+                        "reason=handshake_pending kind=model"
+                )
+            }
+            return
+        }
+        settings.updateRemoteProfileModel(profileID, model: model)
+        refreshRemoteDeviceNames(reason: .connection)
+    }
+
+    func bluetoothBridge(
+        _ bridge: XiaomiBluetoothBridge,
+        didUpdatePowerState state: RemotePowerState?
+    ) {
+        guard let profileID = remoteProfileID(for: bridge) else {
+            if let identifier = bluetoothIdentifier(for: bridge) {
+                pendingRemotePowerStates[identifier] = state
+                AppLogger.shared.write(
+                    "REMOTE PROFILE_TELEMETRY phase=buffered " +
+                        "result=\(state == nil ? "invalidated" : "deferred") " +
+                        "reason=handshake_pending kind=power"
+                )
+            }
+            return
+        }
+        if let state {
+            remotePowerStates[profileID] = state
+        } else {
+            remotePowerStates.removeValue(forKey: profileID)
+        }
+    }
+
+    func batteryLevel(for profileID: UUID) -> Int? {
+        remoteBatteryLevels[profileID]
+    }
+
+    func powerState(for profileID: UUID) -> RemotePowerState? {
+        remotePowerStates[profileID]
+    }
+
+    func systemDeviceName(for profile: RemoteDeviceProfile) -> String? {
+        remoteSystemDeviceNames[profile.id]
+            ?? RemoteDeviceNamePolicy.observedSystemName(from: profile.customName)
+    }
+
+    func configureRemoteCardsForSettingsScreenshot(
+        profileIDs: Set<UUID>,
+        systemNames: [UUID: String],
+        batteryLevels: [UUID: Int],
+        powerStates: [UUID: RemotePowerState]
+    ) {
+        guard ProcessInfo.processInfo.environment["REMOTE_MIC_SETTINGS_SCREENSHOT_DIR"] != nil else {
+            return
+        }
+        connectedRemoteProfileIDs = profileIDs
+        remoteSystemDeviceNames = systemNames
+        remoteBatteryLevels = batteryLevels
+        remotePowerStates = powerStates
+    }
+
+    func isRemoteConnected(_ profileID: UUID) -> Bool {
+        connectedRemoteProfileIDs.contains(profileID)
+    }
+
+    private func requestPhoneApproval(
+        deviceName: String,
+        pairingCode: String,
+        identityFingerprint: String?,
+        completion: @escaping (Bool) -> Void
+    ) {
+        DispatchQueue.main.async {
+            guard self.isPhoneRemoteConnectionEnabled else {
+                completion(false)
+                return
+            }
+            NSApp.activate(ignoringOtherApps: true)
+            let localization = LocalizationStore(settings: self.settings)
+            let alert = NSAlert()
+            alert.messageText = LocalizedMessage(
+                "connection.approval.title", arguments: [deviceName]
+            ).text(using: localization)
+            alert.icon = NSApp.applicationIconImage
+            if Self.isAppleWatchDeviceName(deviceName) {
+                alert.informativeText = localization.text("connection.approval.watch_body")
+            } else {
+                alert.informativeText = localization.text("connection.approval.phone_body")
+            }
+            let codeLabel = NSTextField(labelWithString: pairingCode.map(String.init).joined(separator: " "))
+            codeLabel.frame = NSRect(x: 0, y: 0, width: 300, height: 44)
+            codeLabel.alignment = .center
+            codeLabel.font = .monospacedDigitSystemFont(ofSize: 30, weight: .bold)
+            codeLabel.textColor = .controlAccentColor
+            codeLabel.setAccessibilityLabel(LocalizedMessage(
+                "connection.approval.code_accessibility", arguments: [pairingCode]
+            ).text(using: localization))
+            alert.accessoryView = codeLabel
+            alert.addButton(withTitle: localization.text("connection.approval.allow"))
+            alert.addButton(withTitle: localization.text("connection.approval.deny"))
+            alert.addButton(withTitle: localization.text("connection.phone.cancel_waiting"))
+            self.phoneApprovalAlert = alert
+            let response = alert.runModal()
+            guard self.phoneApprovalAlert === alert else {
+                completion(false)
+                return
+            }
+            self.phoneApprovalAlert = nil
+            if response == .alertThirdButtonReturn {
+                completion(false)
+                self.disablePhoneRemoteConnection()
+                return
+            }
+            let allowed = response == .alertFirstButtonReturn
+            if allowed, let identityFingerprint {
+                self.settings.trustPhoneIdentity(identityFingerprint)
+            }
+            completion(allowed)
+        }
+    }
+
+    private func cancelPhoneApproval() {
+        DispatchQueue.main.async {
+            guard let alert = self.phoneApprovalAlert else { return }
+            self.phoneApprovalAlert = nil
+            NSApp.abortModal()
+            alert.window.orderOut(nil)
+        }
+    }
+
+    private func requestWebApproval(
+        deviceName: String,
+        pairingCode: String,
+        completion: @escaping (Bool) -> Void
+    ) {
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            let localization = LocalizationStore(settings: self.settings)
+            let alert = NSAlert()
+            alert.messageText = LocalizedMessage(
+                "connection.approval.web_title", arguments: [deviceName]
+            ).text(using: localization)
+            alert.informativeText = localization.text("connection.approval.web_body")
+            alert.icon = NSApp.applicationIconImage
+            let codeLabel = NSTextField(
+                labelWithString: pairingCode.map(String.init).joined(separator: " ")
+            )
+            codeLabel.frame = NSRect(x: 0, y: 0, width: 300, height: 44)
+            codeLabel.alignment = .center
+            codeLabel.font = .monospacedDigitSystemFont(ofSize: 30, weight: .bold)
+            codeLabel.textColor = .controlAccentColor
+            codeLabel.setAccessibilityLabel(LocalizedMessage(
+                "connection.approval.code_accessibility", arguments: [pairingCode]
+            ).text(using: localization))
+            alert.accessoryView = codeLabel
+            alert.addButton(withTitle: localization.text("connection.approval.allow"))
+            alert.addButton(withTitle: localization.text("connection.approval.deny"))
+            self.webApprovalAlert = alert
+            let allowed = alert.runModal() == .alertFirstButtonReturn
+            guard self.webApprovalAlert === alert else {
+                completion(false)
+                return
+            }
+            self.webApprovalAlert = nil
+            completion(allowed)
+        }
+    }
+
+    private func cancelWebApproval() {
+        DispatchQueue.main.async {
+            guard let alert = self.webApprovalAlert else { return }
+            self.webApprovalAlert = nil
+            NSApp.abortModal()
+            alert.window.orderOut(nil)
+        }
+    }
+
+    nonisolated static func appRemoteButton(rawValue: String) -> RemoteButton? {
+        RemoteButton(rawValue: rawValue)
+    }
+
+    nonisolated static func appRemoteButtonPhase(rawValue: String) -> RemoteButtonPhase? {
+        RemoteButtonPhase(rawValue: rawValue)
+    }
+
+    nonisolated static func isAppleWatchDeviceName(_ deviceName: String) -> Bool {
+        deviceName.range(of: "watch", options: [.caseInsensitive, .diacriticInsensitive]) != nil
+    }
+
+    private func performPhoneCommand(
+        _ button: RemoteButton,
+        source: UsageEventSource,
+        phraseSource: String? = nil
+    ) -> Bool {
+        guard source != .nearbyPhone || membershipFeature.canStartCompanionConnection else {
+            disablePhoneRemoteConnection()
+            return false
+        }
+        if OnboardingControlValidationPolicy.suppressConfiguredActions(
+            at: settings.onboardingStep,
+            source: settings.onboardingControlSource
+        ) {
+            AppLogger.shared.write(
+                "ONBOARDING CONTROLS button=\(button.rawValue) source=\(source.rawValue) action=suppressed"
+            )
+            return true
+        }
+        if !macroFeature.isEditorActive,
+           membershipFeature.claimsCommonPhrase(button: button.rawValue, source: phraseSource ?? "mobile:\(source.rawValue)") {
+            _ = membershipFeature.handleCommonPhrase(button: button.rawValue, phase: "press", source: phraseSource ?? "mobile:\(source.rawValue)")
+            _ = membershipFeature.handleCommonPhrase(button: button.rawValue, phase: "release", source: phraseSource ?? "mobile:\(source.rawValue)")
+            return true
+        }
+        return performMobileConfiguredAction(for: button, trigger: .singleClick, source: source, phraseSource: phraseSource)
+    }
+
+    private func observeMobileButton(_ button: RemoteButton, source: UsageEventSource) {
+        lastMobileRemoteButtonObservation = MobileRemoteButtonObservation(
+            source: source,
+            button: button
+        )
+    }
+
+    private func handleMobileButtonEvent(
+        _ button: RemoteButton,
+        phase: RemoteButtonPhase,
+        source: UsageEventSource,
+        phraseSource: String? = nil
+    ) -> Bool {
+        if phase == .press && source == .nearbyPhone && !membershipFeature.canStartCompanionConnection {
+            disablePhoneRemoteConnection()
+            return false
+        }
+        if OnboardingControlValidationPolicy.suppressConfiguredActions(
+            at: settings.onboardingStep,
+            source: settings.onboardingControlSource
+        ) {
+            if phase == .press {
+                AppLogger.shared.write(
+                    "ONBOARDING CONTROLS button=\(button.rawValue) source=\(source.rawValue) action=suppressed"
+                )
+            }
+            return true
+        }
+        if macroFeature.isEditorActive {
+            if phase == .press {
+                macroFeature.noteButtonInteraction(button: button)
+            }
+            AppLogger.shared.write(
+                "PHONE REMOTE button=\(button.rawValue) phase=\(phase.rawValue) " +
+                    "path=binding_editor_capture"
+            )
+            return true
+        }
+        if membershipFeature.handleCommonPhrase(
+            button: button.rawValue,
+            phase: phase.rawValue,
+            source: phraseSource ?? "mobile:\(source.rawValue)"
+        ) { return true }
+        let profileID = settings.selectedRemoteProfileID
+        let recognizesDoubleClick = settings.configuredAction(
+            for: button,
+            trigger: .doubleClick
+        ).action != .disabled || macroFeature.hasActiveBinding(
+            profileID: profileID,
+            button: button,
+            trigger: .doubleClick
+        )
+        let recognizesLongPress = settings.configuredAction(
+            for: button,
+            trigger: .longPress
+        ).action != .disabled || macroFeature.hasActiveBinding(
+            profileID: profileID,
+            button: button,
+            trigger: .longPress
+        )
+
+        var recognizer = mobileButtonGestureRecognizers[source] ?? RemoteButtonGestureRecognizer()
+        if phase == .press,
+           !recognizesDoubleClick,
+           !recognizesLongPress,
+           !recognizer.isTracking(button) {
+            return performMobileConfiguredAction(
+                for: button,
+                trigger: .singleClick,
+                source: source,
+                phraseSource: phraseSource
+            )
+        }
+
+        let commands = recognizer.handle(
+            phase,
+            button: button,
+            recognizesDoubleClick: recognizesDoubleClick,
+            recognizesLongPress: recognizesLongPress
+        )
+        mobileButtonGestureRecognizers[source] = recognizer
+        return processMobileGestureCommands(commands, source: source, phraseSource: phraseSource)
+    }
+
+    private func processMobileGestureCommands(
+        _ commands: [RemoteButtonGestureRecognizer.Command],
+        source: UsageEventSource,
+        phraseSource: String? = nil
+    ) -> Bool {
+        for command in commands {
+            switch command {
+            case let .scheduleDoubleClickTimeout(button):
+                scheduleMobileDoubleClickTimeout(for: button, source: source, phraseSource: phraseSource)
+            case let .cancelDoubleClickTimeout(button):
+                mobileDoubleClickTimers.removeValue(forKey: .init(
+                    source: source,
+                    button: button
+                ))?.cancel()
+            case let .scheduleLongPressTimeout(button):
+                scheduleMobileLongPressTimeout(for: button, source: source, phraseSource: phraseSource)
+            case let .cancelLongPressTimeout(button):
+                mobileLongPressTimers.removeValue(forKey: .init(
+                    source: source,
+                    button: button
+                ))?.cancel()
+            case let .trigger(button, trigger):
+                guard performMobileConfiguredAction(
+                    for: button,
+                    trigger: trigger,
+                    source: source,
+                    phraseSource: phraseSource
+                ) else { return false }
+            }
+        }
+        return true
+    }
+
+    private func scheduleMobileDoubleClickTimeout(
+        for button: RemoteButton,
+        source: UsageEventSource,
+        phraseSource: String? = nil
+    ) {
+        let key = MobileButtonGestureKey(source: source, button: button)
+        mobileDoubleClickTimers.removeValue(forKey: key)?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .milliseconds(300))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            mobileDoubleClickTimers.removeValue(forKey: key)
+            guard var recognizer = mobileButtonGestureRecognizers[source] else { return }
+            let commands = recognizer.doubleClickTimedOut(button)
+            mobileButtonGestureRecognizers[source] = recognizer
+            _ = processMobileGestureCommands(commands, source: source, phraseSource: phraseSource)
+        }
+        mobileDoubleClickTimers[key] = timer
+        timer.resume()
+    }
+
+    private func scheduleMobileLongPressTimeout(
+        for button: RemoteButton,
+        source: UsageEventSource,
+        phraseSource: String? = nil
+    ) {
+        let key = MobileButtonGestureKey(source: source, button: button)
+        mobileLongPressTimers.removeValue(forKey: key)?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .milliseconds(550))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            mobileLongPressTimers.removeValue(forKey: key)
+            guard var recognizer = mobileButtonGestureRecognizers[source] else { return }
+            let commands = recognizer.longPressTimedOut(button)
+            mobileButtonGestureRecognizers[source] = recognizer
+            _ = processMobileGestureCommands(commands, source: source, phraseSource: phraseSource)
+        }
+        mobileLongPressTimers[key] = timer
+        timer.resume()
+    }
+
+    private func resetMobileButtonGestures(source: UsageEventSource, phraseSource: String? = nil) {
+        membershipFeature.resetCommonPhrases(source: phraseSource ?? "mobile:\(source.rawValue)")
+        let doubleClickKeys = mobileDoubleClickTimers.keys.filter { $0.source == source }
+        doubleClickKeys.forEach {
+            mobileDoubleClickTimers.removeValue(forKey: $0)?.cancel()
+        }
+        let longPressKeys = mobileLongPressTimers.keys.filter { $0.source == source }
+        longPressKeys.forEach {
+            mobileLongPressTimers.removeValue(forKey: $0)?.cancel()
+        }
+        mobileButtonGestureRecognizers.removeValue(forKey: source)
+    }
+
+    private func performMobileConfiguredAction(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        source: UsageEventSource,
+        phraseSource: String? = nil
+    ) -> Bool {
+        if performButtonProfileBoundAction(
+            profileID: settings.selectedRemoteProfileID,
+            button: button,
+            trigger: trigger,
+            source: phraseSource ?? "mobile:\(source.rawValue)"
+        ) {
+            settings.recordButtonPress(control: .remoteButton(button), source: source)
+            AppLogger.shared.write(
+                "PHONE REMOTE button=\(button.rawValue) trigger=\(trigger.rawValue) action=private_feature"
+            )
+            return true
+        }
+        let configured = settings.configuredAction(for: button, trigger: trigger)
+        if configured.action.isAppInternal {
+            let handled = performInternalAction(configured.action, source: phraseSource ?? "mobile:\(source.rawValue)")
+            if handled {
+                settings.recordButtonPress(control: .remoteButton(button), source: source)
+            }
+            AppLogger.shared.write(
+                "PHONE REMOTE button=\(button.rawValue) trigger=\(trigger.rawValue) " +
+                    "action=\(configured.action.rawValue) handled=\(handled)"
+            )
+            return handled
+        }
+        guard KeyboardInjector.isAccessibilityTrusted else {
+            _ = KeyboardInjector.requestAccessibilityAccess()
+            return false
+        }
+        guard performExternalConfiguredAction(configured) else {
+            return false
+        }
+        settings.recordButtonPress(control: .remoteButton(button), source: source)
+        AppLogger.shared.write(
+            "PHONE REMOTE button=\(button.rawValue) trigger=\(trigger.rawValue) " +
+                "action=\(configured.action.rawValue)"
+        )
+        return true
+    }
+
+    private func performButtonProfileBoundAction(
+        profileID: UUID?,
+        button: RemoteButton,
+        trigger: ButtonTrigger,
+        source: String = "host_action"
+    ) -> Bool {
+        macroFeature.executeBoundAction(
+            profileID: profileID,
+            button: button,
+            trigger: trigger,
+            hostActionPerformer: { [weak self] payload in
+                self?.performButtonProfileHostAction(payload, source: source) ?? false
+            },
+            shortcutPerformer: { [weak self] keyCode, modifiers in
+                self?.performButtonProfileShortcut(keyCode: keyCode, modifiers: modifiers) ?? false
+            }, exactShortcutPerformer: { [weak self] keyCode, modifiers, flags in
+                self?.performButtonProfileShortcut(keyCode: keyCode, modifiers: modifiers, deviceModifierFlags: flags) ?? false
+            }
+        )
+    }
+
+    private func performButtonProfileHostAction(_ payload: Data, source: String) -> Bool {
+        guard !macroFeature.hasPendingPortableImport else { return false }
+        guard let configured = try? JSONDecoder().decode(ConfiguredButtonAction.self, from: payload)
+        else { return false }
+        if configured.action.isAppInternal {
+            return performInternalAction(configured.action, source: source)
+        }
+        guard KeyboardInjector.isAccessibilityTrusted else {
+            _ = KeyboardInjector.requestAccessibilityAccess()
+            return false
+        }
+        return performExternalConfiguredAction(configured)
+    }
+
+    private func performButtonProfileShortcut(
+        keyCode: UInt16,
+        modifiers: [String], deviceModifierFlags: UInt64 = 0
+    ) -> Bool {
+        guard let shortcut = KeyboardInjector.recordedShortcut(
+            keyCode: keyCode, modifiers: modifiers, deviceModifierFlags: deviceModifierFlags
+        ) else { return false }
+        guard KeyboardInjector.isAccessibilityTrusted else {
+            _ = KeyboardInjector.requestAccessibilityAccess()
+            return false
+        }
+        return performExternalConfiguredAction(ConfiguredButtonAction(
+            action: .customShortcut,
+            shortcut: shortcut
+        ))
+    }
+
+    private func performExternalConfiguredAction(_ configured: ConfiguredButtonAction) -> Bool {
+        guard !macroFeature.hasPendingPortableImport else { return false }
+        if configured.action == .combinationAction {
+            return macroFeature.executeMacro(id: configured.macroID)
+        }
+        let applicationProfile = settings.customApplicationProfile(
+            id: configured.applicationProfileID
+        )
+        if configured.action == .openCustomApplication {
+            guard let profile = applicationProfile,
+                !settings.portableApplicationRequiresVerification(profile),
+                NSWorkspace.shared.urlForApplication(withBundleIdentifier: profile.bundleIdentifier) != nil
+            else { return false }
+        }
+        let requestID = settings.voiceFnTapModeEnabled
+            ? VoiceInputDestinationIntent.resolve(
+                configured: configured,
+                applicationProfile: applicationProfile
+            ).map { voiceInputDestinationCoordinator.beginTargetSwitch(intent: $0) }
+            : nil
+        let handled = KeyboardInjector.send(
+            configured.action,
+            shortcut: configured.shortcut,
+            applicationProfile: applicationProfile
+        )
+        if !handled, let requestID {
+            voiceInputDestinationCoordinator.cancel(requestID: requestID, reason: .actionFailed)
+        }
+        return handled
+    }
+
+    private func handleVoiceInputDestinationState(_ state: VoiceInputDestinationState) {
+        guard settings.voiceFnTapModeEnabled else { return }
+        switch state {
+        case .waiting:
+            voiceShortcutStatus = LocalizedMessage("voice_button.status.waiting_for_input")
+        case .ready:
+            voiceShortcutStatus = LocalizedMessage("voice_button.status.input_ready")
+        case .cancelled:
+            voiceShortcutStatus = LocalizedMessage("voice_button.status.input_unavailable")
+        }
+    }
+
+    private func handleVoiceTargetInterruption(
+        _ interruption: VoiceTargetActivityInterruption
+    ) {
+        guard let source = activeMobileVoiceSource else { return }
+        let detail = "Mac 的语音输入目标已结束，请重新开始"
+        AppLogger.shared.write(
+            "MOBILE VOICE target_interrupted source=\(source.logName) " +
+                "reason=\(interruption.rawValue)"
+        )
+        switch source {
+        case .web:
+            webRemoteClient.notifyVoiceEnded(detail: detail)
+        case .nearbyPhone, .nearbyWatch:
+            // Watch can use the BLE server or the nearby TCP server. Notify both
+            // remote endpoints. Only the active endpoint has a voice session.
+            phoneRemoteServer.notifyVoiceEnded(detail: detail)
+            watchBluetoothServer.notifyVoiceEnded(detail: detail)
+        }
+        stopPhoneVoice(source: source, reason: "target_\(interruption.rawValue)")
+    }
+
+    private static func commonPhraseHIDSource(_ profileID: UUID?) -> String {
+        "hid:\(profileID?.uuidString ?? "unassigned")"
+    }
+
+    private func cancelPendingCommonPhraseButtonActions() {
+        hidMonitors.values.forEach { $0.cancelPendingButtonActions() }
+        discoveryHIDMonitor?.cancelPendingButtonActions()
+        mobileDoubleClickTimers.values.forEach { $0.cancel() }
+        mobileDoubleClickTimers.removeAll()
+        mobileLongPressTimers.values.forEach { $0.cancel() }
+        mobileLongPressTimers.removeAll()
+        mobileButtonGestureRecognizers.removeAll()
+        appleRemoteDoubleClickTimers.values.forEach { $0.cancel() }
+        appleRemoteDoubleClickTimers.removeAll()
+        appleRemoteLongPressTimers.values.forEach { $0.cancel() }
+        appleRemoteLongPressTimers.removeAll()
+        appleRemoteGestureRecognizers.removeAll()
+        appleRemoteRepeatTimers.values.forEach { $0.cancel() }
+        appleRemoteRepeatTimers.removeAll()
+        chromecastDoubleClickTimers.values.forEach { $0.cancel() }
+        chromecastDoubleClickTimers.removeAll()
+        chromecastLongPressTimers.values.forEach { $0.cancel() }
+        chromecastLongPressTimers.removeAll()
+        chromecastButtonGestureRecognizer.reset()
+        if appleRemoteAppSwitcherSession.isActive {
+            finishAppleRemoteAppSwitcher(reason: "common_phrases_opened", confirmed: false)
+        }
+    }
+
+    @discardableResult
+    private func performInternalAction(_ action: ButtonAction, source: String = "host_action") -> Bool {
+        if action == .openCommonPhrases {
+            cancelPendingCommonPhraseButtonActions()
+            return membershipFeature.openCommonPhrases(source: source)
+        }
+        guard action == .toggleLongRecording else { return false }
+        guard action.isEnabled(
+            experimentalContinuousRecordingEnabled: settings.experimentalContinuousRecordingEnabled
+        ) else {
+            AppLogger.shared.write("LONG RECORDING ignored feature_enabled=false")
+            return false
+        }
+        return toggleLongRecording()
+    }
+
+    private func toggleLongRecording() -> Bool {
+        if longRecordingRequested {
+            stopLongRecording(reason: "button_toggle")
+            return true
+        }
+        guard isConnected,
+              !bluetoothVoiceActive,
+              activeMobileVoiceSource == nil
+        else {
+            AppLogger.shared.write(
+                "LONG RECORDING rejected connected=\(isConnected) audio_ready=\(isAudioOutputReady) " +
+                    "bluetooth_voice=\(bluetoothVoiceActive) mobile_voice=\(activeMobileVoiceSource != nil)"
+            )
+            return false
+        }
+        if !audioOutput.isReadyForTestTone {
+            ensureVirtualAudioOutputReady(reason: "long_recording_start") { [weak self] ready in
+                guard let self else { return }
+                if ready {
+                    _ = self.toggleLongRecording()
+                } else {
+                    AppLogger.shared.write(
+                        "LONG RECORDING rejected connected=true audio_ready=false " +
+                            "bluetooth_voice=false mobile_voice=false"
+                    )
+                }
+            }
+            return true
+        }
+
+        longRecordingGeneration &+= 1
+        let generation = longRecordingGeneration
+        longRecordingRequested = true
+        guard let selectedBluetoothBridge,
+              selectedBluetoothBridge.requestMicrophoneOpen()
+        else {
+            finishLongRecording(reason: "open_rejected")
+            return false
+        }
+        scheduleLongRecordingOpenTimeout(generation: generation)
+        AppLogger.shared.write("LONG RECORDING opening generation=\(generation)")
+        return true
+    }
+
+    private func scheduleLongRecordingOpenTimeout(generation: UInt64) {
+        longRecordingOpenTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + Self.longRecordingOpenTimeout)
+        timer.setEventHandler { [weak self] in
+            guard let self,
+                  self.longRecordingRequested,
+                  self.longRecordingGeneration == generation,
+                  !self.bluetoothVoiceActive
+            else { return }
+            self.stopLongRecording(reason: "open_timeout")
+        }
+        longRecordingOpenTimer = timer
+        timer.resume()
+    }
+
+    private func stopLongRecording(reason: String) {
+        guard longRecordingRequested else { return }
+        longRecordingRequested = false
+        longRecordingGeneration &+= 1
+        cancelLongRecordingTimers()
+        let closeWritten = selectedBluetoothBridge?.requestMicrophoneClose() ?? false
+        if bluetoothVoiceActive {
+            scheduleLongRecordingCloseTimeout(generation: longRecordingGeneration)
+        }
+        AppLogger.shared.write(
+            "LONG RECORDING stopping reason=\(reason) close_written=\(closeWritten)"
+        )
+    }
+
+    private func scheduleLongRecordingCloseTimeout(generation: UInt64) {
+        longRecordingCloseTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + Self.longRecordingCloseTimeout)
+        timer.setEventHandler { [weak self] in
+            guard let self,
+                  self.longRecordingGeneration == generation,
+                  !self.longRecordingRequested,
+                  self.bluetoothVoiceActive
+            else { return }
+            self.longRecordingCloseTimer = nil
+            AppLogger.shared.write("LONG RECORDING close_timeout reconnecting=true")
+            self.selectedBluetoothBridge?.reconnectNow()
+        }
+        longRecordingCloseTimer = timer
+        timer.resume()
+    }
+
+    private func finishLongRecording(reason: String) {
+        longRecordingRequested = false
+        longRecordingGeneration &+= 1
+        cancelLongRecordingTimers()
+        AppLogger.shared.write("LONG RECORDING finished reason=\(reason)")
+    }
+
+    private func cancelLongRecordingTimers() {
+        longRecordingOpenTimer?.cancel()
+        longRecordingOpenTimer = nil
+        longRecordingCloseTimer?.cancel()
+        longRecordingCloseTimer = nil
+    }
+
+    private func scheduleRC003VoiceExtensionOpenTimeout(generation: UInt64) {
+        rc003VoiceExtensionOpenTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + Self.rc003VoiceExtensionOpenTimeout)
+        timer.setEventHandler { [weak self] in
+            guard let self,
+                  self.rc003VoiceExtensionActive,
+                  self.rc003VoiceExtensionAwaitingReopen,
+                  self.rc003VoiceExtensionGeneration == generation
+            else { return }
+            self.finishRC003VoiceExtensionTest(reason: "reopen_timeout")
+        }
+        rc003VoiceExtensionOpenTimer = timer
+        timer.resume()
+    }
+
+    private func scheduleRC003VoiceExtensionDeadline(generation: UInt64) {
+        rc003VoiceExtensionDeadlineTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + Self.rc003VoiceExtensionMaximumDuration)
+        timer.setEventHandler { [weak self] in
+            guard let self,
+                  self.rc003VoiceExtensionActive,
+                  self.rc003VoiceExtensionGeneration == generation
+            else { return }
+            self.finishRC003VoiceExtensionTest(reason: "safe_timeout")
+        }
+        rc003VoiceExtensionDeadlineTimer = timer
+        timer.resume()
+    }
+
+    private func startRC003VoiceExtensionTimer() {
+        guard rc003VoiceExtensionTimer == nil,
+              rc003VoiceExtensionActive,
+              !rc003VoiceExtensionAwaitingReopen,
+              rc003VoiceExtensionDidReceiveAudio,
+              let bridge = rc003VoiceExtensionBridge
+        else { return }
+        let generation = rc003VoiceExtensionGeneration
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(
+            deadline: .now() + Self.rc003VoiceExtensionInterval,
+            repeating: Self.rc003VoiceExtensionInterval
+        )
+        timer.setEventHandler { [weak self, weak bridge] in
+            guard let self,
+                  let bridge,
+                  self.rc003VoiceExtensionActive,
+                  !self.rc003VoiceExtensionAwaitingReopen,
+                  self.rc003VoiceExtensionGeneration == generation,
+                  self.rc003VoiceExtensionDidReceiveAudio
+            else { return }
+            guard bridge.requestMicrophoneExtend() else {
+                AppLogger.shared.write("RC003 EXTENSION MIC_EXTEND failed")
+                self.finishRC003VoiceExtensionTest(reason: "extend_rejected")
+                return
+            }
+            AppLogger.shared.write("RC003 EXTENSION MIC_EXTEND sent")
+        }
+        rc003VoiceExtensionTimer = timer
+        timer.resume()
+    }
+
+    private func finishRC003VoiceExtensionTest(reason: String) {
+        guard rc003VoiceExtensionActive || rc003VoiceExtensionAwaitingReopen else { return }
+        let bridge = rc003VoiceExtensionBridge
+        let wasStreaming = bluetoothVoiceActive
+        rc003VoiceExtensionActive = false
+        rc003VoiceExtensionAwaitingReopen = false
+        rc003VoiceExtensionDidReceiveAudio = false
+        rc003VoiceExtensionGeneration &+= 1
+        rc003VoiceExtensionTimer?.cancel()
+        rc003VoiceExtensionTimer = nil
+        rc003VoiceExtensionOpenTimer?.cancel()
+        rc003VoiceExtensionOpenTimer = nil
+        rc003VoiceExtensionDeadlineTimer?.cancel()
+        rc003VoiceExtensionDeadlineTimer = nil
+        rc003VoiceExtensionBridge = nil
+        if wasStreaming {
+            cancelVoiceSessionWarningTracking()
+            _ = bridge?.requestMicrophoneClose()
+            AppLogger.shared.write("RC003 EXTENSION stopping reason=\(reason) close_requested=true")
+            return
+        }
+        activeBluetoothVoiceDeviceIdentifier = nil
+        cancelVoiceSessionWarningTracking()
+        bluetoothVoiceActive = false
+        _ = voiceFnTapSession.stopVoice()
+        releaseVoiceKeyIfNeeded(owner: .bluetooth, forceSoftware: false)
+        endVoiceSessionIfNeeded(flushAudio: true)
+        AppLogger.shared.write("RC003 EXTENSION finished reason=\(reason)")
+    }
+
+    private func startPhoneVoice(source: MobileVoiceSource) -> RemoteVoiceStartResult {
+        mobileVoiceOperationCounter &+= 1
+        let operationID = "mobile_voice_\(mobileVoiceOperationCounter)"
+        guard activeMobileVoiceSource == nil else {
+            AppLogger.shared.write(
+                "MOBILE VOICE start_rejected reason=busy requested=\(source.logName) " +
+                    "active=\(activeMobileVoiceSource?.logName ?? "none")"
+            )
+            recordPublicDiagnosticEvent(
+                operationID: operationID,
+                component: "voice",
+                action: "session",
+                phase: "rejected",
+                result: "busy",
+                reason: "busy",
+                source: source.logName
+            )
+            return .busy
+        }
+        cancelVirtualAudioReleaseIfPending(trigger: "mobile_voice_start_\(source.logName)")
+        guard updateVoiceKeyState(
+            streaming: true,
+            forceSoftware: true,
+            owner: .mobile
+        ) else {
+            AppLogger.shared.write(
+                "MOBILE VOICE start_rejected reason=function_key requested=\(source.logName)"
+            )
+            recordPublicDiagnosticEvent(
+                operationID: operationID,
+                component: "voice",
+                action: "session",
+                phase: "failed",
+                result: "failed",
+                reason: "voice_key_press_failed",
+                source: source.logName
+            )
+            releaseVirtualAudioOutputIfUnused(reason: "mobile_voice_function_key_failed")
+            return .unavailable
+        }
+        resetCurrentVoiceSampleReceipt()
+        mobileVoiceLifecycle.markStarted(source)
+        mobileVoiceAudioBatchCount = 0
+        mobileVoiceAudioReceivedBatchCount = 0
+        mobileVoiceAudioEnqueueFailureCount = 0
+        mobileVoiceAudioSourceMismatchCount = 0
+        mobileVoiceAudioSignalMetrics = WatchBluetoothAudioSignalMetrics()
+        beginVoiceSessionIfNeeded()
+        activeMobileVoiceOperationID = operationID
+        activeMobileVoiceStartedAt = Date()
+        scheduleMobileVoiceNoAudioRecoveryIfNeeded(source: source)
+        recordPublicDiagnosticEvent(
+            operationID: operationID,
+            component: "voice",
+            action: "session",
+            phase: "started",
+            result: "accepted",
+            reason: "voice_start",
+            source: source.logName
+        )
+        AppLogger.shared.write("MOBILE VOICE started source=\(source.logName)")
+        return .started
+    }
+
+    private func requestPhoneVoiceStart(
+        source: MobileVoiceSource,
+        completion: @escaping (RemoteVoiceStartResult) -> Void
+    ) {
+        guard source == .web || membershipFeature.canStartCompanionConnection else {
+            disablePhoneRemoteConnection()
+            completion(.unavailable)
+            return
+        }
+        switch mobileVoiceLifecycle.requestStart(source) {
+        case .startNow:
+            startPhoneVoiceAfterAudioReady(source: source, completion: completion)
+        case .deferUntilStopped:
+            pendingMobileVoiceRestartCompletion = completion
+            AppLogger.shared.write("MOBILE VOICE restart_deferred source=\(source.logName)")
+        case .busy:
+            AppLogger.shared.write(
+                "MOBILE VOICE start_rejected reason=busy requested=\(source.logName) " +
+                    "active=\(activeMobileVoiceSource?.logName ?? "none") " +
+                    "stopping=\(stoppingMobileVoiceSource?.logName ?? "none")"
+            )
+            completion(.busy)
+        }
+    }
+
+    private func startPhoneVoiceAfterAudioReady(
+        source: MobileVoiceSource,
+        completion: @escaping (RemoteVoiceStartResult) -> Void
+    ) {
+        let outputReadyAtStart = audioOutput.isReadyForTestTone
+        if !outputReadyAtStart {
+            pendingMobileVoiceStartSource = source
+            pendingMobileVoiceAudio.begin()
+        }
+        let result = startPhoneVoice(source: source)
+        completion(result)
+        guard result == .started, !outputReadyAtStart else {
+            if result != .started {
+                pendingMobileVoiceStartSource = nil
+                pendingMobileVoiceAudio.cancel()
+                pendingMobileVoiceStopRequested = false
+            }
+            return
+        }
+        AppLogger.shared.write(
+            "SYSTEM AUDIO voice_start_recovery configured=pending " +
+                "suspended=\(systemAudioSuspensionState.isSuspended) " +
+                "reasons=\(systemAudioSuspensionState.diagnostic)"
+        )
+        ensureVirtualAudioOutputReady(reason: "mobile_voice_start") { [weak self] ready in
+            guard let self,
+                  self.pendingMobileVoiceStartSource == source
+            else { return }
+            self.pendingMobileVoiceStartSource = nil
+            let stopRequested = self.pendingMobileVoiceStopRequested
+            self.pendingMobileVoiceStopRequested = false
+            let bufferedAudio = self.pendingMobileVoiceAudio.drain()
+            guard ready else {
+                self.pendingMobileVoiceAudio.cancel()
+                if stopRequested {
+                    self.stopPhoneVoice(source: source)
+                } else {
+                    self.stopPhoneVoice(source: source)
+                }
+                return
+            }
+            if !bufferedAudio.isEmpty {
+                AppLogger.shared.write(
+                    "MOBILE VOICE flush_after_configuration source=\(source.logName) " +
+                        "samples=\(bufferedAudio.count)"
+                )
+                self.receivePhoneAudio(bufferedAudio, source: source)
+            }
+            if stopRequested {
+                self.stopPhoneVoice(source: source)
+            }
+        }
+    }
+
+    private func stopPhoneVoice(
+        source: MobileVoiceSource,
+        reason: String = "voice_stop"
+    ) {
+        if source == .nearbyWatch {
+            cancelMobileVoiceNoAudioRecoveryTimer()
+        }
+        if pendingMobileVoiceStartSource == source {
+            if activeMobileVoiceSource == source {
+                pendingMobileVoiceStopRequested = true
+                AppLogger.shared.write(
+                    "MOBILE VOICE stop_deferred_until_audio_ready source=\(source.logName)"
+                )
+            } else {
+                pendingMobileVoiceStartSource = nil
+                pendingMobileVoiceAudio.cancel()
+                pendingMobileVoiceStopRequested = false
+                cancelMobileVoiceNoAudioRecoveryTimer()
+                mobileVoiceAudioReceivedBatchCount = 0
+                AppLogger.shared.write(
+                    "MOBILE VOICE stop_ignored reason=start_pending_audio_configuration source=\(source.logName)"
+                )
+            }
+            return
+        }
+        switch mobileVoiceLifecycle.beginStop(source) {
+        case .ignoredInactive:
+            AppLogger.shared.write(
+                "MOBILE VOICE stop_ignored requested=\(source.logName) " +
+                    "active=\(activeMobileVoiceSource?.logName ?? "none")"
+            )
+            recordPublicDiagnosticEvent(
+                component: "voice",
+                action: "session",
+                phase: "rejected",
+                result: "inactive",
+                reason: "stop_without_active_session",
+                source: source.logName
+            )
+            return
+        case let .ignoredAlreadyStopping(cancelledPendingRestart):
+            if cancelledPendingRestart {
+                let completion = pendingMobileVoiceRestartCompletion
+                pendingMobileVoiceRestartCompletion = nil
+                completion?(.unavailable)
+                AppLogger.shared.write(
+                    "MOBILE VOICE restart_cancelled source=\(source.logName) reason=stop_before_ready"
+                )
+            }
+            AppLogger.shared.write("MOBILE VOICE stop_ignored reason=already_stopping source=\(source.logName)")
+            return
+        case let .begin(stopGeneration):
+            logMobileVoiceAudioSummary(source: source, reason: reason)
+            audioOutput.endSessionAfterDraining(
+                source: source.logName,
+                operationID: stopGeneration
+            ) { [weak self] outcome in
+                guard let self else { return }
+                AppLogger.shared.write(
+                    "MOBILE VOICE playback_stop phase=completed source=\(source.logName) " +
+                        "completion=\(outcome.rawValue)"
+                )
+                switch self.mobileVoiceLifecycle.completeStop(
+                    source,
+                    generation: stopGeneration
+                ) {
+                case .ignored:
+                    return
+                case .stopped:
+                    self.cancelMobileVoiceNoAudioRecoveryTimer()
+                    self.releaseVoiceKeyIfNeeded(owner: .mobile, forceSoftware: true)
+                    self.endVoiceSessionIfNeeded()
+                    if let operationID = self.activeMobileVoiceOperationID {
+                        self.recordVoiceSessionCompletion(
+                            operationID: operationID,
+                            source: source.logName,
+                            remoteModelFamily: nil,
+                            startedAt: self.activeMobileVoiceStartedAt,
+                            receivedSamples: self.mobileVoiceAudioSignalMetrics.sampleCount,
+                            failureCount: self.mobileVoiceAudioEnqueueFailureCount +
+                                self.mobileVoiceAudioSourceMismatchCount +
+                                (outcome == .forced ? 1 : 0),
+                            stopReason: reason
+                        )
+                    }
+                    self.activeMobileVoiceOperationID = nil
+                    self.activeMobileVoiceStartedAt = nil
+                    AppLogger.shared.write("MOBILE VOICE stopped source=\(source.logName)")
+                    self.releaseVirtualAudioOutputIfUnused(reason: "mobile_voice_stopped")
+                case let .restart(restartSource):
+                    self.cancelMobileVoiceNoAudioRecoveryTimer()
+                    self.releaseVoiceKeyIfNeeded(owner: .mobile, forceSoftware: true)
+                    self.endVoiceSessionIfNeeded()
+                    if let operationID = self.activeMobileVoiceOperationID {
+                        self.recordVoiceSessionCompletion(
+                            operationID: operationID,
+                            source: source.logName,
+                            remoteModelFamily: nil,
+                            startedAt: self.activeMobileVoiceStartedAt,
+                            receivedSamples: self.mobileVoiceAudioSignalMetrics.sampleCount,
+                            failureCount: self.mobileVoiceAudioEnqueueFailureCount +
+                                self.mobileVoiceAudioSourceMismatchCount,
+                            stopReason: reason
+                        )
+                    }
+                    self.activeMobileVoiceOperationID = nil
+                    self.activeMobileVoiceStartedAt = nil
+                    AppLogger.shared.write("MOBILE VOICE stopped source=\(source.logName)")
+                    let completion = self.pendingMobileVoiceRestartCompletion
+                    self.pendingMobileVoiceRestartCompletion = nil
+                    self.startPhoneVoiceAfterAudioReady(source: restartSource) { result in
+                        AppLogger.shared.write(
+                            "MOBILE VOICE restart_completed source=\(restartSource.logName) result=\(result)"
+                        )
+                        completion?(result)
+                    }
+                }
+            }
+        }
+    }
+
+    private var readyBluetoothBridgeCount: Int {
+        bluetoothBridgeStates.values.reduce(into: 0) { count, state in
+            if case .ready = state {
+                count += 1
+            }
+        }
+    }
+
+    private var shouldKeepVirtualAudioActive: Bool {
+        VirtualAudioConnectionLifecyclePolicy.shouldBeActive(
+            readyBluetoothBridgeCount: readyBluetoothBridgeCount,
+            bluetoothVoiceActive: bluetoothVoiceActive,
+            mobileVoiceActive: activeMobileVoiceSource != nil ||
+                !appleRemoteVoiceDevices.isEmpty || appleRemoteVoiceStopping,
+            testToneActive: isPlayingTestTone,
+            systemSuspended: systemAudioSuspensionState.isSuspended
+        )
+    }
+
+    private var hasActiveVirtualAudioSource: Bool {
+        bluetoothVoiceActive || activeMobileVoiceSource != nil ||
+            !appleRemoteVoiceDevices.isEmpty || appleRemoteVoiceStopping || isPlayingTestTone
+    }
+
+    private func resumeVirtualAudioOutputIfNeeded(reason: String) {
+        guard shouldKeepVirtualAudioActive else {
+            AppLogger.shared.write(
+                "SYSTEM AUDIO resume_skipped reason=\(reason) required=false " +
+                    "ready_bridges=\(readyBluetoothBridgeCount) selected=\(!settings.selectedAudioDeviceUID.isEmpty)"
+            )
+            return
+        }
+        cancelVirtualAudioReleaseIfPending(trigger: "resume_\(reason)")
+        guard !settings.selectedAudioDeviceUID.isEmpty else {
+            AppLogger.shared.write("SYSTEM AUDIO resume_skipped reason=\(reason) selected=false")
+            return
+        }
+        isAudioOutputReady = audioOutput.isReadyForTestTone
+        guard !isAudioOutputReady else {
+            AppLogger.shared.write(
+                "SYSTEM AUDIO resume_skipped reason=\(reason) already_ready=true " +
+                    "state={\(audioOutput.diagnosticState())}"
+            )
+            return
+        }
+        configureVirtualAudioOutput(reason: reason) { [weak self] configured in
+            guard let self else { return }
+            AppLogger.shared.write(
+                "SYSTEM AUDIO resume_completed reason=\(reason) configured=\(configured) " +
+                    "selected_available=\(self.selectedAudioDeviceIsAvailable) " +
+                    "state={\(self.audioOutput.diagnosticState())}"
+            )
+        }
+    }
+
+    private var selectedAudioDeviceIsAvailable: Bool {
+        let selectedUID = settings.selectedAudioDeviceUID
+        return !selectedUID.isEmpty && audioDevices.contains { $0.uid == selectedUID }
+    }
+
+    private func releaseVirtualAudioOutputIfUnused(reason: String) {
+        guard !shouldKeepVirtualAudioActive else {
+            AppLogger.shared.write(
+                "AUDIO RELEASE skipped reason=\(reason) still_required=true " +
+                    "system_suspended=\(systemAudioSuspensionState.isSuspended) " +
+                    "bluetooth_voice=\(bluetoothVoiceActive) " +
+                    "mobile_voice=\(activeMobileVoiceSource != nil) test_tone=\(isPlayingTestTone)"
+            )
+            return
+        }
+        guard pendingVirtualAudioRelease == nil else { return }
+        switchDefaultInputToFallbackIfNeeded(reason: reason)
+        let pendingVoiceBufferCount = audioOutput.pendingVoiceBufferCountForDiagnostics
+        guard VirtualAudioConnectionLifecyclePolicy.shouldScheduleRelease(
+            hasPendingRelease: pendingVirtualAudioRelease != nil,
+            hasAllocatedOutputResources: audioOutput.hasAllocatedOutputResources,
+            pendingVoiceBufferCount: pendingVoiceBufferCount
+        ) else {
+            isAudioOutputReady = false
+            testToneStatus = LocalizedMessage("audio.output.none_or_unavailable")
+            return
+        }
+        virtualAudioReleaseGeneration &+= 1
+        let generation = virtualAudioReleaseGeneration
+        pendingVirtualAudioRelease = (generation, reason)
+        AppLogger.shared.write(
+            "AUDIO RELEASE requested reason=\(reason) generation=\(generation) " +
+                "system_suspended=\(systemAudioSuspensionState.isSuspended) " +
+                "pending_buffers=\(pendingVoiceBufferCount) " +
+                "state={\(audioOutput.diagnosticState())}"
+        )
+        audioOutput.endSessionAfterDraining(
+            source: "audio_release",
+            operationID: generation
+        ) { [weak self] outcome in
+            guard let self else { return }
+            guard self.virtualAudioReleaseGeneration == generation else {
+                return
+            }
+            self.pendingVirtualAudioRelease = nil
+            guard !self.shouldKeepVirtualAudioActive else {
+                AppLogger.shared.write(
+                    "AUDIO RELEASE cancelled reason=\(reason) generation=\(generation) " +
+                        "cause=required_again system_suspended=\(self.systemAudioSuspensionState.isSuspended) " +
+                        "bluetooth_voice=\(self.bluetoothVoiceActive) " +
+                        "mobile_voice=\(self.activeMobileVoiceSource != nil) " +
+                        "test_tone=\(self.isPlayingTestTone)"
+                )
+                return
+            }
+            self.audioOutput.stop()
+            self.isAudioOutputReady = false
+            self.testToneStatus = LocalizedMessage("audio.output.none_or_unavailable")
+            AppLogger.shared.write(
+                "AUDIO RELEASE completed reason=\(reason) completion=\(outcome.rawValue) generation=\(generation) " +
+                    "system_suspended=\(self.systemAudioSuspensionState.isSuspended) " +
+                    "ready_bridges=\(self.readyBluetoothBridgeCount) " +
+                    "state={\(self.audioOutput.diagnosticState())}"
+            )
+        }
+    }
+
+    private func cancelVirtualAudioReleaseIfPending(
+        trigger: String,
+        cause: String = "required_again"
+    ) {
+        guard let pendingVirtualAudioRelease else { return }
+        virtualAudioReleaseGeneration &+= 1
+        self.pendingVirtualAudioRelease = nil
+        audioOutput.cancelPendingDrain()
+        AppLogger.shared.write(
+            "AUDIO RELEASE cancelled reason=\(pendingVirtualAudioRelease.reason) " +
+                "generation=\(pendingVirtualAudioRelease.generation) " +
+                "current_generation=\(virtualAudioReleaseGeneration) cause=\(cause) " +
+                "trigger=\(trigger) system_suspended=\(systemAudioSuspensionState.isSuspended) " +
+                "ready_bridges=\(readyBluetoothBridgeCount) " +
+                "bluetooth_voice=\(bluetoothVoiceActive) " +
+                "mobile_voice=\(activeMobileVoiceSource != nil) test_tone=\(isPlayingTestTone)"
+        )
+    }
+
+    private func switchDefaultInputToFallbackIfNeeded(reason: String) {
+        guard managedDefaultInputTransition == nil else { return }
+        let selectedUID = settings.selectedAudioDeviceUID
+        guard !selectedUID.isEmpty,
+              CoreAudioDeviceCatalog.defaultInputDevice()?.uid == selectedUID
+        else { return }
+        guard let fallback = preferredFallbackInput(excludingUID: selectedUID) else {
+            AppLogger.shared.write("AUDIO DEFAULT_INPUT fallback_failed reason=\(reason) no_candidate")
+            return
+        }
+        let result = CoreAudioDeviceCatalog.setDefaultInputDevice(fallback)
+        guard result == noErr else {
+            AppLogger.shared.write(
+                "AUDIO DEFAULT_INPUT fallback_failed reason=\(reason) " +
+                    "target={\(CoreAudioDeviceCatalog.deviceDiagnostic(fallback))} " +
+                    AppLogger.errorFields(domain: "os_status", code: Int(result))
+            )
+            return
+        }
+        managedDefaultInputTransition = ManagedDefaultInputTransition(
+            virtualUID: selectedUID,
+            fallbackUID: fallback.uid
+        )
+        AppLogger.shared.write(
+            "AUDIO DEFAULT_INPUT fallback_applied reason=\(reason) " +
+                "target={\(CoreAudioDeviceCatalog.deviceDiagnostic(fallback))}"
+        )
+    }
+
+    private func preferredFallbackInput(excludingUID: String) -> AudioDeviceInfo? {
+        CoreAudioDeviceCatalog.preferredFallbackInput(
+            excludingUID: excludingUID,
+            preferredUID: settings.lastUserSelectedInputDeviceUID
+        )
+    }
+
+    private func rememberCurrentUserInputDeviceIfNeeded(reason: String) {
+        let current = CoreAudioDeviceCatalog.defaultInputDevice()
+        let decision = DefaultInputFallbackPolicy.observationDecision(
+            currentUID: current?.uid,
+            selectedVirtualUID: settings.selectedAudioDeviceUID,
+            managedFallbackUID: managedDefaultInputTransition?.fallbackUID,
+            lastRememberedUID: settings.lastUserSelectedInputDeviceUID
+        )
+        switch decision {
+        case .ignore:
+            return
+        case .clearManagedTransition:
+            managedDefaultInputTransition = nil
+            return
+        case let .remember(uid, clearManagedTransition):
+            if clearManagedTransition {
+                managedDefaultInputTransition = nil
+            }
+            settings.lastUserSelectedInputDeviceUID = uid
+        }
+        AppLogger.shared.write(
+            "AUDIO DEFAULT_INPUT remembered reason=\(reason) target={\(CoreAudioDeviceCatalog.deviceDiagnostic(current))}"
+        )
+    }
+
+    private func restoreManagedDefaultInputIfAppropriate(reason: String) {
+        guard let transition = managedDefaultInputTransition else { return }
+        let currentDefault = CoreAudioDeviceCatalog.defaultInputDevice()
+        guard DefaultInputFallbackPolicy.shouldRestoreVirtualInput(
+            managedVirtualUID: transition.virtualUID,
+            selectedVirtualUID: settings.selectedAudioDeviceUID,
+            managedFallbackUID: transition.fallbackUID,
+            currentDefaultUID: currentDefault?.uid
+        ) else {
+            managedDefaultInputTransition = nil
+            AppLogger.shared.write(
+                "AUDIO DEFAULT_INPUT restore_skipped reason=\(reason) current={\(CoreAudioDeviceCatalog.deviceDiagnostic(currentDefault))}"
+            )
+            return
+        }
+        guard let virtualInput = CoreAudioDeviceCatalog.inputDevices().first(where: {
+            $0.uid == transition.virtualUID
+        }) else {
+            AppLogger.shared.write("AUDIO DEFAULT_INPUT restore_failed reason=\(reason) virtual_unavailable")
+            return
+        }
+        let result = CoreAudioDeviceCatalog.setDefaultInputDevice(virtualInput)
+        if result == noErr {
+            managedDefaultInputTransition = nil
+            AppLogger.shared.write(
+                "AUDIO DEFAULT_INPUT restore_applied reason=\(reason) " +
+                    "target={\(CoreAudioDeviceCatalog.deviceDiagnostic(virtualInput))}"
+            )
+        } else {
+            AppLogger.shared.write(
+                "AUDIO DEFAULT_INPUT restore_failed reason=\(reason) " +
+                    "target={\(CoreAudioDeviceCatalog.deviceDiagnostic(virtualInput))} " +
+                    AppLogger.errorFields(domain: "os_status", code: Int(result))
+            )
+        }
+    }
+
+    private func receivePhoneAudio(_ samples: [Int16], source: MobileVoiceSource) {
+        guard source == .web || membershipFeature.canStartCompanionConnection else {
+            disablePhoneRemoteConnection()
+            return
+        }
+        guard activeMobileVoiceSource == source else {
+            mobileVoiceAudioSourceMismatchCount += 1
+            if mobileVoiceAudioSourceMismatchCount == 1 ||
+                mobileVoiceAudioSourceMismatchCount.isMultiple(of: 20) {
+                AppLogger.shared.write(
+                    "MOBILE VOICE audio_dropped reason=source_mismatch requested=\(source.logName) " +
+                        "active=\(activeMobileVoiceSource?.logName ?? "none") " +
+                        "count=\(mobileVoiceAudioSourceMismatchCount)"
+                )
+            }
+            return
+        }
+        mobileVoiceAudioReceivedBatchCount += 1
+        if pendingMobileVoiceStartSource == source,
+           pendingMobileVoiceAudio.appendIfWaiting(samples) {
+            AppLogger.shared.write(
+                "MOBILE VOICE audio buffered_during_configuration source=\(source.logName) " +
+                    "samples=\(samples.count) total=\(pendingMobileVoiceAudio.bufferedSampleCount)"
+            )
+            return
+        }
+        recordingAssetCoordinator.append(samples: samples)
+        publishCurrentVoiceSampleReceiptIfNeeded(sampleCount: samples.count)
+        mobileVoiceAudioBatchCount += 1
+        mobileVoiceAudioSignalMetrics.append(samples)
+        let deliveryGeneration = voiceAudioDeliveryDiagnostic.generation
+        let accepted = audioOutput.enqueue(
+            samples: samples,
+            deliveryGeneration: deliveryGeneration
+        )
+        recordVoiceAudioReceipt(
+            samples: samples,
+            route: .virtualAudioDirect
+        )
+        recordVoiceAudioEnqueueOutcome(
+            accepted: accepted,
+            deliveryGeneration: deliveryGeneration
+        )
+        if !accepted { mobileVoiceAudioEnqueueFailureCount += 1 }
+        if mobileVoiceAudioBatchCount == 1 || mobileVoiceAudioBatchCount.isMultiple(of: 20) {
+            AppLogger.shared.write(
+                "MOBILE VOICE audio source=\(source.logName) batches=\(mobileVoiceAudioBatchCount) " +
+                    "samples=\(mobileVoiceAudioSignalMetrics.sampleCount) " +
+                    "nonzero=\(mobileVoiceAudioSignalMetrics.nonZeroSampleCount) " +
+                    "peak=\(mobileVoiceAudioSignalMetrics.peak) rms=\(mobileVoiceAudioSignalMetrics.rms) " +
+                    "accepted=\(accepted) enqueue_failures=\(mobileVoiceAudioEnqueueFailureCount) " +
+                    "pending_buffers=\(audioOutput.pendingVoiceBufferCountForDiagnostics)"
+            )
+        }
+    }
+
+    private func scheduleMobileVoiceNoAudioRecoveryIfNeeded(source: MobileVoiceSource) {
+        cancelMobileVoiceNoAudioRecoveryTimer()
+        guard source == .nearbyWatch else { return }
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .seconds(Int(MobileVoiceWatchRecoveryPolicy.noAudioTimeout)))
+        timer.setEventHandler { [weak self] in
+            guard let self,
+                  let startedAt = self.activeMobileVoiceStartedAt,
+                  self.activeMobileVoiceSource == .nearbyWatch,
+                  MobileVoiceWatchRecoveryPolicy.shouldRecover(
+                      startedAt: startedAt,
+                      now: Date(),
+                      receivedBatchCount: self.mobileVoiceAudioReceivedBatchCount
+                  )
+            else { return }
+            AppLogger.shared.write(
+                "MOBILE VOICE recovery reason=watch_no_audio timeout_s=" +
+                    "\(Int(MobileVoiceWatchRecoveryPolicy.noAudioTimeout))"
+            )
+            self.stopPhoneVoice(source: .nearbyWatch)
+        }
+        mobileVoiceNoAudioRecoveryTimer = timer
+        timer.resume()
+    }
+
+    private func cancelMobileVoiceNoAudioRecoveryTimer() {
+        mobileVoiceNoAudioRecoveryTimer?.cancel()
+        mobileVoiceNoAudioRecoveryTimer = nil
+    }
+
+    private func logMobileVoiceAudioSummary(source: MobileVoiceSource, reason: String) {
+        AppLogger.shared.write(
+            "MOBILE VOICE audio_summary source=\(source.logName) reason=\(reason) " +
+                "batches=\(mobileVoiceAudioBatchCount) " +
+                "samples=\(mobileVoiceAudioSignalMetrics.sampleCount) " +
+                "nonzero=\(mobileVoiceAudioSignalMetrics.nonZeroSampleCount) " +
+                "peak=\(mobileVoiceAudioSignalMetrics.peak) rms=\(mobileVoiceAudioSignalMetrics.rms) " +
+                "enqueue_failures=\(mobileVoiceAudioEnqueueFailureCount) " +
+                "source_mismatches=\(mobileVoiceAudioSourceMismatchCount) " +
+                "pending_buffers=\(audioOutput.pendingVoiceBufferCountForDiagnostics)"
+        )
+    }
+
+    private func resetCurrentVoiceSampleReceipt() {
+        guard hasReceivedCurrentVoiceSamples else { return }
+        hasReceivedCurrentVoiceSamples = false
+    }
+
+    private func publishCurrentVoiceSampleReceiptIfNeeded(sampleCount: Int) {
+        guard VoiceSamplePresentationPolicy.shouldPublishReceipt(
+            hasReceivedSamples: hasReceivedCurrentVoiceSamples,
+            sampleCount: sampleCount
+        ) else { return }
+        hasReceivedCurrentVoiceSamples = true
+    }
+
+    func voiceAudioDeliveryDiagnosticSnapshot() -> VoiceAudioDeliveryDiagnostic {
+        var diagnostic = voiceAudioDeliveryDiagnostic
+        diagnostic.outputAtObservation = audioOutput.diagnosticSnapshot(
+            deliveryGeneration: diagnostic.generation
+        )
+        return diagnostic
+    }
+
+    private func recordVoiceAudioReceipt(
+        samples: [Int16],
+        route: VoiceAudioDeliveryRoute
+    ) {
+        guard !samples.isEmpty, voiceAudioDeliveryDiagnostic.generation > 0 else { return }
+        voiceAudioDeliveryDiagnostic.route = route
+        voiceAudioDeliveryDiagnostic.receivedBatches += 1
+        voiceAudioDeliveryDiagnostic.receivedSamples += samples.count
+        voiceAudioDeliveryDiagnostic.outputAtObservation = audioOutput.diagnosticSnapshot(
+            deliveryGeneration: voiceAudioDeliveryDiagnostic.generation
+        )
+    }
+
+    private func recordVoiceAudioEnqueueOutcome(
+        accepted: Bool,
+        deliveryGeneration: Int
+    ) {
+        guard !accepted,
+              deliveryGeneration > 0,
+              voiceAudioDeliveryDiagnostic.generation == deliveryGeneration
+        else { return }
+        voiceAudioDeliveryDiagnostic.enqueueFailures += 1
+        voiceAudioDeliveryDiagnostic.outputAtObservation = audioOutput.diagnosticSnapshot(
+            deliveryGeneration: deliveryGeneration
+        )
+    }
+
+    private func enqueueVoiceFnTapAudio(_ samples: [Int16]) {
+        let deliveryGeneration = voiceAudioDeliveryDiagnostic.generation
+        let accepted = audioOutput.enqueue(
+            samples: samples,
+            deliveryGeneration: deliveryGeneration
+        )
+        recordVoiceAudioEnqueueOutcome(
+            accepted: accepted,
+            deliveryGeneration: deliveryGeneration
+        )
+        if !accepted {
+            bluetoothVoiceEnqueueFailureCount += 1
+        }
+    }
+
+    private func archiveCapturedTranscript(_ capture: CapturedTranscript) {
+        let transcript = capture.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let index = transcriptDiagnosticOperations.firstIndex(where: { $0.sessionID == capture.sessionID }) {
+            let diagnostic = transcriptDiagnosticOperations.remove(at: index)
+            AppLogger.shared.write(
+                "TRANSCRIPT OBSERVATION operation_id=\(diagnostic.operationID) phase=observed " +
+                    "text_present=\(!transcript.isEmpty) observation_source=existing_public_capture " +
+                    "external_capture=unknown trigger_down_to_first_transcript_observation_ms=unknown"
+            )
+        }
+        recordingAssetCoordinator.updateApplication(
+            sessionID: capture.sessionID,
+            applicationName: capture.applicationName,
+            bundleIdentifier: capture.bundleIdentifier
+        )
+        guard settings.localTranscriptHistoryEnabled, !transcript.isEmpty else { return }
+        let record = TranscriptRecord(
+            sessionID: capture.sessionID,
+            startedAt: capture.startedAt,
+            endedAt: capture.endedAt,
+            applicationName: capture.applicationName,
+            bundleIdentifier: capture.bundleIdentifier,
+            source: capture.source,
+            originalTranscript: transcript
+        )
+        updateTranscriptArchive {
+            try self.transcriptArchiveStore.append(record)
+        }
+    }
+
+    private func updateTranscriptArchive(_ operation: @escaping () throws -> Void) {
+        transcriptArchiveOperationQueue.async { [weak self] in
+            guard let self else { return }
+            do {
+                try operation()
+                let records = try transcriptArchiveStore.loadAll()
+                DispatchQueue.main.async { [weak self] in
+                    self?.transcriptRecords = records
+                }
+            } catch {
+                AppLogger.shared.write("TRANSCRIPT ARCHIVE update_failed")
+            }
+        }
+    }
+
+    private func startVoiceSessionWarningTracking(for model: XiaomiRemoteModel) {
+        cancelVoiceSessionWarningTracking()
+        guard model == .rc001 || model == .rc003 else { return }
+
+        voiceSessionWarningGeneration &+= 1
+        let generation = voiceSessionWarningGeneration
+        let startedAt = Date()
+        let thresholds: [(TimeInterval, VoiceSessionWarningLevel)] = [
+            (53, .warning),
+            (57, .critical),
+        ]
+        for (delay, _) in thresholds {
+            let task = DispatchWorkItem { [weak self] in
+                guard let self,
+                      self.voiceSessionWarningGeneration == generation,
+                      let voiceSessionWarningStartedAt = self.voiceSessionWarningStartedAt
+                else { return }
+                let level = VoiceSessionWarningLevel.resolve(
+                    elapsed: Date().timeIntervalSince(voiceSessionWarningStartedAt),
+                    model: model
+                )
+                guard level != .none, level != self.voiceSessionWarningLevel else { return }
+                self.voiceSessionWarningLevel = level
+                if level == .warning {
+                    NSSound.beep()
+                    AppLogger.shared.write(
+                        "UI VOICE_WARNING phase=completed result=system_alert_sound " +
+                            "model=\(model.rawValue) level=\(level.rawValue)"
+                    )
+                }
+                AppLogger.shared.write(
+                    "UI VOICE_WARNING phase=completed result=applied " +
+                        "model=\(model.rawValue) level=\(level.rawValue)"
+                )
+            }
+            voiceSessionWarningTasks.append(task)
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: task)
+        }
+        voiceSessionWarningStartedAt = startedAt
+    }
+
+    private func cancelVoiceSessionWarningTracking() {
+        voiceSessionWarningGeneration &+= 1
+        voiceSessionWarningTasks.forEach { $0.cancel() }
+        voiceSessionWarningTasks.removeAll()
+        voiceSessionWarningStartedAt = nil
+        if voiceSessionWarningLevel != .none {
+            AppLogger.shared.write(
+                "UI VOICE_WARNING phase=completed result=reset cause=session_end"
+            )
+        }
+        voiceSessionWarningLevel = .none
+    }
+
+    private func beginVoiceSessionIfNeeded(audioDiagnosticOperationID: UInt64? = nil) {
+        guard !isStreaming else { return }
+        privateFeature.startVoiceSession()
+        cancelTestToneIfNeeded(
+            statusMessage: LocalizedMessage("audio.test_tone.blocked_voice_active"),
+            logReason: "voice_start"
+        )
+        let startedAt = Date()
+        let source = currentVoiceUsageSource
+        let sessionID = UUID()
+        voiceAudioDeliveryGeneration &+= 1
+        let audioSnapshot = audioOutput.diagnosticSnapshot(
+            deliveryGeneration: voiceAudioDeliveryGeneration
+        )
+        voiceAudioDeliveryDiagnostic = VoiceAudioDeliveryDiagnostic(
+            generation: voiceAudioDeliveryGeneration,
+            source: source.rawValue,
+            outputAtStart: audioSnapshot,
+            outputAtObservation: audioSnapshot,
+            countersAtStart: audioSnapshot.counters
+        )
+        activeVoiceSource = source
+        settings.recordButtonPress(control: .voice, source: source, at: startedAt)
+        voiceSessionStartedAt = startedAt
+        voiceSessionID = sessionID
+        if let audioDiagnosticOperationID {
+            transcriptDiagnosticOperations.append((sessionID, audioDiagnosticOperationID))
+            if transcriptDiagnosticOperations.count > 32 { transcriptDiagnosticOperations.removeFirst() }
+        }
+        voiceSessionUsageSource = source
+        let frontmostApplication = FrontmostApplicationMetadata.current()
+        voiceSessionApplicationName = frontmostApplication?.applicationName
+        recordingAssetCoordinator.start(
+            sessionID: sessionID,
+            startedAt: startedAt,
+            source: source,
+            applicationMetadata: frontmostApplication,
+            diagnosticOperationID: audioDiagnosticOperationID
+        )
+        if let frontmostApplication {
+            AppLogger.shared.write(
+                "RECORDING ASSET application_fallback " +
+                    "name_present=\(!frontmostApplication.applicationName.isEmpty) " +
+                    "bundle=\(frontmostApplication.bundleIdentifier)"
+            )
+        } else {
+            AppLogger.shared.write("RECORDING ASSET application_fallback unavailable")
+        }
+        transcriptCaptureCoordinator.startSession(sessionID: sessionID, startedAt: startedAt, source: source)
+        isStreaming = true
+        if activeMobileVoiceSource != nil {
+            voiceTargetActivityMonitor.start()
+        }
+    }
+
+    private func endVoiceSessionIfNeeded(flushAudio: Bool = true) {
+        guard !bluetoothVoiceActive,
+              appleRemoteVoiceDevices.isEmpty,
+              !appleRemoteVoiceStopping,
+              !chromecastVoiceActive,
+              !chromecastVoiceStopping,
+              activeMobileVoiceSource == nil,
+              isStreaming
+        else { return }
+        voiceTargetActivityMonitor.stop()
+        let endedAt = Date()
+        if let voiceSessionStartedAt {
+            settings.recordVoiceDuration(
+                endedAt.timeIntervalSince(voiceSessionStartedAt),
+                startedAt: voiceSessionStartedAt,
+                source: voiceSessionUsageSource ?? .unknown,
+                applicationName: voiceSessionApplicationName,
+                at: endedAt
+            )
+            self.voiceSessionStartedAt = nil
+        }
+        voiceSessionUsageSource = nil
+        voiceSessionApplicationName = nil
+        let sessionID = voiceSessionID
+        voiceSessionID = nil
+        voiceAudioDeliveryDiagnostic.sessionEnded = true
+        voiceAudioDeliveryDiagnostic.outputAtObservation = audioOutput.diagnosticSnapshot(
+            deliveryGeneration: voiceAudioDeliveryDiagnostic.generation
+        )
+        isStreaming = false
+        activeVoiceSource = nil
+        if flushAudio {
+            audioOutput.endSession()
+        }
+        privateFeature.finishVoiceSession()
+        transcriptCaptureCoordinator.finishSession(endedAt: endedAt)
+        if sessionID != nil {
+            recordingAssetCoordinator.finish(endedAt: endedAt)
+        }
+        // 会话因别的原因结束（用户关闭语音、切换输入源）时，必须让 Chromecast 包内的
+        // latched 状态同步清空；否则下一次点按会被误判成「结束」而不是「开始」。
+        chromecastFeature.notifyHostVoiceSessionEnded()
+    }
+
+    private var currentVoiceUsageSource: UsageEventSource {
+        if bluetoothVoiceActive || !appleRemoteVoiceDevices.isEmpty || appleRemoteVoiceStopping
+            || chromecastVoiceActive || chromecastVoiceStopping {
+            return .bluetoothRemote
+        }
+        switch activeMobileVoiceSource {
+        case .nearbyPhone, .nearbyWatch: return .nearbyPhone
+        case .web: return .webRemote
+        case nil: return .unknown
+        }
+    }
+
+    @discardableResult
+    private func applyVoiceFunctionMapping(neutralizeVoiceKey: Bool) -> Bool {
+        let applied = voiceFunctionMapper.apply(
+            suppressPowerKey: settings.customMappingEnabled,
+            neutralizeVoiceKey: neutralizeVoiceKey
+        )
+        if !isStreaming {
+            isVoiceTriggerEnabled = applied
+            voiceShortcutStatus = LocalizedMessage(
+                applied
+                    ? "voice_button.status.\(settings.voiceKeyMode.rawValue)_enabled"
+                    : "voice_button.status.waiting"
+            )
+        }
+        return !settings.customMappingEnabled || voiceFunctionMapper.isPowerKeySuppressed
+    }
+
+    @discardableResult
+    private func updateVoiceKeyState(
+        streaming: Bool,
+        forceSoftware: Bool,
+        owner: VoiceFunctionKeyLatch.Owner,
+        audioDiagnostic: ATVVAudioDiagnostics? = nil
+    ) -> Bool {
+        let keyDiagnostic = audioDiagnostic ?? (streaming ? nil : heldSoftwareVoiceKeyDiagnostic)
+        let edge = streaming ? "down" : "up"
+        let mode = streaming
+            ? settings.voiceKeyMode
+            : (heldVoiceKeyMode ?? pendingVoiceKeyMode ?? settings.voiceKeyMode)
+        guard forceSoftware || !mode.usesHardwareMapping else {
+            keyDiagnostic?.softwareKey(edge: edge, mode: mode.rawValue, result: "hardware_path_unobserved")
+            return true
+        }
+        if VoiceKeyPendingDownPolicy.shouldRejectStart(
+            streaming: streaming,
+            pendingDown: pendingVoiceKeyMode != nil
+        ) {
+            keyDiagnostic?.softwareKey(edge: edge, mode: mode.rawValue, result: "pending_down_rejected")
+            AppLogger.shared.write(
+                "VOICE KEY start_rejected reason=pending_down owner=\(owner)"
+            )
+            return false
+        }
+        guard let transition = voiceKeyLatch.transition(
+            streaming: streaming,
+            owner: owner
+        ) else {
+            keyDiagnostic?.softwareKey(edge: edge, mode: mode.rawValue, result: "shared_latch_no_event")
+            return true
+        }
+        let shouldHold = transition == .press
+        if shouldHold, mode != .function {
+            pendingVoiceKeyMode = mode
+            if owner == .bluetooth {
+                pendingCommandVoiceAudioDiagnostic = keyDiagnostic
+                pendingCommandVoiceAudio.begin()
+            }
+            if !preferredInputSourceMonitor.beginVoiceSession() {
+                keyDiagnostic?.softwareKey(edge: edge, mode: mode.rawValue, result: "source_prepare_failed")
+                pendingVoiceKeyMode = nil
+                if owner == .bluetooth {
+                    cancelPendingCommandVoiceAudio(reason: "source_prepare_failed")
+                }
+                voiceKeyLatch.rollback(transition, owner: owner)
+                AppLogger.shared.write(
+                    "VOICE INPUT source_prepare_failed mode=\(mode.rawValue)"
+                )
+                return false
+            }
+        }
+        if !shouldHold, mode != .function,
+           heldVoiceKeyMode == nil, pendingVoiceKeyMode != nil {
+            keyDiagnostic?.softwareKey(edge: edge, mode: mode.rawValue, result: "pending_down_cancelled")
+            pendingVoiceKeyMode = nil
+            if owner == .bluetooth {
+                cancelPendingCommandVoiceAudio(reason: "pending_down_cancelled")
+            }
+            preferredInputSourceMonitor.endVoiceSession()
+            isVoiceTriggerEnabled = true
+            AppLogger.shared.write(
+                "VOICE KEY mode=\(mode.rawValue) pending_down_cancelled"
+            )
+            return true
+        }
+        guard KeyboardInjector.setVoiceKeyPressed(mode, isPressed: shouldHold) else {
+            keyDiagnostic?.softwareKey(edge: edge, mode: mode.rawValue, result: "event_submit_failed")
+            if shouldHold, mode != .function {
+                pendingVoiceKeyMode = nil
+                if owner == .bluetooth {
+                    cancelPendingCommandVoiceAudio(reason: "event_submit_failed")
+                }
+                preferredInputSourceMonitor.endVoiceSession()
+            }
+            voiceKeyLatch.rollback(transition, owner: owner)
+            AppLogger.shared.write(
+                "VOICE KEY \(mode.rawValue) \(shouldHold ? "DOWN" : "UP") failed"
+            )
+            return false
+        }
+        keyDiagnostic?.softwareKey(edge: edge, mode: mode.rawValue, result: "event_submitted")
+        heldSoftwareVoiceKeyDiagnostic = shouldHold ? keyDiagnostic : nil
+        if mode != .function, !shouldHold {
+            preferredInputSourceMonitor.endVoiceSession()
+        }
+        if shouldHold {
+            pendingVoiceKeyMode = nil
+            heldVoiceKeyMode = mode
+        } else {
+            heldVoiceKeyMode = nil
+        }
+        isVoiceTriggerEnabled = !shouldHold
+        voiceShortcutStatus = LocalizedMessage(
+            shouldHold
+                ? "voice_button.status.\(mode.rawValue)_pressed"
+                : "voice_button.status.\(mode.rawValue)_released"
+        )
+        AppLogger.shared.write(
+            "VOICE KEY mode=\(mode.rawValue) edge=\(shouldHold ? "down" : "up") " +
+                "result=event_submitted target_response=unknown"
+        )
+        return true
+    }
+
+    @discardableResult
+    private func releaseVoiceKeyIfNeeded(
+        owner: VoiceFunctionKeyLatch.Owner,
+        forceSoftware: Bool,
+        audioDiagnostic: ATVVAudioDiagnostics? = nil
+    ) -> Bool {
+        guard !updateVoiceKeyState(
+            streaming: false,
+            forceSoftware: forceSoftware,
+            owner: owner,
+            audioDiagnostic: audioDiagnostic
+        ) else { return true }
+        return releaseVoiceKeyIfNeeded(audioDiagnostic: audioDiagnostic)
+    }
+
+    @discardableResult
+    private func releaseVoiceKeyIfNeeded(audioDiagnostic: ATVVAudioDiagnostics? = nil) -> Bool {
+        let keyDiagnostic = audioDiagnostic ?? heldSoftwareVoiceKeyDiagnostic
+        guard voiceKeyLatch.isHeld else {
+            heldVoiceKeyMode = nil
+            pendingVoiceKeyMode = nil
+            cancelPendingCommandVoiceAudio(reason: "no_held_key")
+            heldSoftwareVoiceKeyDiagnostic = nil
+            return true
+        }
+        guard let heldVoiceKeyMode else {
+            guard pendingVoiceKeyMode != nil else { return false }
+            voiceKeyLatch.reset()
+            pendingVoiceKeyMode = nil
+            cancelPendingCommandVoiceAudio(reason: "forced_release")
+            preferredInputSourceMonitor.endVoiceSession()
+            isVoiceTriggerEnabled = true
+            keyDiagnostic?.softwareKey(edge: "up", mode: "unknown", result: "pending_down_cancelled")
+            heldSoftwareVoiceKeyDiagnostic = nil
+            AppLogger.shared.write("VOICE KEY pending_down_cancelled reason=forced_release")
+            return true
+        }
+
+        var forcedAfterPermissionChange = false
+        var released = KeyboardInjector.setVoiceKeyPressed(
+            heldVoiceKeyMode,
+            isPressed: false
+        )
+        if !released {
+            forcedAfterPermissionChange = true
+            released = KeyboardInjector.setVoiceKeyPressed(
+                heldVoiceKeyMode,
+                isPressed: false,
+                accessibilityTrusted: { true }
+            )
+        }
+        guard released else {
+            keyDiagnostic?.softwareKey(edge: "up", mode: heldVoiceKeyMode.rawValue, result: "event_submit_failed")
+            return false
+        }
+        keyDiagnostic?.softwareKey(edge: "up", mode: heldVoiceKeyMode.rawValue, result: "event_submitted")
+        heldSoftwareVoiceKeyDiagnostic = nil
+
+        voiceKeyLatch.reset()
+        self.heldVoiceKeyMode = nil
+        if heldVoiceKeyMode != .function {
+            preferredInputSourceMonitor.endVoiceSession()
+        }
+        isVoiceTriggerEnabled = true
+        voiceShortcutStatus = LocalizedMessage(
+            "voice_button.status.\(heldVoiceKeyMode.rawValue)_released"
+        )
+        AppLogger.shared.write(
+            "VOICE KEY mode=\(heldVoiceKeyMode.rawValue) edge=up " +
+                "result=event_submitted target_response=unknown" +
+                (forcedAfterPermissionChange ? " forced_after_permission_change=true" : "")
+        )
+        return true
+    }
+
+    /// 苹果遥控器自报能力的日志标记（真机核对用）。
+    private static func describeSiri(_ declared: SiriRemoteDeclaredCapabilities) -> String {
+        var names: [String] = []
+        if declared.contains(.controlEdges) { names.append("control_edges") }
+        if declared.contains(.touchSurface) { names.append("touch_surface") }
+        if declared.contains(.continuousScroll) { names.append("continuous_scroll") }
+        if declared.contains(.voiceStream) { names.append("voice_stream") }
+        if declared.contains(.batteryLevel) { names.append("battery_level") }
+        if declared.contains(.powerState) { names.append("power_state") }
+        return names.isEmpty ? "none" : names.joined(separator: "+")
+    }
+
+    // MARK: - Chromecast 硬件（可选私有包）
+    //
+    // 与 Siri Remote 链路完全隔离：独立 owner（`.chromecast`）、独立会话与排空操作号，
+    // 一方结束不会取消另一方。私有包缺失时本段全部不会被编译进来。
+
+    #if SAYALL_CHROMECAST_ENABLED
+    /// 设置页「重新连接」。
+    func reconnectChromecast() {
+        chromecastFeature.reconnect()
+    }
+
+    /// 设置页 Chromecast 面板的改动立即作用于运行时。
+    ///
+    /// 开关决定链路启停、模式决定语音键语义，二者都不能等下次启动才生效：
+    /// 否则界面显示「按住说话」而运行时仍按「点按开关」处理，真机验收会得出错误结论。
+    func applyChromecastSettings() {
+        syncChromecastRuntimeState()
+    }
+
+    /// 按设置页开关启停 Chromecast 运行时。幂等，可安全重复调用。
+    private func syncChromecastRuntimeState() {
+        guard started else { return }
+        chromecastFeature.setVoiceMode(effectiveChromecastVoiceMode)
+        // 映射总开关决定 HID 通道是否独占设备：它必须即时生效，否则界面上「已开启映射」
+        // 而系统仍在消费这些按键，用户会以为映射没生效。
+        chromecastFeature.setControlMappingEnabled(settings.customMappingEnabled)
+        if settings.chromecastEnabled {
+            chromecastFeature.start()
+        } else {
+            chromecastFeature.stop()
+            chromecastStatus = .disabled
+        }
+    }
+
+    private func handleChromecastStatusChange(_ status: ChromecastLinkStatus) {
+        // 用户关闭开关后链路回调仍可能上报 disconnected，此时保持「未启用」。
+        if !settings.chromecastEnabled, !status.isActive {
+            chromecastStatus = .disabled
+            endChromecastVoice(reason: .hostStop)
+            disconnectChromecastProfile(reason: "feature_disabled")
+            return
+        }
+        chromecastStatus = status
+        AppLogger.shared.write("CHROMECAST LINK state=\(status)")
+        if status.isConnected {
+            // 与苹果遥控器一致：链路一可用就注册档案，按键页的设备选择器里立刻能选到它。
+            _ = ensureChromecastProfile()
+            AppLogger.shared.write("CHROMECAST REMOTE phase=completed result=profile_ready")
+            // 音频出口预热：否则首次按键要在「按下」的同时做一轮 REBIND（真机实测 ~30ms），
+            // 更关键的是根因 #4 那种「引擎在 startup 时没起来且无人修复」的竞态会在按键瞬间
+            // 才暴露（enqueue_failures 全量丢弃）。链路就绪即准备好出口，按键时只剩纯音频往返。
+            ensureVirtualAudioOutputReady(reason: "chromecast_link_ready")
+        } else {
+            disconnectChromecastProfile(reason: "link_unavailable")
+        }
+        switch status {
+        case .disconnected, .unauthorized, .unsupported:
+            // 链路在可用之后丢失，或型号被判为不支持：必须结束活动收音并释放 owner。
+            endChromecastVoice(reason: .cancelled("link_unavailable"))
+        default:
+            break
+        }
+    }
+
+    /// 链路不再可用时把档案从「已连接」里摘掉，但保留档案本身（用户的映射不能跟着丢）。
+    private func disconnectChromecastProfile(reason: String) {
+        guard !connectedChromecastProfileIDs.isEmpty else { return }
+        connectedChromecastProfileIDs.removeAll()
+        if let profileID = chromecastProfileID { membershipFeature.resetCommonPhrases(source: "chromecast:\(profileID.uuidString)") }
+        resetChromecastButtonState(reason: reason)
+        refreshBluetoothPresentation()
+    }
+
+    private func logChromecastSustain() {
+        AppLogger.shared.write(
+            "CHROMECAST VOICE phase=sustain result=no_visible_change"
+        )
+    }
+
+    // MARK: 语音键驱动（长按式 vs 点按式目标工具）
+    //
+    // 目标工具分两类，语音键的语义必须跟着分（见 `ChromecastFunctionKeyDrive`）：
+    // 长按式（豆包「长按模式」）按住—松开；点按式（豆包「免按模式」、Typeless）只认按下，
+    // 必须「开始一次点按、结束再一次点按」。真机实测见 `Testing/VoiceKeyFnPanelProbe.swift`。
+
+    /// 「开始那次点按」的延迟松开（仅点按式驱动使用）。
+    private var chromecastFunctionKeyTapRelease: DispatchWorkItem?
+    /// 一次点按的按下时长：与小米蓝牙链路的 `VoiceFnTapSessionController` 保持一致。
+    private static let chromecastFunctionKeyTapDuration: TimeInterval = 0.12
+
+    /// 当前应使用的驱动方式：由遥控器自己的语音模式 + 目标工具是否支持长按推导（见能力矩阵）。
+    private var chromecastFunctionKeyDrive: ChromecastFunctionKeyDrive {
+        .resolve(
+            voiceMode: effectiveChromecastVoiceMode,
+            toolSupportsHoldVoiceRecording: settings.onboardingVoiceTool
+                .supportsHoldVoiceRecording
+        )
+    }
+
+    /// 生效的语音模式：设备**自报**不支持「按一次收音」时，即使设置里存着 toggle 也按「按住说话」执行。
+    /// 这样能力不足的型号不会因为一份历史设置而走进它做不到的路径（设置里的原值保留，不静默改写）。
+    var effectiveChromecastVoiceMode: ChromecastVoiceMode {
+        let declared = chromecastDeclaredCapabilities
+        guard !declared.isEmpty, !declared.contains(.toggleVoiceGesture) else {
+            return settings.chromecastVoiceMode
+        }
+        return .hold
+    }
+
+    /// 自报能力的日志标记（真机核对用）。
+    private static func describe(_ declared: ChromecastDeclaredCapabilities) -> String {
+        var names: [String] = []
+        if declared.contains(.controlEdges) { names.append("control_edges") }
+        if declared.contains(.voiceStream) { names.append("voice_stream") }
+        if declared.contains(.touchSurface) { names.append("touch_surface") }
+        if declared.contains(.battery) { names.append("battery") }
+        if declared.contains(.toggleVoiceGesture) { names.append("toggle_voice") }
+        return names.isEmpty ? "none" : names.joined(separator: "+")
+    }
+
+    /// 开始收音时驱动语音键。返回 false 表示按下失败（调用方按既有逻辑报失败）。
+    @discardableResult
+    private func beginChromecastFunctionKeyDrive() -> Bool {
+        let drive = chromecastFunctionKeyDrive
+        if drive.startEvents.contains(.press) {
+            guard updateVoiceKeyState(
+                streaming: true,
+                forceSoftware: true,
+                owner: .chromecast
+            ) else { return false }
+        }
+        guard drive.startEvents.contains(.release) else { return true }
+        // 点按式：延迟一个按下时长后松开，把「长按」变成一次点按。
+        // 不这样做的话 Fn 修饰位会在整个会话期间被按住，用户此时打字会变成 Fn 组合键。
+        AppLogger.shared.write(
+            "CHROMECAST VOICE fn_drive=taps phase=start_tap release_after_ms="
+                + "\(Int(Self.chromecastFunctionKeyTapDuration * 1_000))"
+        )
+        scheduleChromecastFunctionKeyTapRelease()
+        return true
+    }
+
+    /// 结束收音时驱动语音键。点按式工具必须再收到一次**按下 + 松开**才结束（松开对它是空操作）。
+    /// 返回值沿用既有判据：松开是否成功（`phase=completed result=stopped|release_failed`）。
+    @discardableResult
+    private func finishChromecastFunctionKeyDrive() -> Bool {
+        let drive = chromecastFunctionKeyDrive
+        chromecastFunctionKeyTapRelease?.cancel()
+        chromecastFunctionKeyTapRelease = nil
+        if drive.stopEvents.contains(.press) {
+            let pressed = updateVoiceKeyState(
+                streaming: true,
+                forceSoftware: true,
+                owner: .chromecast
+            )
+            AppLogger.shared.write(
+                "CHROMECAST VOICE fn_drive=taps phase=stop_tap pressed=\(pressed)"
+            )
+        }
+        return releaseVoiceKeyIfNeeded(owner: .chromecast, forceSoftware: true)
+    }
+
+    private func scheduleChromecastFunctionKeyTapRelease() {
+        chromecastFunctionKeyTapRelease?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.chromecastVoiceActive || self.chromecastVoiceStopping
+            else { return }
+            self.chromecastFunctionKeyTapRelease = nil
+            _ = self.releaseVoiceKeyIfNeeded(owner: .chromecast, forceSoftware: true)
+            AppLogger.shared.write("CHROMECAST VOICE fn_drive=taps phase=start_released")
+        }
+        chromecastFunctionKeyTapRelease = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.chromecastFunctionKeyTapDuration,
+            execute: work
+        )
+    }
+
+    /// 预卷缓冲：会话开头 prerollDelay 秒的音频先攒后灌（见 receiveChromecastAudio 注释）。
+    private var chromecastAudioPrerollOpenedAt: TimeInterval?
+    private var chromecastAudioPrerollBatches: [[Int16]] = []
+    /// 豆包从语音键到打开输入流实测 0~0.7s（TRANSCRIPT target_ready retry=false/true 两例）。
+    /// 0.5s 覆盖中位情形：开读窗口的丢失从最坏 ~0.4s 压到 ~0.1s，代价是识别出字整体晚 0.5s。
+    private static let chromecastAudioPrerollDelay: TimeInterval = 0.5
+
+    private func beginChromecastVoice() {
+        guard ChromecastFeatureIntegration.isPackageIncluded, settings.chromecastEnabled else {
+            return
+        }
+        if chromecastVoiceStopping {
+            // 快速再按：取消排空并续用同一会话，避免尾音被截断。
+            chromecastVoiceStopOperation &+= 1
+            chromecastVoiceStopping = false
+            chromecastVoiceActive = true
+            isChromecastVoiceActive = true
+            audioOutput.cancelPendingDrain()
+            if let operationID = activeChromecastVoiceOperationID {
+                recordPublicDiagnosticEvent(
+                    operationID: operationID,
+                    component: "voice",
+                    action: "session",
+                    phase: "started",
+                    result: "resumed",
+                    reason: "rapid_repress",
+                    source: "chromecast",
+                    remoteModelFamily: "chromecast"
+                )
+            }
+            AppLogger.shared.write(
+                "CHROMECAST VOICE phase=resumed result=continued_session reason=rapid_repress"
+            )
+            return
+        }
+        guard !chromecastVoiceActive else { return }
+        let outputReadyAtStart = audioOutput.isReadyForTestTone
+        var shouldStartConfiguration = false
+        if !outputReadyAtStart {
+            guard !pendingChromecastVoiceStart else { return }
+            shouldStartConfiguration = true
+            pendingChromecastVoiceStart = true
+            pendingChromecastVoiceAudio.begin()
+        }
+        chromecastVoiceOperationCounter &+= 1
+        let operationID = "chromecast_voice_\(chromecastVoiceOperationCounter)"
+        chromecastAudioBatchCount = 0
+        chromecastAudioSampleCount = 0
+        chromecastAudioEnqueueFailureCount = 0
+        loggedChromecastAudioDevice = false
+        chromecastAudioPrerollOpenedAt = ProcessInfo.processInfo.systemUptime
+        chromecastAudioPrerollBatches = []
+        if outputReadyAtStart {
+            guard ensureVirtualAudioOutputReady(reason: "chromecast_voice_start") else {
+                AppLogger.shared.write(
+                    "CHROMECAST VOICE phase=failed result=audio_output_unavailable route=MiRemoteV_2ch"
+                )
+                recordPublicDiagnosticEvent(
+                    operationID: operationID,
+                    component: "voice",
+                    action: "session",
+                    phase: "failed",
+                    result: "failed",
+                    reason: "audio_output_unavailable",
+                    source: "chromecast",
+                    remoteModelFamily: "chromecast"
+                )
+                return
+            }
+        }
+        guard beginChromecastFunctionKeyDrive() else {
+            if shouldStartConfiguration {
+                pendingChromecastVoiceStart = false
+                pendingChromecastVoiceAudio.cancel()
+            }
+            AppLogger.shared.write(
+                "CHROMECAST VOICE phase=failed result=voice_key_press_failed"
+            )
+            recordPublicDiagnosticEvent(
+                operationID: operationID,
+                component: "voice",
+                action: "session",
+                phase: "failed",
+                result: "failed",
+                reason: "voice_key_press_failed",
+                source: "chromecast",
+                remoteModelFamily: "chromecast"
+            )
+            return
+        }
+        chromecastVoiceActive = true
+        isChromecastVoiceActive = true
+        beginVoiceSessionIfNeeded()
+        activeChromecastVoiceOperationID = operationID
+        activeChromecastVoiceStartedAt = Date()
+        if shouldStartConfiguration {
+            AppLogger.shared.write(
+                "SYSTEM AUDIO voice_start_recovery configured=pending " +
+                    "suspended=\(systemAudioSuspensionState.isSuspended) " +
+                    "reasons=\(systemAudioSuspensionState.diagnostic)"
+            )
+            ensureVirtualAudioOutputReady(reason: "chromecast_voice_start") { [weak self] ready in
+                guard let self, self.pendingChromecastVoiceStart else { return }
+                self.pendingChromecastVoiceStart = false
+                let stopReason = self.pendingChromecastVoiceStopReason
+                self.pendingChromecastVoiceStopReason = nil
+                let bufferedAudio = self.pendingChromecastVoiceAudio.drain()
+                guard ready else {
+                    self.pendingChromecastVoiceAudio.cancel()
+                    if !self.chromecastVoiceActive {
+                        self.chromecastVoiceActive = true
+                        self.isChromecastVoiceActive = true
+                    }
+                    self.endChromecastVoice(reason: .cancelled("audio_output_unavailable"))
+                    return
+                }
+                if !bufferedAudio.isEmpty {
+                    AppLogger.shared.write(
+                        "CHROMECAST AUDIO flush_after_configuration samples=\(bufferedAudio.count)"
+                    )
+                    if !self.chromecastVoiceActive {
+                        self.chromecastVoiceActive = true
+                        self.isChromecastVoiceActive = true
+                    }
+                    self.receiveChromecastAudio(bufferedAudio)
+                }
+                if let stopReason {
+                    if !self.chromecastVoiceActive {
+                        self.chromecastVoiceActive = true
+                        self.isChromecastVoiceActive = true
+                    }
+                    self.endChromecastVoice(reason: stopReason)
+                }
+            }
+        }
+        recordPublicDiagnosticEvent(
+            operationID: operationID,
+            component: "voice",
+            action: "session",
+            phase: "started",
+            result: "accepted",
+            reason: "voice_start",
+            source: "chromecast",
+            remoteModelFamily: "chromecast"
+        )
+        AppLogger.shared.write(
+            "CHROMECAST VOICE phase=started result=triggered " +
+                "audio_source=chromecast_microphone route=MiRemoteV_2ch " +
+                "mode=\(effectiveChromecastVoiceMode.rawValue)"
+        )
+    }
+
+    private func endChromecastVoice(reason: ChromecastVoiceEndReason) {
+        if pendingChromecastVoiceStart {
+            pendingChromecastVoiceStopReason = reason
+            if chromecastVoiceActive {
+                chromecastVoiceActive = false
+                isChromecastVoiceActive = false
+                AppLogger.shared.write(
+                    "CHROMECAST VOICE phase=deferred result=pending_tail " +
+                        "reason=\(reason.logToken)"
+                )
+            } else {
+                AppLogger.shared.write(
+                    "CHROMECAST VOICE phase=completed result=cancelled_before_audio_ready " +
+                        "reason=\(reason.logToken)"
+                )
+            }
+            return
+        }
+        guard chromecastVoiceActive else { return }
+        chromecastVoiceActive = false
+        isChromecastVoiceActive = false
+        if chromecastVoiceStopping {
+            AppLogger.shared.write(
+                "CHROMECAST VOICE phase=completed result=deferred_session_cancelled " +
+                    "reason=\(reason.logToken)"
+            )
+            return
+        }
+        chromecastVoiceStopping = true
+        chromecastVoiceStopOperation &+= 1
+        // 会话很短时预卷缓冲可能还没到期——先排入播放器，再走自然排空，尾段不丢。
+        flushChromecastAudioPreroll()
+        let stopOperation = chromecastVoiceStopOperation
+        let deliveryGeneration = voiceAudioDeliveryDiagnostic.generation
+        let outputBeforeStop = audioOutput.diagnosticSnapshot(
+            deliveryGeneration: deliveryGeneration
+        )
+        AppLogger.shared.write(
+            "CHROMECAST VOICE playback_stop phase=waiting_for_drain reason=\(reason.logToken) " +
+                "completion=\(reason.isNormal ? "normal" : "forced") " +
+                "pending_buffers=\(outputBeforeStop.pendingBuffers) " +
+                "pending_samples=\(outputBeforeStop.pendingSamples)"
+        )
+        // 尾包已经在 MIC_CLOSE 之前全部投递完毕，因此这里只做自然排空，绝不 flush。
+        audioOutput.endSessionAfterDraining(
+            source: "chromecast",
+            operationID: stopOperation,
+            maximumDelay: nil
+        ) { [weak self] outcome in
+            self?.completeChromecastVoiceStop(
+                operation: stopOperation,
+                deliveryGeneration: deliveryGeneration,
+                reason: reason,
+                drainOutcome: outcome
+            )
+        }
+    }
+
+    private func completeChromecastVoiceStop(
+        operation: UInt64,
+        deliveryGeneration: Int,
+        reason: ChromecastVoiceEndReason,
+        drainOutcome: VirtualAudioDrainOutcome
+    ) {
+        guard chromecastVoiceStopping, chromecastVoiceStopOperation == operation else { return }
+        let released = finishChromecastFunctionKeyDrive()
+        chromecastVoiceStopping = false
+        endVoiceSessionIfNeeded(flushAudio: false)
+        let outputAfterStop = audioOutput.diagnosticSnapshot(
+            deliveryGeneration: deliveryGeneration
+        )
+        voiceAudioDeliveryDiagnostic.outputAtObservation = outputAfterStop
+        AppLogger.shared.write(
+            "CHROMECAST AUDIO playback_stop phase=completed result=completed " +
+                "completion=\(drainOutcome.rawValue) reason=\(reason.logToken) " +
+                "pending_before_buffers=\(outputAfterStop.pendingBuffers) " +
+                "played_buffers=\(outputAfterStop.counters.playedBuffers) " +
+                "interrupted_buffers=\(outputAfterStop.counters.interruptedBuffers)"
+        )
+        AppLogger.shared.write(
+            "CHROMECAST VOICE phase=completed result=\(released ? "stopped" : "release_failed") " +
+                "reason=\(reason.logToken) audio_batches=\(chromecastAudioBatchCount) " +
+                "audio_samples=\(chromecastAudioSampleCount) " +
+                "enqueue_failures=\(chromecastAudioEnqueueFailureCount) route=MiRemoteV_2ch"
+        )
+        if let operationID = activeChromecastVoiceOperationID {
+            recordVoiceSessionCompletion(
+                operationID: operationID,
+                source: "chromecast",
+                remoteModelFamily: "chromecast",
+                startedAt: activeChromecastVoiceStartedAt,
+                receivedSamples: chromecastAudioSampleCount,
+                failureCount: chromecastAudioEnqueueFailureCount + (released ? 0 : 1),
+                stopReason: reason.logToken
+            )
+        }
+        activeChromecastVoiceOperationID = nil
+        activeChromecastVoiceStartedAt = nil
+    }
+
+    // MARK: - Chromecast 普通按键（键位映射）
+    //
+    // 与语音链路是两条独立的通道：语音走 ATVV，按键走 HID。两者各自维护自己的活动状态，
+    // 一方结束不会清除另一方的状态。
+
+    private func handleChromecastControlEvent(_ event: ChromecastRemoteControlEvent) {
+        let controlID = event.control.canvasControlID
+
+        guard event.phase != .cancelled else {
+            resetChromecastButtonState(reason: event.cancellationReason ?? "unknown")
+            return
+        }
+        guard settings.chromecastEnabled else {
+            if event.phase == .began {
+                AppLogger.shared.write(
+                    "CHROMECAST ACTION phase=completed result=feature_disabled control=\(controlID)"
+                )
+            }
+            return
+        }
+        let suppressConfiguredAction = OnboardingControlValidationPolicy
+            .suppressConfiguredActions(
+                at: settings.onboardingStep,
+                source: settings.onboardingControlSource
+            )
+        guard settings.customMappingEnabled || suppressConfiguredAction else {
+            // 与小米/苹果遥控器同一规则：映射总开关关闭时按键由系统消费，宿主不接管。
+            if event.phase == .began {
+                AppLogger.shared.write(
+                    "CHROMECAST ACTION phase=completed result=system_managed control=\(controlID)"
+                )
+            }
+            return
+        }
+
+        let profileID = ensureChromecastProfile()
+        let isPress = event.phase == .began
+
+        if suppressConfiguredAction {
+            if isPress {
+                selectRemoteProfile(profileID)
+                settings.recordButtonPress(
+                    control: .remoteButton(event.control.remoteButton),
+                    source: .bluetoothRemote
+                )
+                lastRemoteButtonPress = event.control.remoteButton
+                AppLogger.shared.write(
+                    "ONBOARDING CONTROLS button=\(event.control.remoteButton.rawValue) " +
+                        "source=chromecast action=suppressed"
+                )
+            }
+            if isPress {
+                chromecastPressedControls.insert(controlID)
+            } else {
+                chromecastPressedControls.remove(controlID)
+            }
+            refreshChromecastActiveControlIDs()
+            return
+        }
+
+        // 使用与画布、键位方案相同的保留策略；当前全部普通键可配置。
+        if ChromecastRemoteControl.isSystemManaged(
+            event.control,
+            allowSystemReservedKeys: settings.chromecastAllowSystemReservedKeys,
+            exceptions: settings.chromecastSystemReservedExceptions
+        ) {
+            if isPress {
+                AppLogger.shared.write(
+                    "CHROMECAST ACTION phase=completed result=system_reserved control=\(controlID)"
+                )
+            }
+            return
+        }
+        // 与小米/苹果链路一致的第二道保险：HID 独占（seize）只挡住 HID 层的报告分发，
+        // 系统仍会把部分 usage 解析成原生事件（实测：静音键产生 systemKey(7) → 系统音量 HUD）。
+        // 必须在每个边沿上武装事件抑制器，把随之到达的原生事件吞掉。
+        if !hidEventSuppressor.isRunning {
+            let ready = hidEventSuppressor.start()
+            AppLogger.shared.write("HID FILTER ready=\(ready) owner=chromecast")
+        }
+        hidEventSuppressor.arm(
+            nativeEvents: chromecastNativeEvents(for: event.control),
+            edge: isPress ? .down : .up
+        )
+        if isPress {
+            selectRemoteProfile(profileID)
+            chromecastPressedControls.insert(controlID)
+            settings.recordButtonPress(
+                control: .remoteButton(event.control.remoteButton),
+                source: .bluetoothRemote
+            )
+            lastRemoteButtonPress = event.control.remoteButton
+        } else {
+            chromecastPressedControls.remove(controlID)
+        }
+        refreshChromecastActiveControlIDs()
+
+        handleChromecastButton(
+            event.control.remoteButton,
+            phase: isPress ? .press : .release,
+            profileID: profileID
+        )
+    }
+
+    /// Chromecast 遥控器在 macOS 上产生的原生事件（2026-09-16 正品真机实测，`HID FILTER miss` 日志为证）。
+    ///
+    /// 与小米 RC003 的通用表存在差异：**静音键在系统侧是 `systemKey(7)`**（通用表按 RC003 记录为 3），
+    /// 沿用通用表时抑制必然 miss、系统音量 HUD 照常出现。其余按键实测与通用表一致：
+    /// 音量 = sys0/sys1（抑制命中）、方向/确认键系统侧不产生事件（tap 零记录，无副作用）。
+    private func chromecastNativeEvents(for control: ChromecastRemoteControl) -> Set<RemoteNativeEvent> {
+        switch control {
+        case .mute: return [.systemKey(type: 7)]
+        default: return control.remoteButton.nativeEvents
+        }
+    }
+
+    /// 注册并连接 Chromecast 设备档案。档案按型号识别，不存设备标识。
+    private func ensureChromecastProfile() -> UUID {
+        // 断链时 disconnectChromecastProfile 会把档案从「已连接」集合里摘掉；重连后这里必须
+        // 重新加入——否则设备选择器一直走空态、头部回落到小米的「正在查找小米遥控器」
+        //（真机 2026-09-19：一次蓝牙断连后按键一切正常，页面却始终显示查找中）。
+        // 所以「档案已存在」不能提前 return：成员资格与选中态每次都要确保。
+        let profileID: UUID
+        if let existing = chromecastProfileID {
+            profileID = existing
+        } else {
+            profileID = settings.registerChromecastRemote()
+            chromecastProfileID = profileID
+        }
+        connectedChromecastProfileIDs.insert(profileID)
+        // 连接即选中（与小米链路的 activateRemoteProfile 对齐）：否则按键页停留在上一次
+        // 选中的档案（用户看到的是小米遥控器画布），要等「按键映射开启且按下普通键」才会切换。
+        if settings.selectedRemoteProfileID != profileID {
+            selectRemoteProfile(profileID)
+        } else {
+            refreshBluetoothPresentation()
+        }
+        return profileID
+    }
+
+    private func refreshChromecastActiveControlIDs() {
+        activeChromecastControlIDs = chromecastPressedControls
+    }
+
+    private func resetChromecastButtonState(reason: String) {
+        guard !chromecastPressedControls.isEmpty
+            || !chromecastDoubleClickTimers.isEmpty
+            || !chromecastLongPressTimers.isEmpty
+        else { return }
+        chromecastPressedControls.removeAll()
+        chromecastDoubleClickTimers.values.forEach { $0.cancel() }
+        chromecastDoubleClickTimers.removeAll()
+        chromecastLongPressTimers.values.forEach { $0.cancel() }
+        chromecastLongPressTimers.removeAll()
+        chromecastButtonGestureRecognizer.reset()
+        activeChromecastControlIDs = []
+        AppLogger.shared.write(
+            "CHROMECAST CONTROL phase=completed result=state_reset reason=\(reason)"
+        )
+    }
+
+    private func handleChromecastButton(
+        _ button: RemoteButton,
+        phase: RemoteButtonPhase,
+        profileID: UUID
+    ) {
+        if macroFeature.isEditorActive {
+            if phase == .press { macroFeature.noteButtonInteraction(button: button) }
+            AppLogger.shared.write(
+                "CHROMECAST BUTTON button=\(button.rawValue) phase=\(phase.rawValue) " +
+                    "path=binding_editor_capture"
+            )
+            return
+        }
+
+        if membershipFeature.handleCommonPhrase(
+            button: button.rawValue,
+            phase: phase.rawValue,
+            source: "chromecast:\(profileID.uuidString)"
+        ) { return }
+
+        let recognizesDoubleClick = settings.configuredAction(
+            for: button,
+            trigger: .doubleClick,
+            profileID: profileID
+        ).action != .disabled || macroFeature.hasActiveBinding(
+            profileID: profileID,
+            button: button,
+            trigger: .doubleClick
+        )
+        let recognizesLongPress = settings.configuredAction(
+            for: button,
+            trigger: .longPress,
+            profileID: profileID
+        ).action != .disabled || macroFeature.hasActiveBinding(
+            profileID: profileID,
+            button: button,
+            trigger: .longPress
+        )
+
+        if phase == .press,
+           !recognizesDoubleClick,
+           !recognizesLongPress,
+           !chromecastButtonGestureRecognizer.isTracking(button) {
+            _ = performChromecastConfiguredAction(
+                for: button,
+                trigger: .singleClick,
+                profileID: profileID
+            )
+            return
+        }
+
+        let commands = chromecastButtonGestureRecognizer.handle(
+            phase,
+            button: button,
+            recognizesDoubleClick: recognizesDoubleClick,
+            recognizesLongPress: recognizesLongPress
+        )
+        _ = processChromecastGestureCommands(commands, profileID: profileID)
+    }
+
+    private func processChromecastGestureCommands(
+        _ commands: [RemoteButtonGestureRecognizer.Command],
+        profileID: UUID
+    ) -> Bool {
+        for command in commands {
+            switch command {
+            case let .scheduleDoubleClickTimeout(button):
+                scheduleChromecastDoubleClickTimeout(for: button, profileID: profileID)
+            case let .cancelDoubleClickTimeout(button):
+                chromecastDoubleClickTimers.removeValue(forKey: button)?.cancel()
+            case let .scheduleLongPressTimeout(button):
+                scheduleChromecastLongPressTimeout(for: button, profileID: profileID)
+            case let .cancelLongPressTimeout(button):
+                chromecastLongPressTimers.removeValue(forKey: button)?.cancel()
+            case let .trigger(button, trigger):
+                guard performChromecastConfiguredAction(
+                    for: button,
+                    trigger: trigger,
+                    profileID: profileID
+                ) else { return false }
+            }
+        }
+        return true
+    }
+
+    private func scheduleChromecastDoubleClickTimeout(
+        for button: RemoteButton,
+        profileID: UUID
+    ) {
+        chromecastDoubleClickTimers.removeValue(forKey: button)?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .milliseconds(300))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            chromecastDoubleClickTimers.removeValue(forKey: button)
+            let commands = chromecastButtonGestureRecognizer.doubleClickTimedOut(button)
+            _ = processChromecastGestureCommands(commands, profileID: profileID)
+        }
+        chromecastDoubleClickTimers[button] = timer
+        timer.resume()
+    }
+
+    private func scheduleChromecastLongPressTimeout(
+        for button: RemoteButton,
+        profileID: UUID
+    ) {
+        chromecastLongPressTimers.removeValue(forKey: button)?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .milliseconds(550))
+        timer.setEventHandler { [weak self] in
+            guard let self else { return }
+            chromecastLongPressTimers.removeValue(forKey: button)
+            let commands = chromecastButtonGestureRecognizer.longPressTimedOut(button)
+            _ = processChromecastGestureCommands(commands, profileID: profileID)
+        }
+        chromecastLongPressTimers[button] = timer
+        timer.resume()
+    }
+
+    private func performChromecastConfiguredAction(
+        for button: RemoteButton,
+        trigger: ButtonTrigger,
+        profileID: UUID
+    ) -> Bool {
+        if performButtonProfileBoundAction(
+            profileID: profileID,
+            button: button,
+            trigger: trigger,
+            source: "chromecast:\(profileID.uuidString)"
+        ) {
+            AppLogger.shared.write(
+                "CHROMECAST ACTION button=\(button.rawValue) trigger=\(trigger.rawValue) " +
+                    "action=private_feature"
+            )
+            return true
+        }
+        let configured = settings.configuredAction(for: button, trigger: trigger, profileID: profileID)
+        if configured.action.isAppInternal {
+            let handled = performInternalAction(configured.action, source: "chromecast:\(profileID.uuidString)")
+            AppLogger.shared.write(
+                "CHROMECAST ACTION button=\(button.rawValue) trigger=\(trigger.rawValue) " +
+                    "action=\(configured.action.rawValue) handled=\(handled)"
+            )
+            return handled
+        }
+        guard KeyboardInjector.isAccessibilityTrusted else {
+            _ = KeyboardInjector.requestAccessibilityAccess()
+            AppLogger.shared.write(
+                "CHROMECAST ACTION phase=failed result=accessibility_required " +
+                    "button=\(button.rawValue) trigger=\(trigger.rawValue)"
+            )
+            return false
+        }
+        guard performExternalConfiguredAction(configured) else {
+            AppLogger.shared.write(
+                "CHROMECAST ACTION phase=failed result=submission_failed " +
+                    "button=\(button.rawValue) trigger=\(trigger.rawValue) " +
+                    "action=\(configured.action.rawValue)"
+            )
+            return false
+        }
+        AppLogger.shared.write(
+            "CHROMECAST ACTION phase=completed result=dispatched " +
+                "button=\(button.rawValue) trigger=\(trigger.rawValue) " +
+                "action=\(configured.action.rawValue)"
+        )
+        return true
+    }
+
+    private func receiveChromecastAudio(_ samples: [Int16]) {
+        guard chromecastVoiceActive || chromecastVoiceStopping || pendingChromecastVoiceStart,
+              !samples.isEmpty
+        else { return }
+        if pendingChromecastVoiceStart,
+           pendingChromecastVoiceAudio.appendIfWaiting(samples) {
+            AppLogger.shared.write(
+                "CHROMECAST AUDIO buffered_during_configuration samples=\(samples.count) " +
+                    "total=\(pendingChromecastVoiceAudio.bufferedSampleCount)"
+            )
+            return
+        }
+        recordingAssetCoordinator.append(samples: samples)
+        publishCurrentVoiceSampleReceiptIfNeeded(sampleCount: samples.count)
+
+        // 预卷门控：会话开头 prerollDelay 秒的音频先攒在内存，到期再一次性排入播放器。
+        // 背景：写入端（宿主写 MiRemoteV 输出端）比读取端（豆包打开该设备输入流）先启动，
+        // BlackHole 型环回没有回放缓冲——读端开流之前写入的数据直接消失，表现为「按下即说
+        // 时前几个字丢失」。排入 AVAudioPlayerNode 的 buffer 按实时消费，不会倾倒覆盖，
+        // 豆包开读时恰好从人声开头读到。
+        let uptime = ProcessInfo.processInfo.systemUptime
+        if chromecastAudioPrerollOpenedAt == nil {
+            chromecastAudioPrerollOpenedAt = uptime
+        }
+        if chromecastVoiceActive,
+           uptime - chromecastAudioPrerollOpenedAt! < Self.chromecastAudioPrerollDelay {
+            chromecastAudioPrerollBatches.append(samples)
+            return
+        }
+        flushChromecastAudioPreroll()
+
+        let deliveryGeneration = voiceAudioDeliveryDiagnostic.generation
+        let accepted = audioOutput.enqueue(
+            samples: samples,
+            deliveryGeneration: deliveryGeneration
+        )
+        recordVoiceAudioReceipt(samples: samples, route: .virtualAudioDirect)
+        recordVoiceAudioEnqueueOutcome(
+            accepted: accepted,
+            deliveryGeneration: deliveryGeneration
+        )
+        chromecastAudioBatchCount += 1
+        chromecastAudioSampleCount += samples.count
+        if !accepted { chromecastAudioEnqueueFailureCount += 1 }
+        if !loggedChromecastAudioDevice {
+            loggedChromecastAudioDevice = true
+            AppLogger.shared.write(
+                "CHROMECAST AUDIO routed source=chromecast_microphone " +
+                    "route=virtual_audio device=MiRemoteV_2ch accepted=\(accepted) " +
+                    "first_batch_samples=\(samples.count)"
+            )
+        }
+    }
+
+    /// 把预卷缓冲一次性排入播放器。AVAudioPlayerNode 按实时消费排队的 buffer，
+    /// 因此一次排入不会覆盖环回 ring，豆包读到的是连续实时流。
+    private func flushChromecastAudioPreroll() {
+        guard !chromecastAudioPrerollBatches.isEmpty else { return }
+        let batches = chromecastAudioPrerollBatches
+        chromecastAudioPrerollBatches = []
+        let deliveryGeneration = voiceAudioDeliveryDiagnostic.generation
+        var failures = 0
+        for batch in batches {
+            if !audioOutput.enqueue(samples: batch, deliveryGeneration: deliveryGeneration) {
+                failures += 1
+            }
+            chromecastAudioBatchCount += 1
+            chromecastAudioSampleCount += batch.count
+        }
+        chromecastAudioEnqueueFailureCount += failures
+        if !loggedChromecastAudioDevice, let first = batches.first {
+            loggedChromecastAudioDevice = true
+            AppLogger.shared.write(
+                "CHROMECAST AUDIO routed source=chromecast_microphone " +
+                    "route=virtual_audio device=MiRemoteV_2ch accepted=\(failures == 0) " +
+                    "first_batch_samples=\(first.count)"
+            )
+        }
+        AppLogger.shared.write(
+            "CHROMECAST AUDIO preroll flushed batches=\(batches.count) " +
+                "samples=\(batches.reduce(0) { $0 + $1.count }) failures=\(failures)"
+        )
+    }
+    #endif
+}

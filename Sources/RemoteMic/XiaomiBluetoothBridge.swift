@@ -1,0 +1,1671 @@
+import CoreBluetooth
+import Foundation
+
+enum BluetoothBridgeState: Equatable {
+    case stopped
+    case bluetoothUnavailable(LocalizedMessage)
+    case scanning
+    case connecting
+    case discovering
+    case ready(String)
+    case reconnecting
+    case failed(LocalizedMessage)
+
+    var message: LocalizedMessage {
+        switch self {
+        case .stopped: return LocalizedMessage("common.status.stopped")
+        case .bluetoothUnavailable(let reason): return reason
+        case .scanning: return LocalizedMessage("connection.status.searching")
+        case .connecting: return LocalizedMessage("connection.status.connecting")
+        case .discovering: return LocalizedMessage("connection.status.initializing_voice")
+        case .ready: return LocalizedMessage("connection.status.connected_to_device")
+        case .reconnecting: return LocalizedMessage("connection.status.reconnecting")
+        case .failed(let reason): return reason
+        }
+    }
+}
+
+protocol XiaomiBluetoothBridgeDelegate: AnyObject {
+    func bluetoothBridge(_ bridge: XiaomiBluetoothBridge, didChange state: BluetoothBridgeState)
+    func bluetoothBridgeDidStartVoice(_ bridge: XiaomiBluetoothBridge)
+    func bluetoothBridgeDidStopVoice(_ bridge: XiaomiBluetoothBridge)
+    func bluetoothBridge(_ bridge: XiaomiBluetoothBridge, didDecode samples: [Int16])
+    func bluetoothBridge(_ bridge: XiaomiBluetoothBridge, didUpdateBatteryLevel level: Int?)
+    func bluetoothBridge(_ bridge: XiaomiBluetoothBridge, didIdentifyRemoteModel model: XiaomiRemoteModel)
+    func bluetoothBridge(_ bridge: XiaomiBluetoothBridge, didUpdatePowerState state: RemotePowerState?)
+    func bluetoothBridgeDeviceNameDidChange(_ bridge: XiaomiBluetoothBridge)
+}
+
+private final class XiaomiPeripheralDelegateProxy: NSObject, CBPeripheralDelegate {
+    let generation: UInt64
+    weak var owner: XiaomiBluetoothBridge?
+
+    init(generation: UInt64, owner: XiaomiBluetoothBridge) {
+        self.generation = generation
+        self.owner = owner
+    }
+
+    func peripheralDidUpdateName(_ peripheral: CBPeripheral) {
+        owner?.handleNameUpdate(peripheral: peripheral, generation: generation)
+    }
+
+    func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
+        owner?.handleDiscoveredServices(
+            peripheral: peripheral,
+            generation: generation,
+            error: error
+        )
+    }
+
+    func peripheral(
+        _ peripheral: CBPeripheral,
+        didDiscoverCharacteristicsFor service: CBService,
+        error: Error?
+    ) {
+        owner?.handleDiscoveredCharacteristics(
+            peripheral: peripheral,
+            generation: generation,
+            service: service,
+            error: error
+        )
+    }
+
+    func peripheral(
+        _ peripheral: CBPeripheral,
+        didUpdateNotificationStateFor characteristic: CBCharacteristic,
+        error: Error?
+    ) {
+        owner?.handleNotificationState(
+            peripheral: peripheral,
+            generation: generation,
+            characteristic: characteristic,
+            error: error
+        )
+    }
+
+    func peripheral(
+        _ peripheral: CBPeripheral,
+        didUpdateValueFor characteristic: CBCharacteristic,
+        error: Error?
+    ) {
+        owner?.handleCharacteristicValue(
+            peripheral: peripheral,
+            generation: generation,
+            characteristic: characteristic,
+            error: error
+        )
+    }
+}
+
+enum BluetoothBatteryPollingPolicy {
+    static let interval: TimeInterval = 5 * 60
+
+    static func shouldPoll(
+        supportsNotifications: Bool,
+        isNotifying: Bool
+    ) -> Bool {
+        !supportsNotifications || !isNotifying
+    }
+}
+
+final class XiaomiBluetoothBridge: NSObject {
+    private static let defaultCapabilities = ATVVCapabilities(
+        version: 0x0100,
+        codecs: 0x02,
+        interaction: 0x03,
+        frameSize: 120,
+        selectedCodec: 0x02,
+        sampleRate: 16_000
+    )
+
+    private let settings: AppSettings
+    private weak var delegate: XiaomiBluetoothBridgeDelegate?
+    private let targetIdentifier: UUID?
+    private let excludedIdentifiers: () -> Set<UUID>
+    /// 已被判定为「别的产品」的标识；本桥此后一律不再连接，也不再走扫描回退。
+    private var rejectedIdentifiers = Set<UUID>()
+    private var central: CBCentralManager?
+    private var centralGeneration: UInt64?
+    private var peripheral: CBPeripheral?
+    private var peripheralDelegateProxy: XiaomiPeripheralDelegateProxy?
+    private var transmitCharacteristic: CBCharacteristic?
+    private var audioCharacteristic: CBCharacteristic?
+    private var controlCharacteristic: CBCharacteristic?
+    private var batteryCharacteristic: CBCharacteristic?
+    private var batteryStatusCharacteristic: CBCharacteristic?
+    private var batteryLevelNeedsPolling = false
+    private var batteryStatusNeedsPolling = false
+    private var batteryRefreshWorkItem: DispatchWorkItem?
+    private var batteryPollingActive = false
+    private var hasObservedBatteryLevel = false
+    private var lastObservedBatteryLevel: Int?
+    private var hasObservedPowerState = false
+    private var lastObservedPowerState: RemotePowerState?
+    private var subscribedUUIDs = Set<CBUUID>()
+    private var reconnectWorkItem: DispatchWorkItem?
+    private var connectionTimeoutWorkItem: DispatchWorkItem?
+    private var initializationTimeoutWorkItem: DispatchWorkItem?
+    private var capabilitiesRequested = false
+    private var capabilitiesConfirmed = false
+    private var requestedReconnectDelay: TimeInterval?
+    private var reconnectPolicy = BluetoothReconnectPolicy()
+    private var currentAttemptUsesCachedTarget = false
+    private var generationCounter: UInt64 = 0
+    private var lifecycle: BluetoothLifecyclePhase = .stopped
+    private var shouldRun = false
+    private var systemSuspension = BluetoothSystemSuspensionState()
+    private var capabilities = XiaomiBluetoothBridge.defaultCapabilities
+    private var decoder = IMAADPCMDecoder()
+    private var accumulator = FrameAccumulator()
+    private var pendingSync: (predictor: Int, stepIndex: Int)?
+    private var streaming = false
+    private var microphoneOpened = false
+    private var cancelledMicrophoneOpenAt: Date?
+    private var sessionID: UInt8 = 0
+    private var lastStopAt: Date?
+    private(set) var audioDiagnostics: ATVVAudioDiagnostics?
+    var audioFrameSampleCount: Int { capabilities.frameSize * 2 }
+
+    private func diagnosticForAudio() -> ATVVAudioDiagnostics {
+        let previous = audioDiagnostics
+        if audioDiagnostics?.hasStopped == true,
+           lastStopAt.map({ Date().timeIntervalSince($0) >= 0.3 }) ?? true {
+            audioDiagnostics = nil
+        }
+        if audioDiagnostics == nil || audioDiagnostics?.isFinalized == true {
+            audioDiagnostics = ATVVAudioDiagnostics()
+            if let previous { audioDiagnostics?.precededBy(previous) }
+        }
+        return audioDiagnostics!
+    }
+
+    private let serviceUUID = CBUUID(string: ATVVProtocol.serviceUUID)
+    private let transmitUUID = CBUUID(string: ATVVProtocol.transmitUUID)
+    private let audioUUID = CBUUID(string: ATVVProtocol.audioUUID)
+    private let controlUUID = CBUUID(string: ATVVProtocol.controlUUID)
+    private let batteryServiceUUID = CBUUID(string: "180F")
+    private let batteryLevelUUID = CBUUID(string: "2A19")
+    private let batteryLevelStatusUUID = CBUUID(string: "2BED")
+    private let deviceInformationServiceUUID = CBUUID(string: "180A")
+    private let modelNumberUUID = CBUUID(string: "2A24")
+
+    var deviceIdentifier: UUID? {
+        peripheral?.identifier ?? targetIdentifier
+    }
+
+    /// Refresh the system snapshot without changing the bridge's connection or audio state.
+    func currentSystemDeviceName() -> String? {
+        guard shouldRun, let central, central.state == .poweredOn,
+              let peripheral, case .ready = lifecycle
+        else { return nil }
+        return central.retrieveConnectedPeripherals(withServices: [serviceUUID])
+            .first(where: { $0.identifier == peripheral.identifier })?.name
+    }
+
+    /// Re-read optional battery characteristics without changing connection or audio state.
+    func refreshBatteryTelemetry(reason: String) {
+        guard shouldRun,
+              !systemSuspension.isSuspended,
+              lifecycle.isReady,
+              let peripheral,
+              peripheral.state == .connected
+        else { return }
+        requestBatteryTelemetryRefresh(
+            peripheral: peripheral,
+            reason: reason,
+            pollingOnly: false
+        )
+    }
+
+    fileprivate func handleNameUpdate(peripheral: CBPeripheral, generation: UInt64) {
+        guard shouldRun, isCurrent(peripheral), lifecycle == .ready(generation) else { return }
+        delegate?.bluetoothBridgeDeviceNameDidChange(self)
+    }
+
+    private(set) var state: BluetoothBridgeState = .stopped {
+        didSet {
+            guard oldValue != state else { return }
+            delegate?.bluetoothBridge(self, didChange: state)
+        }
+    }
+
+    init(
+        settings: AppSettings,
+        delegate: XiaomiBluetoothBridgeDelegate,
+        targetIdentifier: UUID? = nil,
+        excludedIdentifiers: @escaping () -> Set<UUID> = { [] }
+    ) {
+        self.settings = settings
+        self.delegate = delegate
+        self.targetIdentifier = targetIdentifier
+        self.excludedIdentifiers = excludedIdentifiers
+        super.init()
+    }
+
+    func start() {
+        shouldRun = true
+        reconnectWorkItem?.cancel()
+        reconnectPolicy.reset()
+        guard !systemSuspension.isSuspended else {
+            systemSuspension.markConnectionCycleNeeded()
+            AppLogger.shared.write(
+                "BLE SYSTEM_SUSPENSION phase=deferred result=paused reason=bridge_start"
+            )
+            return
+        }
+        beginConnectionCycle()
+    }
+
+    func stop() {
+        shouldRun = false
+        reconnectWorkItem?.cancel()
+        stopBatteryPolling(reason: "bridge_stopped")
+        reconnectPolicy.reset()
+        central?.stopScan()
+        closeMicrophoneIfNeeded()
+        if let central, let peripheral, peripheral.state != .disconnected {
+            requestedReconnectDelay = nil
+            lifecycle = .disconnecting(lifecycle.generation ?? generationCounter)
+            central.cancelPeripheralConnection(peripheral)
+        } else {
+            finishAttempt(reconnectAfter: nil)
+        }
+        resetSession()
+        state = .stopped
+    }
+
+    func reconnectNow() {
+        guard shouldRun else { return }
+        guard !systemSuspension.isSuspended else {
+            systemSuspension.markConnectionCycleNeeded()
+            AppLogger.shared.write(
+                "BLE SYSTEM_SUSPENSION phase=deferred result=paused reason=reconnect_requested"
+            )
+            return
+        }
+        _ = systemSuspension.consumeConnectionCycleNeeded()
+        reconnectWorkItem?.cancel()
+        reconnectPolicy.reset()
+        central?.stopScan()
+        if let central, let peripheral, peripheral.state != .disconnected {
+            requestedReconnectDelay = 0.1
+            lifecycle = .disconnecting(lifecycle.generation ?? generationCounter)
+            state = .reconnecting
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
+        finishAttempt(reconnectAfter: 0.1)
+    }
+
+    /// 主动重建本桥的语音链路，重新从发现/连接开始。
+    ///
+    /// `reason` 是稳定枚举（`system_wake` / `session_activated`），只用于把「系统唤醒」和
+    /// 「会话切回前台」两种触发区分开，不参与状态机判定。
+    func recoverVoiceLink(reason: String) {
+        guard shouldRun else {
+            AppLogger.shared.write("BLE RECOVERY phase=skipped cause=bridge_stopped trigger=\(reason)")
+            return
+        }
+        guard !systemSuspension.isSuspended else {
+            systemSuspension.markConnectionCycleNeeded()
+            AppLogger.shared.write(
+                "BLE RECOVERY phase=deferred cause=system_suspended trigger=\(reason)"
+            )
+            return
+        }
+        let centralState = central.map { String($0.state.rawValue) } ?? "none"
+        AppLogger.shared.write(
+            "BLE RECOVERY phase=requested trigger=\(reason) state=\(String(describing: state)) " +
+                "lifecycle=\(String(describing: lifecycle)) " +
+                "central_state=\(centralState) " +
+                "generation=\(generationCounter)"
+        )
+        reconnectNow()
+    }
+
+    func setSystemSuspended(_ suspended: Bool, reason: String) {
+        if suspended {
+            guard systemSuspension.suspend(phase: lifecycle) else { return }
+            stopBatteryPolling(reason: "system_suspended")
+            central?.stopScan()
+            if !lifecycle.isReady,
+               let central,
+               let peripheral,
+               peripheral.state != .disconnected {
+                requestedReconnectDelay = nil
+                lifecycle = .disconnecting(lifecycle.generation ?? generationCounter)
+                central.cancelPeripheralConnection(peripheral)
+            }
+            reconnectWorkItem?.cancel()
+            reconnectWorkItem = nil
+            connectionTimeoutWorkItem?.cancel()
+            connectionTimeoutWorkItem = nil
+            initializationTimeoutWorkItem?.cancel()
+            initializationTimeoutWorkItem = nil
+            AppLogger.shared.write(
+                "BLE SYSTEM_SUSPENSION phase=started result=paused reason=\(reason) " +
+                    "lifecycle=\(String(describing: lifecycle)) " +
+                    "ready_preserved=\(lifecycle.isReady)"
+            )
+            return
+        }
+
+        guard systemSuspension.resume() else { return }
+        if let generation = currentGeneration(), lifecycle.isReady {
+            updateBatteryPollingSchedule(generation: generation)
+        }
+        AppLogger.shared.write(
+            "BLE SYSTEM_SUSPENSION phase=completed result=resumed reason=\(reason) " +
+                "connection_cycle_needed=\(systemSuspension.connectionCycleNeeded)"
+        )
+    }
+
+    func resumeConnectionCycleIfNeeded(reason: String) {
+        guard systemSuspension.consumeConnectionCycleNeeded() else { return }
+        guard shouldRun, !lifecycle.isReady else { return }
+        AppLogger.shared.write(
+            "BLE SYSTEM_SUSPENSION phase=recovering result=requested reason=\(reason) " +
+                "lifecycle=\(String(describing: lifecycle))"
+        )
+        reconnectNow()
+    }
+
+    private func beginConnectionCycle() {
+        guard shouldRun else { return }
+        guard !systemSuspension.isSuspended else {
+            systemSuspension.markConnectionCycleNeeded()
+            return
+        }
+        guard central == nil else { return }
+        generationCounter &+= 1
+        let generation = generationCounter
+        lifecycle = .scanning(generation)
+        let manager = CBCentralManager(
+            delegate: self,
+            queue: .main,
+            options: [CBCentralManagerOptionShowPowerAlertKey: true]
+        )
+        central = manager
+        centralGeneration = generation
+        if manager.state == .poweredOn {
+            discoverOrScan(using: manager, generation: generation)
+        }
+    }
+
+    @discardableResult
+    func requestMicrophoneOpen() -> Bool {
+        guard let generation = currentGeneration(),
+              ATVVSessionGate.canOpenMicrophone(
+                  phase: lifecycle,
+                  generation: generation,
+                  capabilitiesConfirmed: capabilitiesConfirmed,
+                  sampleRate: capabilities.sampleRate
+              ),
+              !microphoneOpened,
+              !streaming
+        else {
+            AppLogger.shared.write("ATVV MIC_OPEN host_request_rejected")
+            return false
+        }
+        guard write(ATVVProtocol.microphoneOpen(
+            version: capabilities.version,
+            codec: capabilities.selectedCodec
+        )) else {
+            AppLogger.shared.write("ATVV MIC_OPEN host_request_write_failed")
+            return false
+        }
+        cancelledMicrophoneOpenAt = nil
+        microphoneOpened = true
+        AppLogger.shared.write("ATVV MIC_OPEN host_request")
+        return true
+    }
+
+    @discardableResult
+    func requestMicrophoneExtend() -> Bool {
+        guard microphoneOpened,
+              streaming,
+              let command = ATVVProtocol.microphoneExtend(
+                  version: capabilities.version,
+                  sessionID: sessionID
+              ),
+              write(command)
+        else {
+            AppLogger.shared.write("ATVV MIC_EXTEND rejected session=\(sessionID)")
+            return false
+        }
+        AppLogger.shared.write("ATVV MIC_EXTEND request session=\(sessionID)")
+        return true
+    }
+
+    @discardableResult
+    func requestMicrophoneClose() -> Bool {
+        guard microphoneOpened || streaming else { return true }
+        let cancelledOpenAt = ATVVSessionGate.cancelledOpenDate(
+            microphoneOpened: microphoneOpened,
+            streaming: streaming
+        )
+        let didWrite = write(ATVVProtocol.microphoneClose(
+            version: capabilities.version,
+            sessionID: sessionID
+        ))
+        audioDiagnostics?.microphoneCloseRequested(written: didWrite)
+        microphoneOpened = false
+        cancelledMicrophoneOpenAt = cancelledOpenAt
+        AppLogger.shared.write(
+            "ATVV MIC_CLOSE request session=\(sessionID) written=\(didWrite)"
+        )
+        return didWrite
+    }
+
+    private func discoverOrScan(using central: CBCentralManager, generation: UInt64) {
+        guard shouldRun,
+              !systemSuspension.isSuspended,
+              self.central === central,
+              lifecycle == .scanning(generation),
+              central.state == .poweredOn
+        else { return }
+        resetPeripheral()
+
+        if reconnectPolicy.allowsCachedTargetRetrieval,
+           let identifier = targetIdentifier,
+           let saved = central.retrievePeripherals(withIdentifiers: [identifier]).first {
+            // 已保存身份不再无条件采纳：早先版本把别的产品（Chromecast Remote）误存成 Xiaomi
+            // 档案后，只按 UUID 连接会让这个错误一直重连、并且和私有 Chromecast 包抢同一台设备。
+            // 被拒绝时不 return：按「设备不在」继续走既有扫描/重试路径，不新增状态分支。
+            if adopt(
+                saved,
+                using: central,
+                generation: generation,
+                source: "target_identifier",
+                advertisesVoiceService: true,
+                advertisedName: nil,
+                usesCachedTarget: true
+            ) {
+                return
+            }
+        }
+
+        if targetIdentifier == nil {
+            // ATVV 服务是通用服务，可能同时命中多台遥控器。这里把候选连名字一起记一行：
+            // 否则「取回了候选但名字不符」与「根本没取回候选」在日志里完全一样，无法二分。
+            let connectedCandidates = central.retrieveConnectedPeripherals(withServices: [serviceUUID])
+            if !connectedCandidates.isEmpty {
+                AppLogger.shared.write(
+                    "BLE SYSTEM CONNECTED CANDIDATES count=\(connectedCandidates.count) "
+                        + "names="
+                        + connectedCandidates.map { $0.name ?? "unknown" }.joined(separator: ",")
+                )
+            }
+            // 逐个过准入：第一台被拒绝（别的产品）时继续看下一台，而不是整批放弃。
+            for candidate in connectedCandidates
+            where !excludedIdentifiers().contains(candidate.identifier)
+                && !rejectedIdentifiers.contains(candidate.identifier) {
+                if adopt(
+                    candidate,
+                    using: central,
+                    generation: generation,
+                    source: "connected_peripheral",
+                    advertisesVoiceService: true,
+                    advertisedName: nil
+                ) {
+                    return
+                }
+            }
+        }
+
+        state = .scanning
+        central.scanForPeripherals(
+            withServices: nil,
+            options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+        )
+        AppLogger.shared.write("BLE SCANNING")
+    }
+
+    /// 三条发现路径——已保存标识、系统已连接设备、扫描广播——**必须共用这一份判定**。
+    /// 分成三份写就会出现「某条路径漏掉/误收」这类只在特定配对状态下复现的缺陷。
+    @discardableResult
+    private func adopt(
+        _ candidate: CBPeripheral,
+        using central: CBCentralManager,
+        generation: UInt64,
+        source: String,
+        advertisesVoiceService: Bool,
+        advertisedName: String?,
+        usesCachedTarget: Bool = false
+    ) -> Bool {
+        let decision = VoiceRemoteAdmission.decide(
+            identifier: candidate.identifier,
+            targetIdentifier: targetIdentifier,
+            advertisesVoiceService: advertisesVoiceService,
+            name: candidate.name,
+            advertisedName: advertisedName
+        )
+        switch decision {
+        case .adoptSavedIdentity, .adoptRecognizedName:
+            connect(
+                candidate,
+                using: central,
+                generation: generation,
+                source: source,
+                usesCachedTarget: usesCachedTarget
+            )
+            return true
+        case .ignore:
+            return false
+        case .rejectForeignProduct, .rejectUnrecognizedName, .rejectUnnamed:
+            reject(candidate, reason: decision.logReason, source: source)
+            return false
+        }
+    }
+
+    /// 明确记录并拒绝一台设备，此后本桥不再尝试连接它。
+    ///
+    /// 必须是显式日志：设备名对不上、名字不认识、根本没拿到名字，这三种情况在没有原因字段的
+    /// 日志里长得完全一样，无法二分「为什么这台遥控器没被接管」。
+    private func reject(_ candidate: CBPeripheral, reason: String, source: String) {
+        guard rejectedIdentifiers.insert(candidate.identifier).inserted else { return }
+        AppLogger.shared.write(
+            "BLE REJECTED reason=\(reason) source=\(source) name=\(candidate.name ?? "unknown")"
+        )
+    }
+
+    private func connect(
+        _ candidate: CBPeripheral,
+        using central: CBCentralManager,
+        generation: UInt64,
+        source: String,
+        usesCachedTarget: Bool = false
+    ) {
+        guard shouldRun,
+              !systemSuspension.isSuspended,
+              self.central === central,
+              peripheral == nil,
+              lifecycle == .scanning(generation)
+        else { return }
+        central.stopScan()
+        peripheral = candidate
+        currentAttemptUsesCachedTarget = usesCachedTarget
+        let proxy = XiaomiPeripheralDelegateProxy(generation: generation, owner: self)
+        peripheralDelegateProxy = proxy
+        candidate.delegate = proxy
+        lifecycle = .connecting(generation)
+        state = .connecting
+        startConnectionTimeout(generation: generation)
+        central.connect(candidate, options: nil)
+        AppLogger.shared.write("BLE CONNECTING source=\(source) name=\(candidate.name ?? "unknown")")
+    }
+
+    private func resetPeripheral() {
+        stopBatteryPolling(reason: "peripheral_reset")
+        peripheral?.delegate = nil
+        peripheral = nil
+        peripheralDelegateProxy = nil
+        requestedReconnectDelay = nil
+        transmitCharacteristic = nil
+        audioCharacteristic = nil
+        controlCharacteristic = nil
+        batteryCharacteristic = nil
+        batteryStatusCharacteristic = nil
+        batteryLevelNeedsPolling = false
+        batteryStatusNeedsPolling = false
+        hasObservedBatteryLevel = false
+        lastObservedBatteryLevel = nil
+        hasObservedPowerState = false
+        lastObservedPowerState = nil
+        subscribedUUIDs.removeAll()
+        connectionTimeoutWorkItem?.cancel()
+        connectionTimeoutWorkItem = nil
+        initializationTimeoutWorkItem?.cancel()
+        initializationTimeoutWorkItem = nil
+        capabilitiesRequested = false
+        capabilitiesConfirmed = false
+        capabilities = Self.defaultCapabilities
+        currentAttemptUsesCachedTarget = false
+        resetSession()
+    }
+
+    private func isCurrent(_ candidate: CBPeripheral) -> Bool {
+        guard let peripheral else { return false }
+        return peripheral === candidate
+    }
+
+    private func currentGeneration() -> UInt64? {
+        lifecycle.generation
+    }
+
+    private func startInitializationTimeout(generation: UInt64) {
+        initializationTimeoutWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.shouldRun,
+                  !self.systemSuspension.isSuspended,
+                  self.currentGeneration() == generation,
+                  self.lifecycle == .discovering(generation) ||
+                    self.lifecycle == .awaitingCapabilities(generation)
+            else { return }
+            self.failInitialization(LocalizedMessage("connection.error.voice_service_timeout"))
+        }
+        initializationTimeoutWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: work)
+    }
+
+    private func startConnectionTimeout(generation: UInt64) {
+        connectionTimeoutWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.shouldRun,
+                  !self.systemSuspension.isSuspended,
+                  self.currentGeneration() == generation,
+                  self.lifecycle == .connecting(generation)
+            else { return }
+            AppLogger.shared.write("BLE CONNECT TIMEOUT")
+            self.state = .reconnecting
+            if let central = self.central,
+               let peripheral = self.peripheral,
+               peripheral.state != .disconnected {
+                central.cancelPeripheralConnection(peripheral)
+            }
+            let delay = self.nextAutomaticReconnectDelay(
+                bypassCachedTarget: self.currentAttemptUsesCachedTarget
+            )
+            self.finishAttempt(reconnectAfter: delay)
+        }
+        connectionTimeoutWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: work)
+    }
+
+    private func resetSession() {
+        audioDiagnostics?.discardPartial(bytes: accumulator.pending.count)
+        audioDiagnostics?.stop(reason: "session_reset")
+        if streaming {
+            streaming = false
+            delegate?.bluetoothBridgeDidStopVoice(self)
+        }
+        microphoneOpened = false
+        cancelledMicrophoneOpenAt = nil
+        sessionID = 0
+        accumulator.reset()
+        pendingSync = nil
+        decoder.reset()
+    }
+
+    private func scheduleReconnect(bypassCachedTarget: Bool = false) {
+        guard shouldRun else { return }
+        guard !systemSuspension.isSuspended else {
+            systemSuspension.markConnectionCycleNeeded()
+            reconnectWorkItem?.cancel()
+            reconnectWorkItem = nil
+            state = .reconnecting
+            AppLogger.shared.write(
+                "BLE RECONNECT deferred reason=system_suspended"
+            )
+            return
+        }
+        reconnectWorkItem?.cancel()
+        state = .reconnecting
+        let delay = nextAutomaticReconnectDelay(
+            bypassCachedTarget: bypassCachedTarget || currentAttemptUsesCachedTarget
+        )
+        if let central, let peripheral, peripheral.state != .disconnected {
+            requestedReconnectDelay = delay
+            lifecycle = .disconnecting(lifecycle.generation ?? generationCounter)
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
+        finishAttempt(reconnectAfter: delay)
+    }
+
+    private func nextAutomaticReconnectDelay(bypassCachedTarget: Bool) -> TimeInterval {
+        let delay = reconnectPolicy.nextAutomaticDelay(
+            bypassCachedTarget: bypassCachedTarget,
+            jitterUnit: Double.random(in: 0 ... 1)
+        )
+        let cachedIdentifierBypassed = targetIdentifier != nil &&
+            !reconnectPolicy.allowsCachedTargetRetrieval
+        AppLogger.shared.write(
+            "BLE RECONNECT scheduled failure_count=\(reconnectPolicy.consecutiveFailureCount) " +
+                "delay_ms=\(Int((delay * 1_000).rounded())) " +
+                "cached_identifier_bypassed=\(cachedIdentifierBypassed)"
+        )
+        return delay
+    }
+
+    private func reconnectDelayAfterFailure(bypassCachedTarget: Bool) -> TimeInterval? {
+        guard shouldRun else { return nil }
+        guard !systemSuspension.isSuspended else {
+            systemSuspension.markConnectionCycleNeeded()
+            return 0
+        }
+        return requestedReconnectDelay ?? nextAutomaticReconnectDelay(
+            bypassCachedTarget: bypassCachedTarget
+        )
+    }
+
+    private func finishAttempt(reconnectAfter delay: TimeInterval?) {
+        let finishedGeneration = lifecycle.generation ?? generationCounter
+        central?.stopScan()
+        requestedReconnectDelay = nil
+        resetPeripheral()
+
+        guard shouldRun, let delay else {
+            central?.delegate = nil
+            central = nil
+            centralGeneration = nil
+            lifecycle = .stopped
+            return
+        }
+
+        guard !systemSuspension.isSuspended else {
+            systemSuspension.markConnectionCycleNeeded()
+            lifecycle = .stopped
+            state = .reconnecting
+            AppLogger.shared.write(
+                "BLE RECONNECT deferred reason=system_suspended"
+            )
+            return
+        }
+
+        state = .reconnecting
+        lifecycle = .waitingReconnect(finishedGeneration)
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.shouldRun,
+                  !self.systemSuspension.isSuspended,
+                  self.lifecycle == .waitingReconnect(finishedGeneration)
+            else { return }
+            self.reconnectWorkItem = nil
+            self.startFreshConnectionCycle()
+        }
+        reconnectWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    @discardableResult
+    private func write(_ data: Data) -> Bool {
+        guard let peripheral, let transmitCharacteristic else { return false }
+        let type: CBCharacteristicWriteType = transmitCharacteristic.properties.contains(.writeWithoutResponse)
+            ? .withoutResponse
+            : .withResponse
+        peripheral.writeValue(data, for: transmitCharacteristic, type: type)
+        return true
+    }
+
+    private func closeMicrophoneIfNeeded() {
+        _ = requestMicrophoneClose()
+    }
+
+    private func requestCapabilitiesIfPossible() {
+        guard let generation = currentGeneration(),
+              lifecycle.acceptsInitializationCallback(generation: generation)
+        else { return }
+        guard transmitCharacteristic != nil,
+              let audioCharacteristic,
+              let controlCharacteristic,
+              subscribedUUIDs.contains(audioCharacteristic.uuid),
+              subscribedUUIDs.contains(controlCharacteristic.uuid),
+              let peripheral
+        else { return }
+        guard !capabilitiesRequested else { return }
+        capabilitiesRequested = true
+        write(ATVVProtocol.getCapabilitiesV10)
+        lifecycle = .awaitingCapabilities(generation)
+        state = .discovering
+        AppLogger.shared.write("ATVV CAPABILITIES requested name=\(peripheral.name ?? "MI RC")")
+    }
+
+    private func updateBatteryPollingSchedule(generation: UInt64) {
+        let needsPolling = batteryLevelNeedsPolling || batteryStatusNeedsPolling
+        guard shouldRun, needsPolling else {
+            stopBatteryPolling(reason: "notifications_active")
+            return
+        }
+        guard batteryRefreshWorkItem == nil else { return }
+        if !batteryPollingActive {
+            batteryPollingActive = true
+            AppLogger.shared.write(
+                "BLE BATTERY polling_started interval_ms=" +
+                    "\(Int((BluetoothBatteryPollingPolicy.interval * 1_000).rounded())) " +
+                    "level=\(batteryLevelNeedsPolling) power=\(batteryStatusNeedsPolling)"
+            )
+        }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.batteryRefreshWorkItem = nil
+            guard self.shouldRun,
+                  !self.systemSuspension.isSuspended,
+                  self.currentGeneration() == generation,
+                  self.lifecycle.isReady,
+                  let peripheral = self.peripheral,
+                  peripheral.state == .connected
+            else {
+                self.stopBatteryPolling(reason: "connection_inactive")
+                return
+            }
+            self.requestBatteryTelemetryRefresh(
+                peripheral: peripheral,
+                reason: "timer",
+                pollingOnly: true
+            )
+            self.updateBatteryPollingSchedule(generation: generation)
+        }
+        batteryRefreshWorkItem = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + BluetoothBatteryPollingPolicy.interval,
+            execute: work
+        )
+    }
+
+    private func stopBatteryPolling(reason: String) {
+        batteryRefreshWorkItem?.cancel()
+        batteryRefreshWorkItem = nil
+        guard batteryPollingActive else { return }
+        batteryPollingActive = false
+        AppLogger.shared.write("BLE BATTERY polling_stopped reason=\(reason)")
+    }
+
+    private func requestBatteryTelemetryRefresh(
+        peripheral: CBPeripheral,
+        reason: String,
+        pollingOnly: Bool
+    ) {
+        var requested: [String] = []
+        if let batteryCharacteristic,
+           !pollingOnly || batteryLevelNeedsPolling {
+            peripheral.readValue(for: batteryCharacteristic)
+            requested.append("level")
+        }
+        if let batteryStatusCharacteristic,
+           !pollingOnly || batteryStatusNeedsPolling {
+            peripheral.readValue(for: batteryStatusCharacteristic)
+            requested.append("power")
+        }
+        guard !requested.isEmpty else { return }
+        AppLogger.shared.write(
+            "BLE BATTERY refresh_requested reason=\(reason) " +
+                "fields=\(requested.joined(separator: ","))"
+        )
+    }
+
+    private func handleControl(_ data: Data) {
+        let controlAt = ProcessInfo.processInfo.systemUptime
+        let bytes = Array(data)
+        guard let opcode = bytes.first,
+              let generation = currentGeneration()
+        else { return }
+
+        switch opcode {
+        case 0x0B:
+            guard lifecycle.acceptsCapabilities(generation: generation) else {
+                AppLogger.shared.write("ATVV CAPS ignored_stale_phase")
+                return
+            }
+            guard let parsed = ATVVCapabilities.parse(data) else {
+                failInitialization(LocalizedMessage("connection.error.invalid_voice_response"))
+                return
+            }
+            capabilities = parsed
+            AppLogger.shared.write(
+                "ATVV CAPS version=\(parsed.version) codec=\(parsed.selectedCodec) frame=\(parsed.frameSize)"
+            )
+            if !ATVVProtocol.supportsAudio(sampleRate: parsed.sampleRate) {
+                rejectUnsupportedAudio(LocalizedMessage("connection.error.unsupported_16khz_codec"))
+                return
+            }
+            capabilitiesConfirmed = true
+            initializationTimeoutWorkItem?.cancel()
+            initializationTimeoutWorkItem = nil
+            reconnectPolicy.reset()
+            currentAttemptUsesCachedTarget = false
+            lifecycle = .ready(generation)
+            if let peripheral {
+                state = .ready(peripheral.name ?? "MI RC")
+                AppLogger.shared.write("BLE READY name=\(peripheral.name ?? "MI RC")")
+            }
+        case 0x08:
+            guard requestMicrophoneOpen() else {
+                AppLogger.shared.write("ATVV MIC_OPEN remote_request_ignored")
+                return
+            }
+            AppLogger.shared.write("ATVV MIC_OPEN remote_request")
+        case 0x04:
+            guard ATVVSessionGate.canOpenMicrophone(
+                phase: lifecycle,
+                generation: generation,
+                capabilitiesConfirmed: capabilitiesConfirmed,
+                sampleRate: capabilities.sampleRate
+            ) else {
+                diagnosticForAudio().rejectStart(reason: "protocol_not_ready")
+                AppLogger.shared.write("ATVV STREAM_START ignored_not_ready")
+                return
+            }
+            if bytes.count >= 3 {
+                let codec = bytes[2]
+                capabilities = ATVVCapabilities(
+                    version: capabilities.version,
+                    codecs: capabilities.codecs,
+                    interaction: bytes[1],
+                    frameSize: capabilities.frameSize,
+                    selectedCodec: codec,
+                    sampleRate: codec == 0x02 ? 16_000 : 8_000
+                )
+            }
+            guard ATVVProtocol.supportsAudio(sampleRate: capabilities.sampleRate) else {
+                rejectUnsupportedAudio(LocalizedMessage("connection.error.unsupported_8khz_codec"))
+                return
+            }
+            let receivedSessionID = bytes.count >= 4 ? bytes[3] : 0
+            if ATVVSessionGate.shouldIgnoreStreamAfterCancelledOpen(
+                cancelledAt: cancelledMicrophoneOpenAt
+            ) {
+                write(ATVVProtocol.microphoneClose(
+                    version: capabilities.version,
+                    sessionID: receivedSessionID
+                ))
+                diagnosticForAudio().rejectStart(reason: "cancelled_open")
+                AppLogger.shared.write(
+                    "ATVV STREAM_START ignored_cancelled session=\(receivedSessionID)"
+                )
+                return
+            }
+            cancelledMicrophoneOpenAt = nil
+            sessionID = receivedSessionID
+            startStreaming()
+            audioDiagnostics?.control(.start, at: controlAt)
+        case 0x00:
+            guard lifecycle.acceptsProtocolData(generation: generation) else { return }
+            audioDiagnostics?.control(.stop, at: controlAt)
+            stopStreaming()
+        case 0x0A:
+            guard lifecycle.acceptsProtocolData(generation: generation) else { return }
+            guard bytes.count >= 7 else { return }
+            audioDiagnostics?.control(.sync, at: controlAt)
+            let predictorBits = UInt16(bytes[4]) << 8 | UInt16(bytes[5])
+            let predictor = Int(Int16(bitPattern: predictorBits))
+            pendingSync = (predictor, Int(bytes[6]))
+            let partialFrameBytes = accumulator.pending.count
+            if partialFrameBytes > 0 {
+                AppLogger.shared.write(
+                    "ATVV FRAME discarded session=\(sessionID) reason=sync " +
+                        "partial_frame_bytes=\(partialFrameBytes)"
+                )
+            }
+            audioDiagnostics?.discardPartial(bytes: partialFrameBytes)
+            accumulator.reset()
+        default:
+            break
+        }
+    }
+
+    private func startStreaming(implicit: Bool = false) {
+        let previous = audioDiagnostics
+        if audioDiagnostics?.hasStopped == true { audioDiagnostics = nil }
+        let diagnostic = diagnosticForAudio()
+        if let previous, previous !== diagnostic { diagnostic.precededBy(previous) }
+        diagnostic.configure(generation: currentGeneration() ?? 0, version: capabilities.version,
+                             codec: capabilities.selectedCodec, frameBytes: capabilities.frameSize,
+                             sampleRate: capabilities.sampleRate)
+        diagnostic.start(
+            frameSamples: capabilities.frameSize * 2,
+            origin: implicit ? "implicit_audio" : (microphoneOpened ? "host_requested" : "remote_initiated")
+        )
+        let partialFrameBytes = accumulator.pending.count
+        if partialFrameBytes > 0 {
+            AppLogger.shared.write(
+                "ATVV FRAME discarded session=\(sessionID) reason=stream_start " +
+                    "streaming_before=\(streaming) partial_frame_bytes=\(partialFrameBytes)"
+            )
+        }
+        audioDiagnostics?.discardPartial(bytes: partialFrameBytes)
+        accumulator.reset()
+        pendingSync = nil
+        decoder.reset()
+        lastStopAt = nil
+        guard !streaming else { return }
+        streaming = true
+        delegate?.bluetoothBridgeDidStartVoice(self)
+        AppLogger.shared.write("ATVV STREAM START session=\(sessionID)")
+    }
+
+    private func stopStreaming() {
+        guard streaming else { return }
+        streaming = false
+        audioDiagnostics?.stop(reason: "remote_stop")
+        microphoneOpened = false
+        let partialFrameBytes = accumulator.pending.count
+        audioDiagnostics?.discardPartial(bytes: partialFrameBytes)
+        accumulator.reset()
+        pendingSync = nil
+        lastStopAt = Date()
+        AppLogger.shared.write(
+            "ATVV STREAM STOP session=\(sessionID) partial_frame_bytes=\(partialFrameBytes)"
+        )
+        delegate?.bluetoothBridgeDidStopVoice(self)
+    }
+
+    private func handleAudio(_ data: Data) {
+        guard let generation = currentGeneration(),
+              ATVVSessionGate.canOpenMicrophone(
+                phase: lifecycle,
+                generation: generation,
+                capabilitiesConfirmed: capabilitiesConfirmed,
+                sampleRate: capabilities.sampleRate
+              )
+        else {
+            audioDiagnostics?.reject(.notReady)
+            return
+        }
+        if ATVVSessionGate.shouldIgnoreStreamAfterCancelledOpen(
+            cancelledAt: cancelledMicrophoneOpenAt
+        ) {
+            audioDiagnostics?.reject(.cancelledOpen)
+            return
+        }
+        cancelledMicrophoneOpenAt = nil
+        if !streaming {
+            let receivedAt = Date()
+            if let lastStopAt, receivedAt.timeIntervalSince(lastStopAt) < 0.3 {
+                audioDiagnostics?.reject(.afterStop)
+                return
+            }
+            startStreaming(implicit: true)
+            AppLogger.shared.write("ATVV STREAM implicit_audio_race")
+        }
+
+        audioDiagnostics?.accept(bytes: data.count)
+        let frames = accumulator.append(data, frameSize: capabilities.frameSize)
+        for frame in frames {
+            if let pendingSync {
+                decoder.reset(
+                    predictor: pendingSync.predictor,
+                    stepIndex: pendingSync.stepIndex
+                )
+                self.pendingSync = nil
+            }
+            let decoded = decoder.decode(frame)
+            let samples = PCMPostprocessor.process(decoded, gainDB: settings.gainDB)
+            audioDiagnostics?.decoded(bytes: frame.count, samples: samples.count)
+            delegate?.bluetoothBridge(self, didDecode: samples)
+        }
+    }
+
+    private func rejectUnsupportedAudio(_ message: LocalizedMessage) {
+        diagnosticForAudio().rejectStart(reason: "unsupported_audio")
+        state = .failed(message)
+        closeMicrophoneIfNeeded()
+        if streaming {
+            stopStreaming()
+        } else {
+            accumulator.reset()
+            pendingSync = nil
+            decoder.reset()
+        }
+        scheduleReconnect(bypassCachedTarget: true)
+    }
+
+    private func failInitialization(_ message: LocalizedMessage) {
+        state = .failed(message)
+        accumulator.reset()
+        pendingSync = nil
+        decoder.reset()
+        scheduleReconnect(bypassCachedTarget: true)
+    }
+}
+
+extension XiaomiBluetoothBridge: CBCentralManagerDelegate {
+    func centralManagerDidUpdateState(_ central: CBCentralManager) {
+        guard self.central === central, let generation = centralGeneration else { return }
+        AppLogger.shared.write(
+            "BLE CENTRAL state=\(central.state.rawValue) " +
+                "lifecycle=\(String(describing: lifecycle)) " +
+                "generation=\(generation)"
+        )
+        switch central.state {
+        case .poweredOn:
+            applyCentralRecovery(
+                .poweredOn,
+                central: central,
+                generation: generation
+            )
+        case .poweredOff:
+            applyCentralRecovery(
+                .poweredOff,
+                central: central,
+                generation: generation
+            )
+            resetPeripheral()
+            state = .bluetoothUnavailable(LocalizedMessage("bluetooth.status.off"))
+        case .unauthorized:
+            applyCentralRecovery(
+                .unauthorized,
+                central: central,
+                generation: generation
+            )
+            resetSession()
+            state = .bluetoothUnavailable(LocalizedMessage("bluetooth.status.permission_denied"))
+        case .unsupported:
+            applyCentralRecovery(
+                .unsupported,
+                central: central,
+                generation: generation
+            )
+            state = .bluetoothUnavailable(LocalizedMessage("bluetooth.status.unsupported"))
+        case .resetting:
+            applyCentralRecovery(
+                .resetting,
+                central: central,
+                generation: generation
+            )
+            resetPeripheral()
+            state = .bluetoothUnavailable(LocalizedMessage("bluetooth.status.resetting"))
+        case .unknown:
+            state = .bluetoothUnavailable(LocalizedMessage("bluetooth.status.initializing"))
+        @unknown default:
+            state = .bluetoothUnavailable(LocalizedMessage("bluetooth.status.unavailable"))
+        }
+    }
+
+    private func applyCentralRecovery(
+        _ event: BluetoothCentralRecoveryEvent,
+        central: CBCentralManager,
+        generation: UInt64
+    ) {
+        let transition = BluetoothCentralRecoveryPolicy.transition(
+            from: lifecycle,
+            generation: generation,
+            event: event,
+            shouldRun: shouldRun
+        )
+        if transition.shouldCancelScheduledReconnect {
+            reconnectWorkItem?.cancel()
+            reconnectWorkItem = nil
+        }
+        lifecycle = transition.phase
+        if transition.shouldReleaseCentral {
+            resetPeripheral()
+            central.stopScan()
+            central.delegate = nil
+            self.central = nil
+            centralGeneration = nil
+            lifecycle = .stopped
+            return
+        }
+        guard !systemSuspension.isSuspended else {
+            if transition.shouldStartFreshConnectionCycle || transition.shouldDiscover {
+                systemSuspension.markConnectionCycleNeeded()
+            }
+            central.stopScan()
+            return
+        }
+        if transition.shouldStartFreshConnectionCycle {
+            startFreshConnectionCycle()
+            return
+        }
+        if transition.shouldDiscover {
+            discoverOrScan(using: central, generation: generation)
+        }
+    }
+
+    private func startFreshConnectionCycle() {
+        guard !systemSuspension.isSuspended else {
+            systemSuspension.markConnectionCycleNeeded()
+            central?.stopScan()
+            return
+        }
+        central?.stopScan()
+        central?.delegate = nil
+        central = nil
+        centralGeneration = nil
+        lifecycle = .stopped
+        beginConnectionCycle()
+    }
+
+    func centralManager(
+        _ central: CBCentralManager,
+        didDiscover peripheral: CBPeripheral,
+        advertisementData: [String: Any],
+        rssi RSSI: NSNumber
+    ) {
+        guard !systemSuspension.isSuspended, self.central === central else { return }
+        let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
+        let serviceMatch = (advertisementData[CBAdvertisementDataServiceUUIDsKey] as? [CBUUID])?
+            .contains(serviceUUID) == true
+        guard let generation = centralGeneration,
+              lifecycle == .scanning(generation),
+              self.peripheral == nil,
+              !excludedIdentifiers().contains(peripheral.identifier),
+              !rejectedIdentifiers.contains(peripheral.identifier)
+        else { return }
+        adopt(
+            peripheral,
+            using: central,
+            generation: generation,
+            source: "scan",
+            advertisesVoiceService: serviceMatch,
+            advertisedName: advertisedName
+        )
+    }
+
+    func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
+        guard self.central === central else { return }
+        guard shouldRun else {
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
+        // 最后一道闸：无论从哪条路径连上来的，只要名字说明它是别的产品就立刻断开。
+        // 前面几处判定可能因为「当时拿不到名字」而放行，这一层保证不会真的接管它。
+        if ForeignVoiceRemoteProduct.isRejected(name: peripheral.name) {
+            reject(peripheral, reason: "foreign_product", source: "did_connect")
+            central.cancelPeripheralConnection(peripheral)
+            return
+        }
+        guard isCurrent(peripheral),
+              let generation = centralGeneration,
+              lifecycle.acceptsDidConnect(generation: generation)
+        else { return }
+        guard !systemSuspension.isSuspended else {
+            systemSuspension.markConnectionCycleNeeded()
+            lifecycle = .disconnecting(generation)
+            central.cancelPeripheralConnection(peripheral)
+            AppLogger.shared.write("BLE CONNECT deferred reason=system_suspended")
+            return
+        }
+        connectionTimeoutWorkItem?.cancel()
+        connectionTimeoutWorkItem = nil
+        lifecycle = .discovering(generation)
+        state = .discovering
+        startInitializationTimeout(generation: generation)
+        peripheral.discoverServices([
+            serviceUUID,
+            batteryServiceUUID,
+            deviceInformationServiceUUID,
+        ])
+        AppLogger.shared.write("BLE CONNECTED name=\(peripheral.name ?? "unknown")")
+    }
+
+    func centralManager(
+        _ central: CBCentralManager,
+        didFailToConnect peripheral: CBPeripheral,
+        error: Error?
+    ) {
+        guard self.central === central,
+              isCurrent(peripheral),
+              let generation = centralGeneration,
+              lifecycle.acceptsDidFailToConnect(generation: generation)
+        else { return }
+        AppLogger.shared.write(
+            "BLE CONNECT FAILED " + AppLogger.optionalErrorFields(error)
+        )
+        let delay = reconnectDelayAfterFailure(
+            bypassCachedTarget: currentAttemptUsesCachedTarget
+        )
+        finishAttempt(reconnectAfter: delay)
+        if !shouldRun { state = .stopped }
+    }
+
+    func centralManager(
+        _ central: CBCentralManager,
+        didDisconnectPeripheral peripheral: CBPeripheral,
+        error: Error?
+    ) {
+        guard self.central === central,
+              isCurrent(peripheral),
+              let generation = centralGeneration,
+              lifecycle.acceptsDisconnect(generation: generation)
+        else { return }
+        handleDisconnect(error: error)
+    }
+
+    func centralManager(
+        _ central: CBCentralManager,
+        didDisconnectPeripheral peripheral: CBPeripheral,
+        timestamp: CFAbsoluteTime,
+        isReconnecting: Bool,
+        error: Error?
+    ) {
+        guard self.central === central,
+              isCurrent(peripheral),
+              let generation = centralGeneration,
+              lifecycle.acceptsDisconnect(generation: generation)
+        else { return }
+        handleDisconnect(error: error)
+    }
+
+    private func handleDisconnect(error: Error?) {
+        let shouldBypassCachedTarget: Bool
+        switch lifecycle {
+        case .connecting, .discovering, .awaitingCapabilities:
+            shouldBypassCachedTarget = true
+        default:
+            shouldBypassCachedTarget = false
+        }
+        AppLogger.shared.write(
+            "BLE DISCONNECTED phase=\(lifecycle) " + AppLogger.optionalErrorFields(error)
+        )
+        let delay = reconnectDelayAfterFailure(
+            bypassCachedTarget: shouldBypassCachedTarget || currentAttemptUsesCachedTarget
+        )
+        finishAttempt(reconnectAfter: delay)
+        if !shouldRun { state = .stopped }
+    }
+}
+
+extension XiaomiBluetoothBridge {
+    fileprivate func handleDiscoveredServices(
+        peripheral: CBPeripheral,
+        generation: UInt64,
+        error: Error?
+    ) {
+        guard shouldRun,
+              !systemSuspension.isSuspended,
+              isCurrent(peripheral),
+              currentGeneration() == generation,
+              lifecycle.acceptsInitializationCallback(generation: generation)
+        else { return }
+        if let error {
+            state = .failed(
+                LocalizedMessage(
+                    "connection.error.voice_service_discovery_failed",
+                    arguments: [error.localizedDescription]
+                )
+            )
+            scheduleReconnect(bypassCachedTarget: true)
+            return
+        }
+        guard let service = peripheral.services?.first(where: { $0.uuid == serviceUUID }) else {
+            state = .failed(LocalizedMessage("connection.error.voice_service_missing"))
+            scheduleReconnect(bypassCachedTarget: true)
+            return
+        }
+        peripheral.discoverCharacteristics(
+            [transmitUUID, audioUUID, controlUUID],
+            for: service
+        )
+        if let batteryService = peripheral.services?.first(where: { $0.uuid == batteryServiceUUID }) {
+            peripheral.discoverCharacteristics(
+                [batteryLevelUUID, batteryLevelStatusUUID],
+                for: batteryService
+            )
+        }
+        if let deviceInformationService = peripheral.services?.first(where: {
+            $0.uuid == deviceInformationServiceUUID
+        }) {
+            peripheral.discoverCharacteristics([modelNumberUUID], for: deviceInformationService)
+        }
+    }
+
+    fileprivate func handleDiscoveredCharacteristics(
+        peripheral: CBPeripheral,
+        generation: UInt64,
+        service: CBService,
+        error: Error?
+    ) {
+        let isOptionalService = service.uuid == batteryServiceUUID ||
+            service.uuid == deviceInformationServiceUUID
+        guard shouldRun,
+              (!systemSuspension.isSuspended || lifecycle.isReady),
+              isCurrent(peripheral),
+              currentGeneration() == generation,
+              isOptionalService
+                ? lifecycle.acceptsNotificationUpdate(generation: generation)
+                : lifecycle.acceptsInitializationCallback(generation: generation)
+        else { return }
+        if service.uuid == batteryServiceUUID {
+            if let error {
+                AppLogger.shared.write(
+                    "BLE BATTERY characteristic_discovery_failed " +
+                        AppLogger.errorFields(error)
+                )
+                delegate?.bluetoothBridge(self, didUpdateBatteryLevel: nil)
+                delegate?.bluetoothBridge(self, didUpdatePowerState: nil)
+                return
+            }
+            guard let characteristics = service.characteristics else {
+                delegate?.bluetoothBridge(self, didUpdateBatteryLevel: nil)
+                delegate?.bluetoothBridge(self, didUpdatePowerState: nil)
+                return
+            }
+            if let characteristic = characteristics.first(where: { $0.uuid == batteryLevelUUID }) {
+                batteryCharacteristic = characteristic
+                peripheral.readValue(for: characteristic)
+                let supportsNotifications = characteristic.properties.contains(.notify) ||
+                    characteristic.properties.contains(.indicate)
+                batteryLevelNeedsPolling = BluetoothBatteryPollingPolicy.shouldPoll(
+                    supportsNotifications: supportsNotifications,
+                    isNotifying: characteristic.isNotifying
+                )
+                if supportsNotifications {
+                    peripheral.setNotifyValue(true, for: characteristic)
+                }
+            } else {
+                delegate?.bluetoothBridge(self, didUpdateBatteryLevel: nil)
+            }
+            if let characteristic = characteristics.first(where: { $0.uuid == batteryLevelStatusUUID }) {
+                batteryStatusCharacteristic = characteristic
+                peripheral.readValue(for: characteristic)
+                let supportsNotifications = characteristic.properties.contains(.notify) ||
+                    characteristic.properties.contains(.indicate)
+                batteryStatusNeedsPolling = BluetoothBatteryPollingPolicy.shouldPoll(
+                    supportsNotifications: supportsNotifications,
+                    isNotifying: characteristic.isNotifying
+                )
+                if supportsNotifications {
+                    peripheral.setNotifyValue(true, for: characteristic)
+                }
+            } else {
+                delegate?.bluetoothBridge(self, didUpdatePowerState: nil)
+            }
+            updateBatteryPollingSchedule(generation: generation)
+            return
+        }
+        if service.uuid == deviceInformationServiceUUID {
+            if let error {
+                AppLogger.shared.write(
+                    "BLE MODEL characteristic_discovery_failed " +
+                        AppLogger.errorFields(error)
+                )
+                return
+            }
+            guard let characteristic = service.characteristics?.first(where: { $0.uuid == modelNumberUUID }) else {
+                return
+            }
+            peripheral.readValue(for: characteristic)
+            return
+        }
+        if let error {
+            state = .failed(
+                LocalizedMessage(
+                    "connection.error.voice_channel_discovery_failed",
+                    arguments: [error.localizedDescription]
+                )
+            )
+            scheduleReconnect(bypassCachedTarget: true)
+            return
+        }
+        for characteristic in service.characteristics ?? [] {
+            switch characteristic.uuid {
+            case transmitUUID:
+                transmitCharacteristic = characteristic
+            case audioUUID:
+                audioCharacteristic = characteristic
+                peripheral.setNotifyValue(true, for: characteristic)
+            case controlUUID:
+                controlCharacteristic = characteristic
+                peripheral.setNotifyValue(true, for: characteristic)
+            default:
+                continue
+            }
+        }
+        guard transmitCharacteristic != nil,
+              audioCharacteristic != nil,
+              controlCharacteristic != nil
+        else {
+            state = .failed(LocalizedMessage("connection.error.voice_channel_incomplete"))
+            scheduleReconnect(bypassCachedTarget: true)
+            return
+        }
+        requestCapabilitiesIfPossible()
+    }
+
+    fileprivate func handleNotificationState(
+        peripheral: CBPeripheral,
+        generation: UInt64,
+        characteristic: CBCharacteristic,
+        error: Error?
+    ) {
+        guard shouldRun,
+              (!systemSuspension.isSuspended || lifecycle.isReady),
+              isCurrent(peripheral),
+              currentGeneration() == generation,
+              lifecycle.acceptsNotificationUpdate(generation: generation)
+        else { return }
+        let isOptionalCharacteristic = characteristic.uuid == batteryLevelUUID ||
+            characteristic.uuid == batteryLevelStatusUUID
+        if isOptionalCharacteristic {
+            let supportsNotifications = characteristic.properties.contains(.notify) ||
+                characteristic.properties.contains(.indicate)
+            let needsPolling = BluetoothBatteryPollingPolicy.shouldPoll(
+                supportsNotifications: supportsNotifications,
+                isNotifying: error == nil && characteristic.isNotifying
+            )
+            if characteristic.uuid == batteryLevelUUID {
+                batteryLevelNeedsPolling = needsPolling
+            } else {
+                batteryStatusNeedsPolling = needsPolling
+            }
+            if let error {
+                AppLogger.shared.write(
+                    "BLE BATTERY notification_failed uuid=\(characteristic.uuid.uuidString) " +
+                        AppLogger.errorFields(error)
+                )
+            }
+            updateBatteryPollingSchedule(generation: generation)
+            return
+        }
+        if let error {
+            state = .failed(
+                LocalizedMessage(
+                    "connection.error.voice_channel_subscription_failed",
+                    arguments: [error.localizedDescription]
+                )
+            )
+            scheduleReconnect(bypassCachedTarget: true)
+            return
+        }
+        guard characteristic.uuid == audioUUID || characteristic.uuid == controlUUID else {
+            return
+        }
+        guard characteristic.isNotifying else {
+            subscribedUUIDs.remove(characteristic.uuid)
+            failInitialization(LocalizedMessage("connection.error.voice_channel_subscription_inactive"))
+            return
+        }
+        subscribedUUIDs.insert(characteristic.uuid)
+        requestCapabilitiesIfPossible()
+    }
+
+    fileprivate func handleCharacteristicValue(
+        peripheral: CBPeripheral,
+        generation: UInt64,
+        characteristic: CBCharacteristic,
+        error: Error?
+    ) {
+        let callbackAt = ProcessInfo.processInfo.systemUptime
+        let diagnostic = characteristic.uuid == audioUUID ? diagnosticForAudio() : nil
+        diagnostic?.receive(
+            bytes: error == nil ? (characteristic.value?.count ?? 0) : 0,
+            frameSize: capabilities.frameSize,
+            at: callbackAt
+        )
+        defer { diagnostic?.handlerFinished(since: callbackAt) }
+        guard shouldRun,
+              isCurrent(peripheral),
+              currentGeneration() == generation
+        else {
+            diagnostic?.reject(!shouldRun ? .stopped : (isCurrent(peripheral) ? .staleGeneration : .stalePeripheral))
+            return
+        }
+        if let error {
+            diagnostic?.reject(.callbackError, errorFields: AppLogger.errorFields(error))
+            if characteristic.uuid == batteryLevelUUID {
+                AppLogger.shared.write(
+                    "BLE BATTERY read_failed " + AppLogger.errorFields(error)
+                )
+                hasObservedBatteryLevel = false
+                lastObservedBatteryLevel = nil
+                delegate?.bluetoothBridge(self, didUpdateBatteryLevel: nil)
+            } else if characteristic.uuid == batteryLevelStatusUUID {
+                AppLogger.shared.write(
+                    "BLE POWER read_failed " + AppLogger.errorFields(error)
+                )
+                hasObservedPowerState = false
+                lastObservedPowerState = nil
+                delegate?.bluetoothBridge(self, didUpdatePowerState: nil)
+            } else if characteristic.uuid == modelNumberUUID {
+                AppLogger.shared.write(
+                    "BLE MODEL read_failed " + AppLogger.errorFields(error)
+                )
+            }
+            return
+        }
+        guard let data = characteristic.value else {
+            diagnostic?.reject(.missingValue)
+            return
+        }
+        if characteristic.uuid == batteryLevelUUID {
+            let level = data.first.map(Int.init)
+            guard !hasObservedBatteryLevel || lastObservedBatteryLevel != level else { return }
+            hasObservedBatteryLevel = true
+            lastObservedBatteryLevel = level
+            AppLogger.shared.write("BLE BATTERY level=\(level.map(String.init) ?? "unknown")")
+            delegate?.bluetoothBridge(self, didUpdateBatteryLevel: level)
+            return
+        }
+        if characteristic.uuid == batteryLevelStatusUUID {
+            let powerState = RemotePowerState.decodeBatteryLevelStatus(data)
+            guard !hasObservedPowerState || lastObservedPowerState != powerState else { return }
+            hasObservedPowerState = true
+            lastObservedPowerState = powerState
+            AppLogger.shared.write(
+                "BLE POWER state=\(powerState?.logValue ?? "unavailable")"
+            )
+            delegate?.bluetoothBridge(self, didUpdatePowerState: powerState)
+            return
+        }
+        if characteristic.uuid == modelNumberUUID {
+            guard let modelNumber = String(data: data, encoding: .utf8) else {
+                AppLogger.shared.write("BLE MODEL unreadable")
+                return
+            }
+            let normalizedModelNumber = modelNumber.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            if normalizedModelNumber.contains("ARN9") {
+                // ARN9 firmware encodes ADPCM low-nibble-first; flipping the
+                // default high-first order is required for intelligible audio.
+                decoder.lowNibbleFirst = true
+                AppLogger.shared.write("BLE MODEL ARN9 adpcm=low-nibble-first")
+            }
+            guard let model = XiaomiRemoteModel.identified(by: modelNumber) else {
+                AppLogger.shared.write("BLE MODEL unrecognized modelNumber=\(normalizedModelNumber)")
+                return
+            }
+            // 原始型号串必须一起记：广播名与型号**不是**一一对应（本机这台广播名是
+            // 「小米蓝牙语音遥控器」，DIS 报的却是 RC003），只有原始串能支撑型号目录。
+            AppLogger.shared.write(
+                "BLE MODEL identified=\(model.rawValue) modelNumber=\(normalizedModelNumber)"
+            )
+            delegate?.bluetoothBridge(self, didIdentifyRemoteModel: model)
+            return
+        }
+        if characteristic.uuid == controlUUID {
+            guard lifecycle.acceptsCapabilities(generation: generation) ||
+                    lifecycle.acceptsProtocolData(generation: generation)
+            else { return }
+            handleControl(data)
+        } else if characteristic.uuid == audioUUID {
+            guard lifecycle.acceptsProtocolData(generation: generation) else {
+                diagnostic?.reject(.lifecycle)
+                return
+            }
+            handleAudio(data)
+        }
+    }
+}

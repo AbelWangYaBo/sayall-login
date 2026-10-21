@@ -1,0 +1,293 @@
+#!/bin/zsh
+set -euo pipefail
+
+ROOT="${0:A:h:h}"
+source "$ROOT/scripts/release-variant.sh"
+OUTPUT_DIR="$RELEASE_OUTPUT_DIR"
+DRIVER="$OUTPUT_DIR/MiRemoteV2ch.driver"
+LEGACY_DRIVER="$OUTPUT_DIR/legacy/MiRemoteV2ch.driver"
+APP="$OUTPUT_DIR/SayAll.app"
+APPLE_REMOTE_HCI_SERVICE="$APP/Contents/Helpers/SayAllAppleRemoteHCIService"
+APPLE_REMOTE_HCI_PLIST="$ROOT/packaging/apple-remote-hci/com.hd838a.SayAll.AppleRemoteHCIService.plist"
+VERSION="$(/usr/bin/plutil -extract CFBundleShortVersionString raw -o - "$ROOT/Resources/Info.plist")"
+BUILD="$(/usr/bin/plutil -extract CFBundleVersion raw -o - "$ROOT/Resources/Info.plist")"
+INSTALL_PACKAGE="$OUTPUT_DIR/$RELEASE_INSTALL_PACKAGE_NAME"
+LEGACY_INSTALL_PACKAGE="$OUTPUT_DIR/安装豆包兼容麦克风.pkg"
+UNINSTALL_PACKAGE="$OUTPUT_DIR/$RELEASE_UNINSTALL_PACKAGE_NAME"
+LEGACY_UNINSTALL_PACKAGE="$OUTPUT_DIR/卸载豆包兼容麦克风.pkg"
+INSTALLER_SIGNING_IDENTITY="${INSTALLER_SIGNING_IDENTITY:--}"
+REQUIRE_DEVELOPER_ID_SIGNING="${REQUIRE_DEVELOPER_ID_SIGNING:-0}"
+RELEASE_STAGE_TIMEOUTS="${RELEASE_STAGE_TIMEOUTS:-0}"
+RELEASE_PKGBUILD_TIMEOUT_SECONDS="${RELEASE_PKGBUILD_TIMEOUT_SECONDS:-90}"
+RELEASE_PRODUCTBUILD_TIMEOUT_SECONDS="${RELEASE_PRODUCTBUILD_TIMEOUT_SECONDS:-90}"
+RELEASE_PRODUCTSIGN_TIMEOUT_SECONDS="${RELEASE_PRODUCTSIGN_TIMEOUT_SECONDS:-45}"
+INSTALLER_SIGNING_LOCK_TIMEOUT_SECONDS="${INSTALLER_SIGNING_LOCK_TIMEOUT_SECONDS:-30}"
+INSTALLER_SIGNING_LOCK_PATH="${INSTALLER_SIGNING_LOCK_PATH:-/private/tmp/remote-mic-installer-signing.lock}"
+RELEASE_STAGE_RUNNER="$ROOT/scripts/run-release-stage.sh"
+WORK_DIR="$(/usr/bin/mktemp -d "$OUTPUT_DIR/.doubao-driver-package.XXXXXX")"
+PAYLOAD_ROOT="$WORK_DIR/payload"
+SIRI_REMOTE_PAYLOAD_ROOT="$WORK_DIR/siri-remote-payload"
+INSTALL_SCRIPTS="$WORK_DIR/install-scripts"
+SIRI_REMOTE_INSTALL_SCRIPTS="$WORK_DIR/siri-remote-install-scripts"
+UNINSTALL_SCRIPTS="$WORK_DIR/uninstall-scripts"
+COMPONENT_PLIST="$WORK_DIR/components.plist"
+INSTALL_COMPONENT_PACKAGE="$WORK_DIR/RemoteMicComponent.pkg"
+SIRI_REMOTE_COMPONENT_PACKAGE="$WORK_DIR/SiriRemoteComponent.pkg"
+UNSIGNED_INSTALL_PACKAGE="$WORK_DIR/Install SayAll-unsigned.pkg"
+UNSIGNED_UNINSTALL_PACKAGE="$WORK_DIR/Uninstall SayAll-unsigned.pkg"
+SIGNING_PROBE_UNSIGNED_PACKAGE="$WORK_DIR/Installer Signing Probe-unsigned.pkg"
+SIGNING_PROBE_PACKAGE="$WORK_DIR/Installer Signing Probe.pkg"
+DISTRIBUTION="$ROOT/packaging/doubao-driver/distribution/$RELEASE_VARIANT.xml"
+DISTRIBUTION_RESOURCES="$ROOT/packaging/doubao-driver/distribution/Resources"
+
+move_existing_path_to_trash() {
+  local source_path="$1"
+  local label="$2"
+  local developer_user developer_home trash_root destination counter=0
+  [[ -e "$source_path" || -L "$source_path" ]] || return 0
+  developer_user="$(/usr/bin/id -un)"
+  developer_home="$(/usr/bin/dscl . -read "/Users/$developer_user" NFSHomeDirectory \
+    2>/dev/null | /usr/bin/sed -n 's/^NFSHomeDirectory: //p')"
+  if [[ "$developer_home" != /* || "$developer_home" == "/" || \
+        "$developer_home" == *'/../'* || "$developer_home" == *'/..' ]]; then
+    print -u2 "refusing to move $label because the developer Trash path is invalid"
+    return 1
+  fi
+  trash_root="$developer_home/.Trash"
+  /bin/mkdir -p -- "$trash_root"
+  destination="$trash_root/$label-$(/bin/date -u +%Y%m%dT%H%M%SZ)-$$"
+  while [[ -e "$destination" || -L "$destination" ]]; do
+    counter=$((counter + 1))
+    destination="$trash_root/$label-$(/bin/date -u +%Y%m%dT%H%M%SZ)-$$-$counter"
+  done
+  /bin/mv -n -- "$source_path" "$destination"
+  print "Moved previous $label to Trash: $destination"
+}
+
+cleanup() {
+  case "$WORK_DIR" in
+    "$OUTPUT_DIR/.doubao-driver-package."*)
+      move_existing_path_to_trash "$WORK_DIR" "sayall-driver-package-work"
+      ;;
+    *) print -u2 "refusing to clean unexpected work path: $WORK_DIR" ;;
+  esac
+}
+trap cleanup EXIT
+
+test -x /usr/bin/pkgbuild
+test -x /usr/bin/productbuild
+test -f "$DISTRIBUTION"
+test -d "$DISTRIBUTION_RESOURCES/en.lproj"
+test -d "$DISTRIBUTION_RESOURCES/zh-Hans.lproj"
+case "$REQUIRE_DEVELOPER_ID_SIGNING" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_DEVELOPER_ID_SIGNING must be 0 or 1"; exit 1 ;;
+esac
+case "$RELEASE_STAGE_TIMEOUTS" in
+  0|1) ;;
+  *) print -u2 "RELEASE_STAGE_TIMEOUTS must be 0 or 1"; exit 1 ;;
+esac
+if [[ "$RELEASE_STAGE_TIMEOUTS" == "1" && ! -x "$RELEASE_STAGE_RUNNER" ]]; then
+  print -u2 "release stage runner is unavailable"
+  exit 1
+fi
+if ! print -r -- "$INSTALLER_SIGNING_LOCK_TIMEOUT_SECONDS" | \
+    /usr/bin/grep -Eq '^[1-9][0-9]*$'; then
+  print -u2 "INSTALLER_SIGNING_LOCK_TIMEOUT_SECONDS must be a positive integer"
+  exit 1
+fi
+if (( INSTALLER_SIGNING_LOCK_TIMEOUT_SECONDS >= RELEASE_PRODUCTSIGN_TIMEOUT_SECONDS )); then
+  print -u2 "Installer signing lock timeout must be shorter than the productsign stage timeout"
+  exit 1
+fi
+case "$INSTALLER_SIGNING_LOCK_PATH" in
+  /private/tmp/*.lock) ;;
+  *) print -u2 "INSTALLER_SIGNING_LOCK_PATH must be an explicit lock file under /private/tmp"; exit 1 ;;
+esac
+
+run_release_stage() {
+  local stage="$1"
+  local timeout_seconds="$2"
+  shift 2
+  if [[ "$RELEASE_STAGE_TIMEOUTS" == "1" ]]; then
+    "$RELEASE_STAGE_RUNNER" "$RELEASE_VARIANT" "$stage" "$timeout_seconds" -- "$@"
+  else
+    "$@"
+  fi
+}
+
+write_package_build_metadata() {
+  local plist_path="$1"
+  if ! /usr/bin/plutil -replace PackageBuild -string "$BUILD" "$plist_path" 2>/dev/null; then
+    /usr/bin/plutil -insert PackageBuild -string "$BUILD" "$plist_path"
+  fi
+}
+
+run_locked_productsign() {
+  local stage="$1"
+  local input_package="$2"
+  local output_package="$3"
+  run_release_stage "$stage" "$RELEASE_PRODUCTSIGN_TIMEOUT_SECONDS" \
+    /usr/bin/lockf -k -t "$INSTALLER_SIGNING_LOCK_TIMEOUT_SECONDS" \
+    "$INSTALLER_SIGNING_LOCK_PATH" \
+    /usr/bin/productsign --sign "$INSTALLER_SIGNING_IDENTITY" \
+    "$input_package" "$output_package"
+}
+if [[ "$REQUIRE_DEVELOPER_ID_SIGNING" == "1" && "$INSTALLER_SIGNING_IDENTITY" == "-" ]]; then
+  print -u2 "Developer ID Installer signing is required"
+  exit 1
+fi
+"$ROOT/scripts/verify-doubao-driver.sh" "$DRIVER" brand
+"$ROOT/scripts/verify-doubao-driver.sh" "$LEGACY_DRIVER" legacy
+"$ROOT/scripts/verify-app.sh" "$APP"
+if [[ ! -x "$APPLE_REMOTE_HCI_SERVICE" ]]; then
+  print -u2 "Siri Remote helper is missing from the release App; configure SAYALL_SIRI_REMOTE_PACKAGE_PATH before building the Installer package"
+  exit 1
+fi
+test -f "$APPLE_REMOTE_HCI_PLIST"
+/usr/bin/plutil -lint "$APPLE_REMOTE_HCI_PLIST"
+
+move_existing_path_to_trash "$INSTALL_PACKAGE" "${INSTALL_PACKAGE:t}"
+move_existing_path_to_trash "$LEGACY_INSTALL_PACKAGE" "${LEGACY_INSTALL_PACKAGE:t}"
+move_existing_path_to_trash "$UNINSTALL_PACKAGE" "${UNINSTALL_PACKAGE:t}"
+move_existing_path_to_trash "$LEGACY_UNINSTALL_PACKAGE" "${LEGACY_UNINSTALL_PACKAGE:t}"
+/bin/mkdir -p \
+  "$PAYLOAD_ROOT/Applications" \
+  "$PAYLOAD_ROOT/Library/Application Support/RemoteMic/Installer" \
+  "$SIRI_REMOTE_PAYLOAD_ROOT/Library/LaunchDaemons" \
+  "$SIRI_REMOTE_PAYLOAD_ROOT/Library/PrivilegedHelperTools"
+/usr/bin/ditto --norsrc --noextattr --noqtn --noacl \
+  "$APP" "$PAYLOAD_ROOT/Applications/SayAll.app"
+/usr/bin/ditto --norsrc --noextattr --noqtn --noacl \
+  "$DRIVER" \
+  "$PAYLOAD_ROOT/Library/Application Support/RemoteMic/Installer/MiRemoteV2ch.driver"
+/usr/bin/ditto --norsrc --noextattr --noqtn --noacl \
+  "$LEGACY_DRIVER" \
+  "$PAYLOAD_ROOT/Library/Application Support/RemoteMic/Installer/legacy/MiRemoteV2ch.driver"
+/usr/bin/ditto --norsrc --noextattr --noqtn --noacl \
+  "$ROOT/packaging/doubao-driver/install" "$INSTALL_SCRIPTS"
+/usr/bin/ditto --norsrc --noextattr --noqtn --noacl \
+  "$APPLE_REMOTE_HCI_SERVICE" \
+  "$SIRI_REMOTE_PAYLOAD_ROOT/Library/PrivilegedHelperTools/com.hd838a.SayAll.AppleRemoteHCIService"
+/usr/bin/ditto --norsrc --noextattr --noqtn --noacl \
+  "$APPLE_REMOTE_HCI_PLIST" \
+  "$SIRI_REMOTE_PAYLOAD_ROOT/Library/LaunchDaemons/com.hd838a.SayAll.AppleRemoteHCIService.plist"
+/usr/bin/ditto --norsrc --noextattr --noqtn --noacl \
+  "$ROOT/packaging/doubao-driver/siri-remote/install" "$SIRI_REMOTE_INSTALL_SCRIPTS"
+/usr/bin/ditto --norsrc --noextattr --noqtn --noacl \
+  "$RELEASE_CONFIG_PLIST" "$INSTALL_SCRIPTS/release-variant.plist"
+/usr/bin/ditto --norsrc --noextattr --noqtn --noacl \
+  "$RELEASE_CONFIG_PLIST" "$SIRI_REMOTE_INSTALL_SCRIPTS/release-variant.plist"
+write_package_build_metadata "$INSTALL_SCRIPTS/release-variant.plist"
+write_package_build_metadata "$SIRI_REMOTE_INSTALL_SCRIPTS/release-variant.plist"
+/usr/bin/ditto --norsrc --noextattr --noqtn --noacl \
+  "$ROOT/packaging/doubao-driver/uninstall" "$UNINSTALL_SCRIPTS"
+
+run_release_stage installer-component-analysis "$RELEASE_PKGBUILD_TIMEOUT_SECONDS" \
+  /usr/bin/pkgbuild \
+  --analyze \
+  --root "$PAYLOAD_ROOT" \
+  "$COMPONENT_PLIST"
+
+APP_COMPONENT_INDEX=-1
+DRIVER_COMPONENT_COUNT=0
+component_index=0
+while true; do
+  bundle_path="$(/usr/libexec/PlistBuddy \
+    -c "Print :$component_index:RootRelativeBundlePath" \
+    "$COMPONENT_PLIST" 2>/dev/null || true)"
+  [[ -z "$bundle_path" ]] && break
+  if [[ "$bundle_path" == "Applications/SayAll.app" ||
+        "$bundle_path" == "Library/Application Support/RemoteMic/Installer/MiRemoteV2ch.driver" ||
+        "$bundle_path" == "Library/Application Support/RemoteMic/Installer/legacy/MiRemoteV2ch.driver" ]]; then
+    if ! /usr/libexec/PlistBuddy \
+      -c "Set :$component_index:BundleIsRelocatable false" \
+      "$COMPONENT_PLIST" 2>/dev/null; then
+      /usr/libexec/PlistBuddy \
+        -c "Add :$component_index:BundleIsRelocatable bool false" \
+        "$COMPONENT_PLIST"
+    fi
+    if [[ "$bundle_path" == "Applications/SayAll.app" ]]; then
+      APP_COMPONENT_INDEX="$component_index"
+    else
+      # HAL selection belongs to postinstall. Installer must neither relocate
+      # these same-identity candidates nor skip one on bundle version checks.
+      /usr/libexec/PlistBuddy -c "Set :$component_index:BundleIsVersionChecked false" "$COMPONENT_PLIST"
+      DRIVER_COMPONENT_COUNT=$((DRIVER_COMPONENT_COUNT + 1))
+    fi
+  fi
+  component_index=$((component_index + 1))
+done
+if [[ "$APP_COMPONENT_INDEX" -lt 0 || "$DRIVER_COMPONENT_COUNT" -ne 2 ]]; then
+  print -u2 "unable to identify the App and both driver candidates in the generated plist"
+  exit 1
+fi
+
+run_release_stage installer-component-pkgbuild "$RELEASE_PKGBUILD_TIMEOUT_SECONDS" \
+  /usr/bin/pkgbuild \
+  --root "$PAYLOAD_ROOT" \
+  --scripts "$INSTALL_SCRIPTS" \
+  --component-plist "$COMPONENT_PLIST" \
+  --identifier "com.hd838a.RemoteMic.installer" \
+  --version "$VERSION" \
+  --install-location / \
+  --ownership recommended \
+  "$INSTALL_COMPONENT_PACKAGE"
+
+run_release_stage siri-remote-component-pkgbuild "$RELEASE_PKGBUILD_TIMEOUT_SECONDS" \
+  /usr/bin/pkgbuild \
+  --root "$SIRI_REMOTE_PAYLOAD_ROOT" \
+  --scripts "$SIRI_REMOTE_INSTALL_SCRIPTS" \
+  --identifier "com.hd838a.RemoteMic.siri-remote" \
+  --version "$VERSION" \
+  --install-location / \
+  --ownership recommended \
+  "$SIRI_REMOTE_COMPONENT_PACKAGE"
+
+run_release_stage installer-productbuild "$RELEASE_PRODUCTBUILD_TIMEOUT_SECONDS" \
+  /usr/bin/productbuild \
+  --distribution "$DISTRIBUTION" \
+  --resources "$DISTRIBUTION_RESOURCES" \
+  --package-path "$WORK_DIR" \
+  "$UNSIGNED_INSTALL_PACKAGE"
+
+run_release_stage uninstaller-pkgbuild "$RELEASE_PKGBUILD_TIMEOUT_SECONDS" \
+  /usr/bin/pkgbuild \
+  --nopayload \
+  --scripts "$UNINSTALL_SCRIPTS" \
+  --identifier "com.hd838a.MiRemoteV2ch.uninstaller" \
+  --version "$VERSION" \
+  "$UNSIGNED_UNINSTALL_PACKAGE"
+
+if [[ "$INSTALLER_SIGNING_IDENTITY" != "-" ]]; then
+  test -x /usr/bin/lockf
+  test -x /usr/bin/productsign
+  run_release_stage installer-signing-probe-pkgbuild 30 \
+    /usr/bin/pkgbuild \
+    --nopayload \
+    --identifier "com.hd838a.RemoteMic.installer-signing-probe" \
+    --version "$VERSION" \
+    "$SIGNING_PROBE_UNSIGNED_PACKAGE"
+  run_locked_productsign installer-signing-probe-productsign \
+    "$SIGNING_PROBE_UNSIGNED_PACKAGE" "$SIGNING_PROBE_PACKAGE"
+  PROBE_SIGNATURE_DETAILS="$(/usr/sbin/pkgutil --check-signature \
+    "$SIGNING_PROBE_PACKAGE" 2>&1)"
+  print -r -- "$PROBE_SIGNATURE_DETAILS" | \
+    rg -q 'Status: signed by a developer certificate issued by Apple for distribution'
+  run_locked_productsign installer-productsign \
+    "$UNSIGNED_INSTALL_PACKAGE" "$INSTALL_PACKAGE"
+  run_locked_productsign uninstaller-productsign \
+    "$UNSIGNED_UNINSTALL_PACKAGE" "$UNINSTALL_PACKAGE"
+else
+  /bin/mv "$UNSIGNED_INSTALL_PACKAGE" "$INSTALL_PACKAGE"
+  /bin/mv "$UNSIGNED_UNINSTALL_PACKAGE" "$UNINSTALL_PACKAGE"
+fi
+
+"$ROOT/scripts/verify-doubao-driver-pkg.sh" "$INSTALL_PACKAGE" install
+"$ROOT/scripts/verify-doubao-driver-pkg.sh" "$UNINSTALL_PACKAGE" uninstall
+
+print "Built: $INSTALL_PACKAGE"
+print "Built: $UNINSTALL_PACKAGE"
+print "RELEASE VARIANT: $RELEASE_VARIANT"
+print "INSTALLER SIGNING IDENTITY: $INSTALLER_SIGNING_IDENTITY"
+print "APP VERSION: $VERSION ($BUILD)"

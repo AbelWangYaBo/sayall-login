@@ -1,0 +1,673 @@
+#!/bin/zsh
+set -euo pipefail
+
+ROOT="${0:A:h:h}"
+source "$ROOT/scripts/release-variant.sh"
+if [[ "$#" -gt 1 ]]; then
+  print -u2 "usage: $0 [APP]"
+  exit 1
+fi
+APP="${1:-$RELEASE_OUTPUT_DIR/SayAll.app}"
+PLIST="$APP/Contents/Info.plist"
+BINARY="$APP/Contents/MacOS/RemoteMic"
+MCP_HELPER="$APP/Contents/Helpers/SayAllMCP"
+APPLE_REMOTE_AUDIO_HELPER="$APP/Contents/Helpers/SayAllAppleRemoteAudioCapture"
+APPLE_REMOTE_HCI_SERVICE="$APP/Contents/Helpers/SayAllAppleRemoteHCIService"
+APPLE_REMOTE_HCI_UPGRADE_SERVICE="$APP/Contents/Library/LaunchServices/com.hd838a.SayAll.AppleRemoteHCIService"
+OPUS_DYLIB="$APP/Contents/Frameworks/libopus.0.dylib"
+SPARKLE_FRAMEWORK="$APP/Contents/Frameworks/Sparkle.framework"
+APP_ICON="$APP/Contents/Resources/AppIcon.icns"
+ICON_SOURCE="$ROOT/Resources/AppIcon.png"
+EXPECTED_ICON_ICNS="$ROOT/Resources/AppIcon.icns"
+ICON_CORNER_STYLE="opaque"
+if [[ "$RELEASE_VARIANT" == "intel" ]]; then
+  APP_ICON="$APP/Contents/Resources/AppIcon.icns"
+  ICON_SOURCE="$ROOT/Resources/AppIcons/faceted-duck.png"
+  EXPECTED_ICON_ICNS="$ROOT/Resources/AppIcon-intel.icns"
+  ICON_CORNER_STYLE="transparent"
+fi
+EXPECTED_DEVELOPER_TEAM_ID="${EXPECTED_DEVELOPER_TEAM_ID:-}"
+REQUIRE_DEVELOPER_ID_SIGNING="${REQUIRE_DEVELOPER_ID_SIGNING:-0}"
+REQUIRE_NOTARIZATION="${REQUIRE_NOTARIZATION:-0}"
+REQUIRE_SAYALL_AI_PACKAGE="${REQUIRE_SAYALL_AI_PACKAGE:-0}"
+REQUIRE_SAYALL_COMBINATION_ACTIONS="${REQUIRE_SAYALL_COMBINATION_ACTIONS:-0}"
+REQUIRE_SAYALL_BUTTON_PROFILES="${REQUIRE_SAYALL_BUTTON_PROFILES:-0}"
+REQUIRE_SAYALL_PRIVATE_ARTIFACT_PACKAGE="${REQUIRE_SAYALL_PRIVATE_ARTIFACT_PACKAGE:-0}"
+REQUIRE_SAYALL_BUTTON_PROFILES_TEST_ACCESS="${REQUIRE_SAYALL_BUTTON_PROFILES_TEST_ACCESS:-0}"
+REQUIRE_DIAGNOSTIC_PUBLIC_KEY="${REQUIRE_DIAGNOSTIC_PUBLIC_KEY:-0}"
+REQUIRE_DIAGNOSTIC_SERVICE="${REQUIRE_DIAGNOSTIC_SERVICE:-0}"
+REQUIRE_RELEASE_BUILD_CHANNEL="${REQUIRE_RELEASE_BUILD_CHANNEL:-0}"
+
+case "$REQUIRE_DEVELOPER_ID_SIGNING" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_DEVELOPER_ID_SIGNING must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_NOTARIZATION" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_NOTARIZATION must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_SAYALL_AI_PACKAGE" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_SAYALL_AI_PACKAGE must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_SAYALL_COMBINATION_ACTIONS" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_SAYALL_COMBINATION_ACTIONS must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_SAYALL_BUTTON_PROFILES" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_SAYALL_BUTTON_PROFILES must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_SAYALL_PRIVATE_ARTIFACT_PACKAGE" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_SAYALL_PRIVATE_ARTIFACT_PACKAGE must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_SAYALL_BUTTON_PROFILES_TEST_ACCESS" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_SAYALL_BUTTON_PROFILES_TEST_ACCESS must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_DIAGNOSTIC_PUBLIC_KEY" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_DIAGNOSTIC_PUBLIC_KEY must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_DIAGNOSTIC_SERVICE" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_DIAGNOSTIC_SERVICE must be 0 or 1"; exit 1 ;;
+esac
+case "$REQUIRE_RELEASE_BUILD_CHANNEL" in
+  0|1) ;;
+  *) print -u2 "REQUIRE_RELEASE_BUILD_CHANNEL must be 0 or 1"; exit 1 ;;
+esac
+if [[ "$REQUIRE_DEVELOPER_ID_SIGNING" == "1" && -z "$EXPECTED_DEVELOPER_TEAM_ID" ]]; then
+  print -u2 "EXPECTED_DEVELOPER_TEAM_ID is required for Developer ID verification"
+  exit 1
+fi
+if [[ "$REQUIRE_NOTARIZATION" == "1" && "$REQUIRE_DEVELOPER_ID_SIGNING" != "1" ]]; then
+  print -u2 "notarization verification requires Developer ID verification"
+  exit 1
+fi
+
+test -d "$APP"
+test -f "$PLIST"
+test -x "$BINARY"
+test -x "$MCP_HELPER"
+if /usr/bin/plutil -extract CFBundleIconName raw -o - "$PLIST" >/dev/null 2>&1; then
+  print -u2 "App must not declare CFBundleIconName; use the legacy ICNS path"
+  exit 1
+fi
+if [[ -e "$APP/Contents/Resources/Assets.car" ]]; then
+  print -u2 "App must not package Assets.car for the legacy ICNS path"
+  exit 1
+fi
+FORBIDDEN_ICON_RESOURCES=("$APP/Contents/Resources"/*.icon(N))
+if (( ${#FORBIDDEN_ICON_RESOURCES} > 0 )); then
+  print -u2 "App must not package .icon resources for the legacy ICNS path"
+  exit 1
+fi
+SAYALL_SIRI_REMOTE_INCLUDED="$(plutil -extract SayAllSiriRemoteIncluded raw -o - "$PLIST" 2>/dev/null || true)"
+SAYALL_SIRI_REMOTE_RESOURCE_BUNDLE="$APP/Contents/Resources/SayAllSiriRemote_SayAllSiriRemote.bundle"
+SAYALL_CHROMECAST_RESOURCE_BUNDLE="$APP/Contents/Resources/SayAllChromecast_SayAllChromecast.bundle"
+case "$SAYALL_SIRI_REMOTE_INCLUDED" in
+  true)
+    test -x "$APPLE_REMOTE_AUDIO_HELPER"
+    test -x "$APPLE_REMOTE_HCI_SERVICE"
+    test -f "$OPUS_DYLIB"
+    test -d "$SAYALL_SIRI_REMOTE_RESOURCE_BUNDLE"
+    SIRI_REMOTE_SIGNATURE_DETAILS="$(codesign -dvvv "$APP" 2>&1)"
+    print -r -- "$SIRI_REMOTE_SIGNATURE_DETAILS" | rg -q '^Authority=Developer ID Application:' || {
+      print -u2 "Siri Remote voice app must use Developer ID Application signing; ad-hoc apps cannot connect to the installed HCI helper"
+      exit 1
+    }
+    print -r -- "$SIRI_REMOTE_SIGNATURE_DETAILS" | rg -q '^TeamIdentifier=L3QHLDRPAY$' || {
+      print -u2 "Siri Remote voice app has an unexpected Developer ID team"
+      exit 1
+    }
+    ;;
+  false|"")
+    test ! -e "$APPLE_REMOTE_AUDIO_HELPER"
+    test ! -e "$APPLE_REMOTE_HCI_SERVICE"
+    test ! -e "$OPUS_DYLIB"
+    test ! -e "$SAYALL_SIRI_REMOTE_RESOURCE_BUNDLE"
+    ;;
+  *)
+    print -u2 "invalid SayAllSiriRemoteIncluded marker"
+    exit 1
+    ;;
+esac
+test -d "$SPARKLE_FRAMEWORK"
+test -x "$SPARKLE_FRAMEWORK/Versions/B/Sparkle"
+test -x "$SPARKLE_FRAMEWORK/Versions/B/Autoupdate"
+test -x "$SPARKLE_FRAMEWORK/Versions/B/Updater.app/Contents/MacOS/Updater"
+SAYALL_CHROMECAST_INCLUDED="$(plutil -extract SayAllChromecastIncluded raw -o - "$PLIST" 2>/dev/null || true)"
+case "$SAYALL_CHROMECAST_INCLUDED" in
+  true)
+    test -d "$SAYALL_CHROMECAST_RESOURCE_BUNDLE"
+    ;;
+  false|"")
+    test ! -e "$SAYALL_CHROMECAST_RESOURCE_BUNDLE"
+    ;;
+  *)
+    print -u2 "invalid SayAllChromecastIncluded marker"
+    exit 1
+    ;;
+esac
+if [[ -n "$(find "$APP" -type d ! -perm 0755 -print -quit)" ]]; then
+  print -u2 "app bundle contains a directory without 0755 permissions"
+  exit 1
+fi
+if [[ -n "$(find "$APP" -type f ! -perm 0644 ! -perm 0755 -print -quit)" ]]; then
+  print -u2 "app bundle contains a file without 0644 or 0755 permissions"
+  exit 1
+fi
+test ! -e "$APP/Contents/Resources/CommonPhrases/built-in.md"
+test -f "$APP/Contents/Resources/LICENSE.md"
+test -f "$APP/Contents/Resources/README.md"
+test -f "$APP/Contents/Resources/TECHNICAL.md"
+test -f "$APP/Contents/Resources/THIRD_PARTY_NOTICES.md"
+test -f "$APP/Contents/Resources/TROUBLESHOOTING.md"
+test -f "$APP/Contents/Resources/COPYRIGHT.md"
+test -f "$APP/Contents/Resources/LOGO-LICENSE.md"
+test -f "$APP/Contents/Resources/FirstInstallGuide.md"
+test -f "$APP/Contents/Resources/RC003-remote-photo.png"
+for onboarding_image in "$ROOT"/Resources/Onboarding/*.png(N); do
+  test -f "$APP/Contents/Resources/Onboarding/${onboarding_image:t}"
+done
+test -f "$APP_ICON"
+cmp -s "$EXPECTED_ICON_ICNS" "$APP_ICON"
+ICON_CHECK_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/sayall-app-icon.XXXXXX")"
+ICONSET="$ICON_CHECK_ROOT/AppIcon.iconset"
+/usr/bin/iconutil --convert iconset --output "$ICONSET" "$APP_ICON"
+EXPECTED_ICON_NAMES=(
+  icon_16x16.png
+  icon_16x16@2x.png
+  icon_32x32.png
+  icon_32x32@2x.png
+  icon_128x128.png
+  icon_128x128@2x.png
+  icon_256x256.png
+  icon_256x256@2x.png
+  icon_512x512.png
+  icon_512x512@2x.png
+)
+for icon_name in "${EXPECTED_ICON_NAMES[@]}"; do
+  test -f "$ICONSET/$icon_name"
+done
+ICON_IMAGES=("$ICONSET"/*.png(N))
+/usr/bin/xcrun swift - "$ICON_CORNER_STYLE" "$ICON_SOURCE" "${ICON_IMAGES[@]}" <<'SWIFT'
+import AppKit
+import Darwin
+import Foundation
+
+func fail(_ message: String) -> Never {
+    FileHandle.standardError.write(Data((message + "\n").utf8))
+    exit(1)
+}
+
+let transparentCorners = CommandLine.arguments[1] == "transparent"
+for (index, path) in CommandLine.arguments.dropFirst(2).enumerated() {
+    let url = URL(fileURLWithPath: path)
+    guard let representation = try? NSBitmapImageRep(data: Data(contentsOf: url)) else {
+        fail("unable to decode app icon image: \(path)")
+    }
+    if index == 0 && (representation.pixelsWide != 1024 || representation.pixelsHigh != 1024) {
+        fail("app icon master must be 1024x1024: \(path)")
+    }
+    guard representation.hasAlpha else {
+        fail("app icon image is missing an alpha channel: \(path)")
+    }
+    let corners: [(Int, Int)] = [
+        (0, 0),
+        (representation.pixelsWide - 1, 0),
+        (0, representation.pixelsHigh - 1),
+        (representation.pixelsWide - 1, representation.pixelsHigh - 1),
+    ]
+    for (x, y) in corners {
+        let alpha = representation.colorAt(x: x, y: y)?.alphaComponent ?? 1
+        if transparentCorners && alpha > (1.0 / 255.0) {
+            fail("packaged Intel app icon corner is not transparent: \(path) (\(x),\(y))")
+        }
+        if !transparentCorners && alpha < (1.0 - 1.0 / 255.0) {
+            fail("packaged app icon corner is not opaque: \(path) (\(x),\(y))")
+        }
+    }
+    let centerAlpha = representation.colorAt(
+        x: representation.pixelsWide / 2,
+        y: representation.pixelsHigh / 2
+    )?.alphaComponent ?? 0
+    if centerAlpha < 0.5 {
+        fail("app icon center is unexpectedly transparent: \(path)")
+    }
+}
+SWIFT
+test -f "$APP/Contents/Resources/StatusIconTemplate.png"
+test -f "$APP/Contents/Resources/StatusIconTemplate@2x.png"
+test -f "$APP/Contents/Resources/StatusIconActiveTemplate.png"
+test -f "$APP/Contents/Resources/StatusIconActiveTemplate@2x.png"
+LOCALIZATION_DIRS=("$APP"/Contents/Resources/*.lproj(N))
+if (( ${#LOCALIZATION_DIRS} == 0 )); then
+  print -u2 "app bundle contains no localization resources"
+  exit 1
+fi
+test -d "$APP/Contents/Resources/en.lproj"
+test -f "$APP/Contents/Resources/en.lproj/Glossary.md"
+rg -q '^"CFBundleDisplayName" = "SayAll";$' \
+  "$APP/Contents/Resources/en.lproj/InfoPlist.strings"
+rg -q '^"CFBundleName" = "SayAll";$' \
+  "$APP/Contents/Resources/en.lproj/InfoPlist.strings"
+rg -q '^"CFBundleDisplayName" = "无线麦 SayAll";$' \
+  "$APP/Contents/Resources/zh-Hans.lproj/InfoPlist.strings"
+rg -q '^"CFBundleName" = "无线麦 SayAll";$' \
+  "$APP/Contents/Resources/zh-Hans.lproj/InfoPlist.strings"
+for RESOURCE_DIR in "${LOCALIZATION_DIRS[@]}"; do
+  test -f "$RESOURCE_DIR/InfoPlist.strings"
+  test -f "$RESOURCE_DIR/Localizable.strings"
+  plutil -lint "$RESOURCE_DIR/InfoPlist.strings"
+  plutil -lint "$RESOURCE_DIR/Localizable.strings"
+done
+rg -q '^"app.name" = "SayAll";$' "$APP/Contents/Resources/en.lproj/Localizable.strings"
+/usr/bin/ruby - "${LOCALIZATION_DIRS[@]}" <<'RUBY'
+def strings(path)
+  result = {}
+  File.foreach(path, encoding: "UTF-8") do |line|
+    match = line.match(/^"([^"]+)" = "(.*)";$/)
+    result[match[1]] = match[2] if match
+  end
+  result
+end
+
+directories = ARGV
+english_directory = directories.find { |path| File.basename(path) == "en.lproj" }
+abort "English localization is required" unless english_directory
+english = strings(File.join(english_directory, "Localizable.strings"))
+abort "English localization is empty" if english.empty?
+semantic_key = /\A[a-z0-9]+(?:[._][a-z0-9]+)*\z/
+invalid_keys = english.keys.reject { |key| semantic_key.match?(key) }
+abort "Invalid localization keys: #{invalid_keys.join(", ")}" unless invalid_keys.empty?
+
+format_pattern = /%(?:[0-9]+\$)?[a-zA-Z@]/
+restricted_terms = /RC003|ATVV|\bHID\b|\bUUID\b|virtual[ -]transport/i
+directories.each do |directory|
+  localized = strings(File.join(directory, "Localizable.strings"))
+  missing = english.keys - localized.keys
+  extra = localized.keys - english.keys
+  abort "#{directory} has missing keys: #{missing.join(", ")}" unless missing.empty?
+  abort "#{directory} has extra keys: #{extra.join(", ")}" unless extra.empty?
+  localized.each do |key, value|
+    abort "#{directory} has an empty value for #{key}" if value.empty?
+    expected_formats = english.fetch(key).scan(format_pattern).sort
+    actual_formats = value.scan(format_pattern).sort
+    abort "#{directory} has mismatched formats for #{key}" unless actual_formats == expected_formats
+    abort "#{directory} exposes a restricted term in #{key}" if value.match?(restricted_terms)
+  end
+
+  english_info = strings(File.join(english_directory, "InfoPlist.strings"))
+  localized_info = strings(File.join(directory, "InfoPlist.strings"))
+  abort "#{directory} has incomplete InfoPlist.strings" unless localized_info.keys.sort == english_info.keys.sort
+end
+RUBY
+
+test "$(plutil -extract CFBundleIdentifier raw -o - "$PLIST")" = \
+  "com.hd838a.RemoteMic"
+test "$(plutil -extract LSUIElement raw -o - "$PLIST")" = "true"
+test "$(plutil -extract LSMinimumSystemVersion raw -o - "$PLIST")" = \
+  "$RELEASE_MIN_SYSTEM_VERSION"
+test "$(plutil -extract CFBundleDevelopmentRegion raw -o - "$PLIST")" = "en"
+test "${APP:t}" = "SayAll.app"
+test "$(plutil -extract CFBundleDisplayName raw -o - "$PLIST")" = "SayAll"
+test "$(plutil -extract CFBundleName raw -o - "$PLIST")" = "SayAll"
+test "$(plutil -extract CFBundleExecutable raw -o - "$PLIST")" = "RemoteMic"
+test "$(plutil -extract CFBundleIconFile raw -o - "$PLIST")" = "AppIcon"
+SAYALL_BUILD_CHANNEL="$(plutil -extract SayAllBuildChannel raw -o - "$PLIST" 2>/dev/null || true)"
+if [[ "$REQUIRE_RELEASE_BUILD_CHANNEL" == "1" && "$SAYALL_BUILD_CHANNEL" != "release" ]]; then
+  print -u2 "Protected release App must declare SayAllBuildChannel=release"
+  exit 1
+fi
+if [[ "$SAYALL_BUILD_CHANNEL" == "local" || "$SAYALL_BUILD_CHANNEL" == "release" ]]; then
+  REQUIRE_DIAGNOSTIC_SERVICE=1
+fi
+test -n "$(plutil -extract NSBluetoothAlwaysUsageDescription raw -o - "$PLIST")"
+test "$(plutil -extract SUFeedURL raw -o - "$PLIST")" = "$RELEASE_FEED_URL"
+test "$(plutil -extract SUEnableAutomaticChecks raw -o - "$PLIST")" = "true"
+test "$(plutil -extract SUScheduledCheckInterval raw -o - "$PLIST")" = "86400"
+test "$(plutil -extract SUAutomaticallyUpdate raw -o - "$PLIST")" = "false"
+test "$(plutil -extract SUAllowsAutomaticUpdates raw -o - "$PLIST")" = "false"
+test -n "$(plutil -extract SUPublicEDKey raw -o - "$PLIST")"
+if plutil -type SayAllDiagnosticPublicKey "$PLIST" >/dev/null 2>&1; then
+  SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64="$(
+    plutil -extract SayAllDiagnosticPublicKey raw -expect string -o - "$PLIST"
+  )"
+else
+  SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64=""
+fi
+if [[ "$REQUIRE_DIAGNOSTIC_PUBLIC_KEY" == "1" && -z "$SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64" ]]; then
+  print -u2 "App is missing the required diagnostic public key"
+  exit 1
+fi
+if [[ -n "$SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64" ]]; then
+  if ! DIAGNOSTIC_PUBLIC_KEY_SIZE="$(
+    print -rn -- "$SAYALL_DIAGNOSTIC_PUBLIC_KEY_BASE64" |
+      /usr/bin/base64 -D 2>/dev/null |
+      /usr/bin/wc -c |
+      /usr/bin/tr -d '[:space:]'
+  )" || [[ "$DIAGNOSTIC_PUBLIC_KEY_SIZE" != "32" ]]; then
+    print -u2 "SayAllDiagnosticPublicKey must encode a 32-byte Curve25519 public key"
+    exit 1
+  fi
+fi
+if plutil -type SayAllSentryDSN "$PLIST" >/dev/null 2>&1; then
+  SAYALL_SENTRY_DSN="$(plutil -extract SayAllSentryDSN raw -expect string -o - "$PLIST")"
+else
+  SAYALL_SENTRY_DSN=""
+fi
+if [[ "$REQUIRE_DIAGNOSTIC_SERVICE" == "1" && -z "$SAYALL_SENTRY_DSN" ]]; then
+  print -u2 "App is missing the required diagnostic service DSN"
+  exit 1
+fi
+if [[ -n "$SAYALL_SENTRY_DSN" ]]; then
+  python3 - "$SAYALL_SENTRY_DSN" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+value = sys.argv[1].strip()
+parsed = urlparse(value)
+if (
+    parsed.scheme != "https"
+    or not parsed.hostname
+    or not parsed.username
+    or parsed.password
+    or parsed.port is not None
+    or parsed.query
+    or parsed.fragment
+    or not parsed.path.strip("/")
+):
+    raise SystemExit("SayAllSentryDSN is not a valid protected Sentry DSN")
+PY
+fi
+SAYALL_AI_INCLUDED="$(plutil -extract SayAllAIIncluded raw -o - "$PLIST" 2>/dev/null || true)"
+if [[ "$SAYALL_AI_INCLUDED" == "true" ]]; then
+  SAYALL_AI_RESOURCE_BUNDLE="$APP/Contents/Resources/SayAllAI_SayAllAI.bundle"
+  test -d "$SAYALL_AI_RESOURCE_BUNDLE"
+  if [[ -d "$SAYALL_AI_RESOURCE_BUNDLE/Contents/Resources" ]]; then
+    SAYALL_AI_RESOURCE_ROOT="$SAYALL_AI_RESOURCE_BUNDLE/Contents/Resources"
+    SAYALL_AI_RESOURCE_PLIST="$SAYALL_AI_RESOURCE_BUNDLE/Contents/Info.plist"
+  else
+    SAYALL_AI_RESOURCE_ROOT="$SAYALL_AI_RESOURCE_BUNDLE"
+    SAYALL_AI_RESOURCE_PLIST="$SAYALL_AI_RESOURCE_BUNDLE/Info.plist"
+  fi
+  test -f "$SAYALL_AI_RESOURCE_ROOT/en.lproj/Localizable.strings"
+  test -f "$SAYALL_AI_RESOURCE_ROOT/zh-Hans.lproj/Localizable.strings"
+  test -n "$(plutil -extract CFBundleDevelopmentRegion raw -o - \
+    "$SAYALL_AI_RESOURCE_PLIST")"
+elif [[ -e "$APP/Contents/Resources/SayAllAI_SayAllAI.bundle" ]]; then
+  print -u2 "SayAllAI resource bundle exists without the inclusion marker"
+  exit 1
+fi
+if [[ "$REQUIRE_SAYALL_AI_PACKAGE" == "1" && "$SAYALL_AI_INCLUDED" != "true" ]]; then
+  print -u2 "App is missing the required SayAllAI package marker"
+  exit 1
+fi
+SAYALL_COMBINATION_ACTIONS_INCLUDED="$(plutil -extract SayAllCombinationActionsIncluded raw -o - "$PLIST" 2>/dev/null || true)"
+SAYALL_MACRO_RESOURCE_BUNDLE="$APP/Contents/Resources/SayAllCombinationActions_SayAllMacroRemoteMic.bundle"
+if [[ "$SAYALL_COMBINATION_ACTIONS_INCLUDED" == "true" ]]; then
+  test -d "$SAYALL_MACRO_RESOURCE_BUNDLE"
+  if [[ -d "$SAYALL_MACRO_RESOURCE_BUNDLE/Contents/Resources" ]]; then
+    SAYALL_MACRO_RESOURCE_ROOT="$SAYALL_MACRO_RESOURCE_BUNDLE/Contents/Resources"
+    SAYALL_MACRO_RESOURCE_PLIST="$SAYALL_MACRO_RESOURCE_BUNDLE/Contents/Info.plist"
+  else
+    SAYALL_MACRO_RESOURCE_ROOT="$SAYALL_MACRO_RESOURCE_BUNDLE"
+    SAYALL_MACRO_RESOURCE_PLIST="$SAYALL_MACRO_RESOURCE_BUNDLE/Info.plist"
+  fi
+  test -f "$SAYALL_MACRO_RESOURCE_ROOT/en.lproj/Localizable.strings"
+  test -n "$(plutil -extract CFBundleDevelopmentRegion raw -o - \
+    "$SAYALL_MACRO_RESOURCE_PLIST")"
+  if [[ ! -f "$SAYALL_MACRO_RESOURCE_ROOT/zh-Hans.lproj/Localizable.strings" && \
+        ! -f "$SAYALL_MACRO_RESOURCE_ROOT/zh-hans.lproj/Localizable.strings" ]]; then
+    print -u2 "SayAll combination actions Chinese localization is missing"
+    exit 1
+  fi
+elif [[ -e "$SAYALL_MACRO_RESOURCE_BUNDLE" ]]; then
+  print -u2 "SayAll combination actions resource bundle exists without the inclusion marker"
+  exit 1
+fi
+if [[ "$REQUIRE_SAYALL_COMBINATION_ACTIONS" == "1" && \
+      "$SAYALL_COMBINATION_ACTIONS_INCLUDED" != "true" ]]; then
+  print -u2 "App is missing the required SayAll combination actions marker"
+  exit 1
+fi
+SAYALL_PRIVATE_ARTIFACT_INCLUDED="$(plutil -extract SayAllPrivateArtifactsIncluded raw -o - "$PLIST" 2>/dev/null || true)"
+SAYALL_BUTTON_PROFILES_INCLUDED="$(plutil -extract SayAllButtonProfilesIncluded raw -o - "$PLIST" 2>/dev/null || true)"
+SAYALL_BUTTON_PROFILES_RESOURCE_BUNDLE="$APP/Contents/Resources/SayAllButtonProfiles_SayAllButtonProfiles.bundle"
+SAYALL_MEMBERSHIP_RESOURCE_BUNDLE="$APP/Contents/Resources/SayAllMembership_SayAllMembershipUI.bundle"
+SAYALL_COMMON_PHRASES_RESOURCE_BUNDLE="$APP/Contents/Resources/SayAllCommonPhrases_SayAllCommonPhrases.bundle"
+if [[ "$SAYALL_BUTTON_PROFILES_INCLUDED" == "true" ]]; then
+  test -d "$SAYALL_BUTTON_PROFILES_RESOURCE_BUNDLE"
+  if [[ -d "$SAYALL_BUTTON_PROFILES_RESOURCE_BUNDLE/Contents/Resources" ]]; then
+    SAYALL_BUTTON_PROFILES_RESOURCE_ROOT="$SAYALL_BUTTON_PROFILES_RESOURCE_BUNDLE/Contents/Resources"
+    SAYALL_BUTTON_PROFILES_RESOURCE_PLIST="$SAYALL_BUTTON_PROFILES_RESOURCE_BUNDLE/Contents/Info.plist"
+  else
+    SAYALL_BUTTON_PROFILES_RESOURCE_ROOT="$SAYALL_BUTTON_PROFILES_RESOURCE_BUNDLE"
+    SAYALL_BUTTON_PROFILES_RESOURCE_PLIST="$SAYALL_BUTTON_PROFILES_RESOURCE_BUNDLE/Info.plist"
+  fi
+  test -f "$SAYALL_BUTTON_PROFILES_RESOURCE_ROOT/en.lproj/Localizable.strings"
+  test -n "$(plutil -extract CFBundleDevelopmentRegion raw -o - \
+    "$SAYALL_BUTTON_PROFILES_RESOURCE_PLIST")"
+  if [[ ! -f "$SAYALL_BUTTON_PROFILES_RESOURCE_ROOT/zh-Hans.lproj/Localizable.strings" && \
+        ! -f "$SAYALL_BUTTON_PROFILES_RESOURCE_ROOT/zh-hans.lproj/Localizable.strings" ]]; then
+    print -u2 "SayAll button profiles Chinese localization is missing"
+    exit 1
+  fi
+  if [[ "$SAYALL_PRIVATE_ARTIFACT_INCLUDED" == "true" ]]; then
+    test -d "$SAYALL_MEMBERSHIP_RESOURCE_BUNDLE"
+    if [[ -d "$SAYALL_MEMBERSHIP_RESOURCE_BUNDLE/Contents/Resources" ]]; then
+      SAYALL_MEMBERSHIP_RESOURCE_ROOT="$SAYALL_MEMBERSHIP_RESOURCE_BUNDLE/Contents/Resources"
+    else
+      SAYALL_MEMBERSHIP_RESOURCE_ROOT="$SAYALL_MEMBERSHIP_RESOURCE_BUNDLE"
+    fi
+    test -f "$SAYALL_MEMBERSHIP_RESOURCE_ROOT/MembershipCenterCopy.json"
+    test -f "$SAYALL_MEMBERSHIP_RESOURCE_ROOT/AppIcon.png"
+    test -d "$SAYALL_COMMON_PHRASES_RESOURCE_BUNDLE"
+    if [[ -d "$SAYALL_COMMON_PHRASES_RESOURCE_BUNDLE/Contents/Resources" ]]; then
+      SAYALL_COMMON_PHRASES_RESOURCE_ROOT="$SAYALL_COMMON_PHRASES_RESOURCE_BUNDLE/Contents/Resources"
+    else
+      SAYALL_COMMON_PHRASES_RESOURCE_ROOT="$SAYALL_COMMON_PHRASES_RESOURCE_BUNDLE"
+    fi
+    test -f "$SAYALL_COMMON_PHRASES_RESOURCE_ROOT/CommonPhrases.json"
+  else
+    test ! -e "$SAYALL_MEMBERSHIP_RESOURCE_BUNDLE"
+  fi
+elif [[ -e "$SAYALL_BUTTON_PROFILES_RESOURCE_BUNDLE" ]]; then
+  print -u2 "SayAll button profiles resource bundle exists without the inclusion marker"
+  exit 1
+elif [[ -e "$SAYALL_MEMBERSHIP_RESOURCE_BUNDLE" ]]; then
+  print -u2 "SayAll membership resource bundle exists without the button profiles marker"
+  exit 1
+elif [[ -e "$SAYALL_COMMON_PHRASES_RESOURCE_BUNDLE" ]]; then
+  print -u2 "SayAll common phrases resource bundle exists without the private artifact marker"
+  exit 1
+fi
+if [[ "$REQUIRE_SAYALL_BUTTON_PROFILES" == "1" && \
+      "$SAYALL_BUTTON_PROFILES_INCLUDED" != "true" ]]; then
+  print -u2 "App is missing the required SayAll button profiles marker"
+  exit 1
+fi
+SAYALL_BUTTON_PROFILES_TEST_ACCESS="$(plutil -extract SayAllButtonProfilesTestAccess raw -o - "$PLIST" 2>/dev/null || true)"
+case "$SAYALL_BUTTON_PROFILES_TEST_ACCESS" in
+  true|false) ;;
+  "") SAYALL_BUTTON_PROFILES_TEST_ACCESS=false ;;
+  *) print -u2 "invalid SayAllButtonProfilesTestAccess marker"; exit 1 ;;
+esac
+if [[ "$SAYALL_BUTTON_PROFILES_TEST_ACCESS" == "true" && \
+      "$SAYALL_BUTTON_PROFILES_INCLUDED" != "true" ]]; then
+  print -u2 "button profile test access exists without the button profiles marker"
+  exit 1
+fi
+if [[ "$SAYALL_BUTTON_PROFILES_TEST_ACCESS" == "true" && \
+      "$SAYALL_PRIVATE_ARTIFACT_INCLUDED" == "true" ]]; then
+  print -u2 "button profile test access must not include private membership artifacts"
+  exit 1
+fi
+if [[ "$REQUIRE_SAYALL_BUTTON_PROFILES_TEST_ACCESS" == "1" && \
+      "$SAYALL_BUTTON_PROFILES_TEST_ACCESS" != "true" ]]; then
+  print -u2 "App is missing the required free button profile test access marker"
+  exit 1
+fi
+if [[ "$SAYALL_PRIVATE_ARTIFACT_INCLUDED" == "true" && \
+      "$SAYALL_COMBINATION_ACTIONS_INCLUDED" != "true" ]]; then
+  print -u2 "private artifact marker exists without the combination actions marker"
+  exit 1
+fi
+if [[ "$REQUIRE_SAYALL_PRIVATE_ARTIFACT_PACKAGE" == "1" && \
+      "$SAYALL_PRIVATE_ARTIFACT_INCLUDED" != "true" ]]; then
+  print -u2 "App is missing the required private artifact package marker"
+  exit 1
+fi
+
+codesign --verify --deep --strict "$APP"
+codesign --verify --strict "$MCP_HELPER"
+if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+  codesign --verify --strict "$APPLE_REMOTE_AUDIO_HELPER"
+  codesign --verify --strict "$APPLE_REMOTE_HCI_SERVICE"
+  codesign --verify --strict "$APPLE_REMOTE_HCI_UPGRADE_SERVICE"
+  cmp -s "$APPLE_REMOTE_HCI_SERVICE" "$APPLE_REMOTE_HCI_UPGRADE_SERVICE"
+  test "$(/usr/libexec/PlistBuddy -c 'Print :SMPrivilegedExecutables:com.hd838a.SayAll.AppleRemoteHCIService' "$PLIST")" = \
+    'identifier "com.hd838a.SayAll.AppleRemoteHCIService" and anchor apple generic and certificate leaf[subject.OU] = "L3QHLDRPAY"'
+  otool -l "$APPLE_REMOTE_HCI_UPGRADE_SERVICE" | rg -q 'sectname __info_plist'
+  otool -l "$APPLE_REMOTE_HCI_UPGRADE_SERVICE" | rg -q 'sectname __launchd_plist'
+  test "$(codesign -dvv "$APPLE_REMOTE_AUDIO_HELPER" 2>&1 | \
+    sed -n 's/^Identifier=//p')" = "com.hd838a.RemoteMic.apple-remote-audio"
+  test "$(codesign -dvv "$APPLE_REMOTE_HCI_SERVICE" 2>&1 | \
+    sed -n 's/^Identifier=//p')" = "com.hd838a.SayAll.AppleRemoteHCIService"
+  codesign --verify --strict "$OPUS_DYLIB"
+fi
+if [[ "$REQUIRE_DEVELOPER_ID_SIGNING" == "1" ]]; then
+  RELAY_URL="$(plutil -extract RemoteWebRelayURL raw -o - "$PLIST" 2>/dev/null || true)"
+  if [[ "$RELAY_URL" != wss://?*/ws ]]; then
+    print -u2 "Developer ID app is missing a production Web Remote relay URL"
+    exit 1
+  fi
+  EARLY_ACCESS_URL="$(plutil -extract EarlyAccessServiceURL raw -o - "$PLIST" 2>/dev/null || true)"
+  if ! print -r -- "$EARLY_ACCESS_URL" | rg -q '^https://[^/?#]+/?$'; then
+    print -u2 "Developer ID app is missing a production root HTTPS Early Access URL"
+    exit 1
+  fi
+  SIGNATURE_DETAILS="$(codesign -dvvv "$APP" 2>&1)"
+  print -r -- "$SIGNATURE_DETAILS" | rg -q '^Authority=Developer ID Application:'
+  print -r -- "$SIGNATURE_DETAILS" | rg -q "^TeamIdentifier=$EXPECTED_DEVELOPER_TEAM_ID$"
+  print -r -- "$SIGNATURE_DETAILS" | rg -q '^CodeDirectory .*flags=.*runtime'
+  signed_components=("$MCP_HELPER")
+  if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+    signed_components+=(
+      "$APPLE_REMOTE_AUDIO_HELPER"
+      "$APPLE_REMOTE_HCI_SERVICE"
+      "$OPUS_DYLIB"
+    )
+  fi
+  for signed_component in \
+    "${signed_components[@]}" \
+    "$SPARKLE_FRAMEWORK/Versions/B/XPCServices/Installer.xpc" \
+    "$SPARKLE_FRAMEWORK/Versions/B/XPCServices/Downloader.xpc" \
+    "$SPARKLE_FRAMEWORK/Versions/B/Autoupdate" \
+    "$SPARKLE_FRAMEWORK/Versions/B/Updater.app" \
+    "$SPARKLE_FRAMEWORK"; do
+    COMPONENT_SIGNATURE_DETAILS="$(codesign -dvvv "$signed_component" 2>&1)"
+    print -r -- "$COMPONENT_SIGNATURE_DETAILS" | rg -q '^Authority=Developer ID Application:'
+    print -r -- "$COMPONENT_SIGNATURE_DETAILS" | \
+      rg -q "^TeamIdentifier=$EXPECTED_DEVELOPER_TEAM_ID$"
+    print -r -- "$COMPONENT_SIGNATURE_DETAILS" | \
+      rg -q '^CodeDirectory .*flags=.*runtime'
+  done
+fi
+file "$BINARY" | rg -q 'Mach-O 64-bit executable'
+file "$MCP_HELPER" | rg -q 'Mach-O 64-bit executable'
+if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+  file "$APPLE_REMOTE_AUDIO_HELPER" | rg -q 'Mach-O 64-bit executable'
+  file "$APPLE_REMOTE_HCI_SERVICE" | rg -q 'Mach-O 64-bit executable'
+  file "$OPUS_DYLIB" | rg -q 'Mach-O 64-bit dynamically linked shared library'
+fi
+ARCHS="$(lipo -archs "$BINARY")"
+test "$ARCHS" = "$RELEASE_ARCH"
+test "$(lipo -archs "$MCP_HELPER")" = "$RELEASE_ARCH"
+if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+  test "$(lipo -archs "$APPLE_REMOTE_AUDIO_HELPER")" = "$RELEASE_ARCH"
+  test "$(lipo -archs "$APPLE_REMOTE_HCI_SERVICE")" = "$RELEASE_ARCH"
+  test "$(lipo -archs "$OPUS_DYLIB")" = "$RELEASE_ARCH"
+fi
+xcrun vtool -show-build "$BINARY" | rg -Fq "minos $RELEASE_MIN_SYSTEM_VERSION"
+xcrun vtool -show-build "$MCP_HELPER" | rg -Fq "minos $RELEASE_MIN_SYSTEM_VERSION"
+if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+  autoload -Uz is-at-least
+  embedded_component_minimum_is_supported() {
+    local component="$1"
+    local component_minos
+    component_minos="$(xcrun vtool -show-build "$component" | awk '/minos / { print $2; exit }')"
+    [[ -n "$component_minos" ]] || return 1
+    is-at-least "$component_minos" "$RELEASE_MIN_SYSTEM_VERSION"
+  }
+  embedded_component_minimum_is_supported "$APPLE_REMOTE_AUDIO_HELPER" || {
+    print -u2 "Apple Remote audio helper requires a newer macOS than the app release floor"
+    exit 1
+  }
+  embedded_component_minimum_is_supported "$APPLE_REMOTE_HCI_SERVICE" || {
+    print -u2 "Apple Remote HCI service requires a newer macOS than the app release floor"
+    exit 1
+  }
+  embedded_component_minimum_is_supported "$OPUS_DYLIB" || {
+    print -u2 "Apple Remote Opus library requires a newer macOS than the app release floor"
+    exit 1
+  }
+fi
+otool -l "$BINARY" | rg -A2 'LC_RPATH' | rg -q '@executable_path/\.\./Frameworks'
+
+if [[ "$RELEASE_VARIANT" == "intel" ]]; then
+  for sparkle_binary in \
+    "$SPARKLE_FRAMEWORK/Versions/B/Sparkle" \
+    "$SPARKLE_FRAMEWORK/Versions/B/Autoupdate" \
+    "$SPARKLE_FRAMEWORK/Versions/B/Updater.app/Contents/MacOS/Updater" \
+    "$SPARKLE_FRAMEWORK/Versions/B/XPCServices/Installer.xpc/Contents/MacOS/Installer" \
+    "$SPARKLE_FRAMEWORK/Versions/B/XPCServices/Downloader.xpc/Contents/MacOS/Downloader"; do
+    test "$(lipo -archs "$sparkle_binary")" = "x86_64"
+  done
+fi
+
+EXPECTED_APP_FILES=$'Contents/Helpers/SayAllMCP\nContents/Info.plist\nContents/MacOS/RemoteMic\nContents/Resources/AppIcon.icns\nContents/Resources/COPYRIGHT.md\nContents/Resources/FirstInstallGuide.md\nContents/Resources/LICENSE.md\nContents/Resources/LOGO-LICENSE.md\nContents/Resources/RC003-remote-photo.png\nContents/Resources/README.md\nContents/Resources/StatusIconActiveTemplate.png\nContents/Resources/StatusIconActiveTemplate@2x.png\nContents/Resources/StatusIconTemplate.png\nContents/Resources/StatusIconTemplate@2x.png\nContents/Resources/TECHNICAL.md\nContents/Resources/THIRD_PARTY_NOTICES.md\nContents/Resources/TROUBLESHOOTING.md\nContents/_CodeSignature/CodeResources'
+if [[ "$SAYALL_SIRI_REMOTE_INCLUDED" == "true" ]]; then
+  EXPECTED_APP_FILES=$'Contents/Frameworks/libopus.0.dylib\nContents/Helpers/SayAllAppleRemoteAudioCapture\nContents/Helpers/SayAllAppleRemoteHCIService\nContents/Library/LaunchServices/com.hd838a.SayAll.AppleRemoteHCIService\n'"$EXPECTED_APP_FILES"
+fi
+while IFS= read -r expected_file; do
+  test -f "$APP/$expected_file"
+done <<< "$EXPECTED_APP_FILES"
+if [[ -d "$ROOT/Resources/AppIcons" ]]; then
+  while IFS= read -r source_icon; do
+    relative_icon_path="${source_icon#$ROOT/Resources/AppIcons/}"
+    bundled_icon="$APP/Contents/Resources/AppIcons/$relative_icon_path"
+    expected_source="$source_icon"
+    test -f "$bundled_icon"
+    /usr/bin/cmp -s "$expected_source" "$bundled_icon"
+  done < <(find "$ROOT/Resources/AppIcons" -type f | LC_ALL=C sort)
+fi
+for onboarding_image in "$ROOT"/Resources/Onboarding/*.png(N); do
+  test -f "$APP/Contents/Resources/Onboarding/${onboarding_image:t}"
+done
+for source_localization_dir in "$ROOT"/Resources/*.lproj(N); do
+  localization_name="${source_localization_dir:t}"
+  while IFS= read -r source_file; do
+    relative_path="${source_file#$source_localization_dir/}"
+    test -f "$APP/Contents/Resources/$localization_name/$relative_path"
+  done < <(find "$source_localization_dir" -type f | LC_ALL=C sort)
+done
+
+# Sentry's pinned SDK contains public CI __FILE__ paths, not local user paths.
+# Read the full pipeline so pipefail cannot hide a match through SIGPIPE.
+if rg -a -o --no-filename '/Users/[^[:space:]\x00]+|/tmp/remote-bridge|AA:BB:CC:DD:EE:FF' "$APP/Contents" \
+    | rg -v '^/Users/runner/work/sentry-cocoa/sentry-cocoa/Sources/([A-Za-z0-9_-]+/)+[A-Za-z0-9_+-]+\.(m|mm|c|cpp|h|swift)$' >/dev/null; then
+  print -u2 "bundle contains a forbidden local path or example device address"
+  exit 1
+fi
+
+if [[ "$REQUIRE_NOTARIZATION" == "1" ]]; then
+  xcrun stapler validate "$APP"
+  /usr/sbin/spctl -a -vv -t open --context context:primary-signature "$APP"
+fi
+
+print "APP VERIFY PASS: $APP"
+print "RELEASE VARIANT: $RELEASE_VARIANT"

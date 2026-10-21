@@ -1,0 +1,1380 @@
+import AppKit
+import Combine
+import CoreBluetooth
+import Darwin
+import Sparkle
+import SwiftUI
+
+struct UpdateFeedSelection {
+    let stableFeedURLString: String?
+
+    init(stableFeedURLString: String?) {
+        self.stableFeedURLString = stableFeedURLString
+    }
+
+    func feedURLString(checksForPreReleaseUpdates: Bool) -> String? {
+        guard let stableFeedURL else { return nil }
+        return checksForPreReleaseUpdates
+            ? preReleaseFeedURL?.absoluteString
+            : stableFeedURL.absoluteString
+    }
+
+    var appcastAssetName: String {
+        guard let name = stableFeedURL?.lastPathComponent
+        else { return "appcast.xml" }
+        return name
+    }
+
+    var validatedStableFeedURL: URL? {
+        stableFeedURL
+    }
+
+    var validatedPreReleaseFeedURL: URL? {
+        preReleaseFeedURL
+    }
+
+    private var stableFeedURL: URL? {
+        guard let stableFeedURLString,
+              let components = URLComponents(string: stableFeedURLString),
+              components.scheme == "https",
+              components.host == "download.sayall.app",
+              components.port == nil,
+              components.user == nil,
+              components.password == nil,
+              components.query == nil,
+              components.fragment == nil,
+              let url = components.url,
+              ["appcast.xml", "appcast-intel.xml"].contains(url.lastPathComponent),
+              components.path == "/mac/channels/stable/\(url.lastPathComponent)"
+        else { return nil }
+        return url
+    }
+
+    private var preReleaseFeedURL: URL? {
+        guard let stableFeedURL,
+              var components = URLComponents(url: stableFeedURL, resolvingAgainstBaseURL: false)
+        else { return nil }
+        components.path = "/mac/channels/preview/\(stableFeedURL.lastPathComponent)"
+        return components.url
+    }
+}
+
+struct UpdateCheckPolicy: Equatable {
+    let checksForPreReleaseUpdates: Bool
+
+    var startsUpdaterAutomatically: Bool {
+        !checksForPreReleaseUpdates
+    }
+
+    var allowsBackgroundUpdatePrompts: Bool {
+        !checksForPreReleaseUpdates
+    }
+
+    var refreshesAboutInformationOnAppear: Bool {
+        !checksForPreReleaseUpdates
+    }
+}
+
+enum SettingsWindowActivationPolicy {
+    static func value(
+        showDockIcon: Bool,
+        isSettingsWindowOpen _: Bool
+    ) -> NSApplication.ActivationPolicy {
+        showDockIcon ? .regular : .accessory
+    }
+}
+
+enum AppEntryPointVisibilityPolicy {
+    static func shouldShowMainWindow(
+        baseLaunchDecision: Bool,
+        showDockIcon: Bool,
+        showStatusBarIcon: Bool
+    ) -> Bool {
+        baseLaunchDecision || (!showDockIcon && !showStatusBarIcon)
+    }
+}
+
+struct ButtonProfileImportRequest: Equatable {
+    let url: URL
+    let operationID: UInt
+}
+
+final class ButtonProfileImportRequestStore: ObservableObject {
+    @Published private(set) var pendingRequest: ButtonProfileImportRequest?
+    private var nextOperationID: UInt = 0
+
+    @discardableResult
+    func enqueue(url: URL) -> ButtonProfileImportRequest {
+        nextOperationID += 1
+        let request = ButtonProfileImportRequest(url: url, operationID: nextOperationID)
+        pendingRequest = request
+        return request
+    }
+
+    func clear() {
+        pendingRequest = nil
+    }
+}
+
+@main
+enum RemoteMicApp {
+    @MainActor
+    static func main() {
+        if ProcessInfo.processInfo.arguments.contains("--agent-configure") {
+            let arguments = Array(ProcessInfo.processInfo.arguments.dropFirst())
+            exit(AgentConfigurationCommand.run(arguments: arguments))
+        }
+        if let screenshotDirectory = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_SETTINGS_SCREENSHOT_DIR"
+        ] {
+            do {
+                try SettingsScreenshotRenderer.renderAll(
+                    to: URL(fileURLWithPath: screenshotDirectory, isDirectory: true),
+                    sizeValue: ProcessInfo.processInfo.environment[
+                        "REMOTE_MIC_SETTINGS_SCREENSHOT_SIZE"
+                    ],
+                    appearanceName: ProcessInfo.processInfo.environment[
+                        "REMOTE_MIC_SETTINGS_SCREENSHOT_APPEARANCE"
+                    ],
+                    languageName: ProcessInfo.processInfo.environment[
+                        "REMOTE_MIC_SETTINGS_SCREENSHOT_LANGUAGE"
+                    ]
+                )
+            } catch {
+                fputs("Settings screenshot rendering failed: \(error)\n", stderr)
+                exit(EXIT_FAILURE)
+            }
+            return
+        }
+        if let screenshotDirectory = ProcessInfo.processInfo.environment[
+            "REMOTE_MIC_ONBOARDING_SCREENSHOT_DIR"
+        ] {
+            do {
+                try OnboardingScreenshotRenderer.renderAll(
+                    to: URL(fileURLWithPath: screenshotDirectory, isDirectory: true),
+                    appearanceName: ProcessInfo.processInfo.environment[
+                        "REMOTE_MIC_ONBOARDING_SCREENSHOT_APPEARANCE"
+                    ]
+                )
+            } catch {
+                fputs("Onboarding screenshot rendering failed: \(error)\n", stderr)
+                exit(EXIT_FAILURE)
+            }
+            return
+        }
+        let bundleIdentifier = Bundle.main.bundleIdentifier
+            ?? ApplicationInstanceGuard.fallbackBundleIdentifier
+        var instanceLock: ApplicationInstanceLock?
+        if let lockURL = ApplicationInstanceGuard.defaultLockURL() {
+            switch ApplicationInstanceLock.acquire(at: lockURL) {
+            case let .acquired(lock):
+                instanceLock = lock
+            case .alreadyLocked:
+                ApplicationInstanceGuard.existingApplication(
+                    bundleIdentifier: bundleIdentifier
+                )?.activate(options: [.activateAllWindows])
+                return
+            case let .failed(reason):
+                fputs("Single-instance lock unavailable: \(reason)\n", stderr)
+            }
+        } else {
+            fputs("Single-instance lock unavailable: application_support_missing\n", stderr)
+        }
+
+        if let existingApplication = ApplicationInstanceGuard.existingApplication(
+            bundleIdentifier: bundleIdentifier,
+            requiresFinishedLaunch: true
+        ) {
+            existingApplication.activate(options: [.activateAllWindows])
+            return
+        }
+
+        let application = NSApplication.shared
+        let delegate = RemoteMicAppDelegate()
+        application.delegate = delegate
+        application.setActivationPolicy(delegate.activationPolicy)
+        withExtendedLifetime(instanceLock) {
+            withExtendedLifetime(delegate) {
+                application.run()
+            }
+        }
+    }
+}
+
+@MainActor
+private final class RemoteMicAppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate,
+    NSWindowDelegate, SPUUpdaterDelegate, @preconcurrency SPUStandardUserDriverDelegate
+{
+    private enum UpdateCheckPurpose {
+        case information
+        case userInitiated
+    }
+
+    private let model = BridgeAppModel()
+    private lazy var appIconController = AppIconController()
+    private let updateInformation = UpdateInformationStore()
+    private let hardwareAnnouncements = HardwareAnnouncementStore()
+    private lazy var localization = LocalizationStore(settings: model.settings)
+    private var statusItem: NSStatusItem?
+    private var statusItemPresentation: StatusItemPresentation = .disconnected
+    private var appliedStatusItemPresentation: StatusItemPresentation?
+    private var statusItemOperationID: UInt = 0
+    private var statusItemWarningBlinkTimer: Timer?
+    private var statusItemWarningBlinkVisible = true
+    private var entryPointOperationID: UInt = 0
+    private var statusMenu: NSMenu?
+    private var settingsWindowController: NSWindowController?
+    private var isSettingsWindowOpen = false
+    private var subscriptions = Set<AnyCancellable>()
+    private var terminationSignalSources: [DispatchSourceSignal] = []
+    private var applicationShortcutMonitor: Any?
+    private var workspaceAudioLifecycleObservers: [NSObjectProtocol] = []
+    private var updateFeedSelection = UpdateFeedSelection(
+        stableFeedURLString: Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String
+    )
+    private var updateCheckTask: Task<Void, Never>?
+    private let buttonProfileImportRequests = ButtonProfileImportRequestStore()
+    private var resolvedUpdateFeedURLString: String?
+    private let accountAuthStore = AccountAuthStore()
+    private var loginWindowController: NSWindowController?
+    private var updaterStarted = false
+    private lazy var updaterController = SPUStandardUpdaterController(
+        startingUpdater: false,
+        updaterDelegate: self,
+        userDriverDelegate: self
+    )
+
+    private let connectionItem = NSMenuItem()
+    private let audioItem = NSMenuItem()
+    private let hidItem = NSMenuItem()
+
+    var activationPolicy: NSApplication.ActivationPolicy {
+        SettingsWindowActivationPolicy.value(
+            showDockIcon: model.settings.showDockIcon,
+            isSettingsWindowOpen: false
+        )
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        if let environmentEvent = AppEnvironmentSnapshot.current(
+            settings: model.settings
+        ).publicEvent {
+            AppLogger.shared.record(environmentEvent)
+        }
+        let currentBuild = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+        let completedUpdate = model.settings.recordLaunchAndDetectCompletedUpdate(
+            currentBuild: currentBuild,
+            sparkleHadLaunchedBefore: UserDefaults.standard.bool(forKey: "SUHasLaunchedBefore")
+        )
+        observeUpdatePreferences()
+        observeAppIconPreference()
+        configureUpdater()
+        installTerminationSignalHandlers()
+        configureApplicationMenu()
+        installApplicationKeyboardShortcuts()
+        applyStatusBarIconVisibility(
+            model.settings.showStatusBarIcon,
+            source: "launch"
+        )
+        observeModel()
+        observeLocalization()
+        observePhoneRemoteButtonTitles()
+        installWorkspaceAudioLifecycleObservers()
+        guard accountAuthStore.isSignedIn else {
+            AppLogger.shared.write("AUTH gate blocked=signin_required")
+            showLoginWindow { [weak self] in
+                self?.finishLaunchAfterAuth(completedUpdate: completedUpdate)
+            }
+            return
+        }
+        finishLaunchAfterAuth(completedUpdate: completedUpdate)
+    }
+
+    /// 登录门禁通过后继续执行的原生启动流程。
+    private func finishLaunchAfterAuth(completedUpdate: Bool) {
+        model.privateFeature.refreshAccessIfNeeded()
+        model.macroFeature.refreshAccessIfNeeded()
+        model.membershipFeature.refreshIfNeeded()
+        if OnboardingLaunchPolicy.shouldStartRuntime(
+            isComplete: model.settings.isOnboardingComplete,
+            step: model.settings.onboardingStep
+        ) {
+            model.startIfNeeded()
+        }
+        if model.settings.isOnboardingComplete,
+           BridgeAppModel.shouldRecoverHIDAfterCompletedUpdate(
+            completedUpdate: completedUpdate,
+            customMappingEnabled: model.settings.customMappingEnabled
+        ) {
+            model.recoverHIDAfterCompletedUpdate()
+        }
+        let shouldOpenPermissionRepair = CompletedUpdatePermissionRepairPolicy.shouldOpenPermissions(
+            isOnboardingComplete: model.settings.isOnboardingComplete,
+            completedUpdate: completedUpdate,
+            bluetoothGranted: CBManager.authorization == .allowedAlways,
+            inputMonitoringGranted: HIDRemoteMonitor.isInputMonitoringGranted,
+            accessibilityGranted: KeyboardInjector.isAccessibilityTrusted
+        )
+        if shouldOpenPermissionRepair {
+            AppLogger.shared.write(
+                "UPDATE PERMISSION_REPAIR bluetooth=\(CBManager.authorization == .allowedAlways) " +
+                    "input=\(HIDRemoteMonitor.isInputMonitoringGranted) " +
+                    "accessibility=\(KeyboardInjector.isAccessibilityTrusted)"
+            )
+        }
+        refreshMenuStatus()
+
+        let baseLaunchDecision = OnboardingLaunchPolicy.shouldShowMainWindow(
+            isComplete: model.settings.isOnboardingComplete,
+            completedUpdate: completedUpdate,
+            openMainWindowAtLaunch: model.settings.openMainWindowAtLaunch
+        )
+        let shouldShowMainWindow = AppEntryPointVisibilityPolicy.shouldShowMainWindow(
+            baseLaunchDecision: baseLaunchDecision,
+            showDockIcon: model.settings.showDockIcon,
+            showStatusBarIcon: model.settings.showStatusBarIcon
+        )
+        if shouldShowMainWindow {
+            if !baseLaunchDecision {
+                AppLogger.shared.write(
+                    "UI ENTRY_POINT phase=completed result=passed source=launch_recovery " +
+                        "show_dock=false show_status_bar=false decision=open_settings"
+                )
+            }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if shouldOpenPermissionRepair {
+                    self.showSettingsWindow(initialSection: .about)
+                } else {
+                    self.showSettings()
+                }
+                if completedUpdate {
+                    self.showUpdateCompletedAlert()
+                }
+            }
+        }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        model.privateFeature.hideHUDImmediately()
+        model.stop()
+        model.settings.discardOnboardingVoiceTrial()
+        updateCheckTask?.cancel()
+        terminationSignalSources.forEach { $0.cancel() }
+        terminationSignalSources.removeAll()
+        if let applicationShortcutMonitor {
+            NSEvent.removeMonitor(applicationShortcutMonitor)
+            self.applicationShortcutMonitor = nil
+        }
+        let workspaceNotificationCenter = NSWorkspace.shared.notificationCenter
+        workspaceAudioLifecycleObservers.forEach(workspaceNotificationCenter.removeObserver)
+        workspaceAudioLifecycleObservers.removeAll()
+        AppLogger.shared.write("SYSTEM AUDIO observers_stopped")
+        AppLogger.shared.flush()
+    }
+
+    func applicationDidBecomeActive(_ notification: Notification) {
+        model.refreshRemoteDeviceNames(reason: .foreground)
+        model.privateFeature.refreshAccessIfNeeded()
+        model.macroFeature.refreshAccessIfNeeded()
+        model.membershipFeature.refreshIfNeeded()
+        model.refreshHIDAfterPermissionChange()
+    }
+
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        showSettings()
+        AppLogger.shared.write(
+            "UI ENTRY_POINT phase=completed result=passed source=application_reopen " +
+                "show_dock=\(model.settings.showDockIcon) " +
+                "show_status_bar=\(model.settings.showStatusBarIcon) " +
+                "decision=open_settings"
+        )
+        return true
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        if let buttonProfileURL = urls.first(where: {
+            $0.isFileURL && $0.pathExtension.caseInsensitiveCompare("sayall") == .orderedSame
+        }) {
+            let request = buttonProfileImportRequests.enqueue(url: buttonProfileURL)
+            AppLogger.shared.write(
+                "BUTTON_PROFILE_IMPORT phase=requested result=accepted " +
+                    "source=finder_file operation_id=button_profile_import_\(request.operationID)"
+            )
+            showSettings()
+        }
+
+        guard let request = urls.lazy.compactMap(SayAllDeepLinkRequest.parse).first else {
+            return
+        }
+        AppLogger.shared.write(
+            "DEEPLINK SAYALL source=\(request.source ?? "unknown") " +
+                "status=\(request.status?.rawValue ?? "none") " +
+                "reason=\(request.reason ?? "none")"
+        )
+        NotificationCenter.default.post(
+            name: .sayAllDeepLinkReceived,
+            object: request
+        )
+        showSettings()
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func installTerminationSignalHandlers() {
+        for signalNumber in [SIGTERM, SIGINT] {
+            signal(signalNumber, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(
+                signal: signalNumber,
+                queue: .main
+            )
+            source.setEventHandler {
+                NSApp.terminate(nil)
+            }
+            source.resume()
+            terminationSignalSources.append(source)
+        }
+    }
+
+    private func installWorkspaceAudioLifecycleObservers() {
+        let notificationCenter = NSWorkspace.shared.notificationCenter
+        let events: [(Notification.Name, SystemAudioLifecycleEvent)] = [
+            (NSWorkspace.screensDidSleepNotification, .screenDidSleep),
+            (NSWorkspace.screensDidWakeNotification, .screenDidWake),
+            (NSWorkspace.sessionDidResignActiveNotification, .sessionDidResignActive),
+            (NSWorkspace.sessionDidBecomeActiveNotification, .sessionDidBecomeActive),
+            (NSWorkspace.willSleepNotification, .systemWillSleep),
+            (NSWorkspace.didWakeNotification, .systemDidWake),
+        ]
+        workspaceAudioLifecycleObservers = events.map { name, event in
+            notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.model.handleSystemAudioLifecycle(event)
+                    if event == .systemDidWake {
+                        self.model.privateFeature.refreshAccessIfNeeded()
+                        self.model.macroFeature.refreshAccessIfNeeded()
+                        self.model.membershipFeature.refreshIfNeeded()
+                    }
+                }
+            }
+        }
+        AppLogger.shared.write(
+            "SYSTEM AUDIO observers_started events=\(events.map { $0.1.rawValue }.joined(separator: ","))"
+        )
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshMenuStatus()
+    }
+
+    @discardableResult
+    private func configureStatusItem() -> Bool {
+        guard statusItem == nil else {
+            rebuildStatusMenu()
+            refreshStatusItemPresentation()
+            return false
+        }
+
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        if let button = item.button {
+            button.target = self
+            button.action = #selector(handleStatusItemClick(_:))
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+
+        connectionItem.isEnabled = false
+        audioItem.isEnabled = false
+        hidItem.isEnabled = false
+
+        statusItem = item
+        appliedStatusItemPresentation = nil
+        statusItemPresentation = .resolve(
+            physicalConnected: model.isConnected,
+            phoneConnected: model.isPhoneRemoteConnected,
+            watchConnected: model.isWatchRemoteConnected,
+            webState: model.webRemoteState,
+            isStreaming: model.isStreaming,
+            voiceWarningLevel: model.voiceSessionWarningLevel
+        )
+        refreshStatusItemPresentation()
+        rebuildStatusMenu()
+        return true
+    }
+
+    @discardableResult
+    private func removeStatusItem() -> Bool {
+        guard let statusItem else { return false }
+        stopStatusItemWarningBlinking()
+        statusMenu?.removeItem(connectionItem)
+        statusMenu?.removeItem(audioItem)
+        statusMenu?.removeItem(hidItem)
+        NSStatusBar.system.removeStatusItem(statusItem)
+        self.statusItem = nil
+        statusMenu = nil
+        appliedStatusItemPresentation = nil
+        return true
+    }
+
+    private func applyStatusBarIconVisibility(_ isVisible: Bool, source: String) {
+        entryPointOperationID &+= 1
+        let operationID = entryPointOperationID
+        AppLogger.shared.write(
+            "UI ENTRY_POINT operation_id=\(operationID) phase=requested source=\(source) " +
+                "show_dock=\(model.settings.showDockIcon) show_status_bar=\(isVisible)"
+        )
+        let changed = isVisible ? configureStatusItem() : removeStatusItem()
+        AppLogger.shared.write(
+            "UI ENTRY_POINT operation_id=\(operationID) phase=completed result=passed " +
+                "source=\(source) show_dock=\(model.settings.showDockIcon) " +
+                "show_status_bar=\(isVisible) " +
+                "both_hidden=\(!model.settings.showDockIcon && !isVisible) " +
+                "change=\(changed ? (isVisible ? "created" : "removed") : "none")"
+        )
+    }
+
+    private func rebuildStatusMenu() {
+        statusMenu?.removeItem(connectionItem)
+        statusMenu?.removeItem(audioItem)
+        statusMenu?.removeItem(hidItem)
+
+        let menu = NSMenu()
+        menu.delegate = self
+        menu.addItem(connectionItem)
+        menu.addItem(audioItem)
+        menu.addItem(hidItem)
+        menu.addItem(.separator())
+        menu.addItem(menuItem("connection.action.reconnect", action: #selector(reconnect)))
+        menu.addItem(menuItem("menu.open_settings", action: #selector(showSettings)))
+        menu.addItem(menuItem("menu.show_logs", action: #selector(showLog)))
+        menu.addItem(languageMenuItem())
+        menu.addItem(.separator())
+        menu.addItem(menuItem("menu.about", action: #selector(showAbout)))
+        menu.addItem(versionMenuItem())
+        menu.addItem(menuItem("menu.check_for_updates", action: #selector(checkForUpdates)))
+        menu.addItem(menuItem("about.support.github", action: #selector(openGitHub)))
+        menu.addItem(menuItem("about.support.website", action: #selector(openWebsite)))
+        menu.addItem(.separator())
+        menu.addItem(menuItem("common.action.quit", action: #selector(quit)))
+        statusMenu = menu
+        refreshMenuStatus()
+    }
+
+    private func configureApplicationMenu() {
+        let mainMenu = NSMenu()
+
+        let applicationMenuItem = NSMenuItem()
+        let applicationMenu = NSMenu(title: localization.text("app.name"))
+        applicationMenu.addItem(menuItem("menu.about", action: #selector(showAbout)))
+        applicationMenu.addItem(.separator())
+        applicationMenu.addItem(responderMenuItem(
+            "common.action.hide",
+            action: "hide:",
+            keyEquivalent: "h"
+        ))
+        applicationMenu.addItem(responderMenuItem(
+            "common.action.hide_others",
+            action: "hideOtherApplications:",
+            keyEquivalent: "h",
+            modifierMask: [.command, .option]
+        ))
+        applicationMenu.addItem(responderMenuItem(
+            "common.action.show_all",
+            action: "unhideAllApplications:",
+            keyEquivalent: ""
+        ))
+        applicationMenu.addItem(.separator())
+        let quitItem = NSMenuItem(
+            title: localization.text("common.action.quit"),
+            action: #selector(quit),
+            keyEquivalent: "q"
+        )
+        quitItem.keyEquivalentModifierMask = .command
+        quitItem.target = self
+        applicationMenu.addItem(quitItem)
+        applicationMenuItem.submenu = applicationMenu
+        mainMenu.addItem(applicationMenuItem)
+
+        let fileMenuItem = NSMenuItem()
+        let fileMenu = NSMenu(title: localization.text("menu.file"))
+        let closeItem = NSMenuItem(
+            title: localization.text("common.action.close"),
+            action: #selector(closeKeyWindow),
+            keyEquivalent: "w"
+        )
+        closeItem.keyEquivalentModifierMask = .command
+        closeItem.target = self
+        fileMenu.addItem(menuItem("menu.open_log_folder", action: #selector(showLog)))
+        fileMenu.addItem(.separator())
+        fileMenu.addItem(closeItem)
+        fileMenuItem.submenu = fileMenu
+        mainMenu.addItem(fileMenuItem)
+
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: localization.text("menu.edit"))
+        editMenu.addItem(responderMenuItem("common.action.undo", action: "undo:", keyEquivalent: "z"))
+        editMenu.addItem(responderMenuItem("common.action.redo", action: "redo:", keyEquivalent: "Z"))
+        editMenu.addItem(.separator())
+        editMenu.addItem(responderMenuItem("common.action.cut", action: "cut:", keyEquivalent: "x"))
+        editMenu.addItem(responderMenuItem("common.action.copy", action: "copy:", keyEquivalent: "c"))
+        editMenu.addItem(responderMenuItem("common.action.paste", action: "paste:", keyEquivalent: "v"))
+        editMenu.addItem(.separator())
+        editMenu.addItem(responderMenuItem("common.action.select_all", action: "selectAll:", keyEquivalent: "a"))
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        let windowMenuItem = NSMenuItem()
+        let windowMenu = NSMenu(title: localization.text("menu.window"))
+        windowMenu.addItem(responderMenuItem(
+            "common.action.minimize",
+            action: "performMiniaturize:",
+            keyEquivalent: "m"
+        ))
+        windowMenuItem.submenu = windowMenu
+        mainMenu.addItem(windowMenuItem)
+        NSApp.windowsMenu = windowMenu
+
+        NSApp.mainMenu = mainMenu
+    }
+
+    private func responderMenuItem(
+        _ titleKey: String,
+        action: String,
+        keyEquivalent: String,
+        modifierMask: NSEvent.ModifierFlags = [.command]
+    ) -> NSMenuItem {
+        let item = NSMenuItem(
+            title: localization.text(titleKey),
+            action: Selector(action),
+            keyEquivalent: keyEquivalent
+        )
+        item.keyEquivalentModifierMask = modifierMask
+        // A nil target lets AppKit route the standard editing action to the focused text field.
+        item.target = nil
+        return item
+    }
+
+    private func installApplicationKeyboardShortcuts() {
+        applicationShortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) {
+            [weak self] event in
+            let relevantModifiers = event.modifierFlags.intersection([
+                .command, .control, .option, .shift,
+            ])
+            guard relevantModifiers == .command else { return event }
+            switch event.charactersIgnoringModifiers?.lowercased() {
+            case "q":
+                self?.quit()
+                return nil
+            case "w":
+                self?.closeKeyWindow()
+                return nil
+            default:
+                return event
+            }
+        }
+    }
+
+    private func menuItem(_ title: String, action: Selector) -> NSMenuItem {
+        let item = NSMenuItem(title: localization.text(title), action: action, keyEquivalent: "")
+        item.target = self
+        return item
+    }
+
+    private func languageMenuItem() -> NSMenuItem {
+        let item = NSMenuItem(title: localization.text("menu.language"), action: nil, keyEquivalent: "")
+        let submenu = NSMenu()
+        for language in AppLanguage.allCases {
+            let title: String
+            switch language {
+            case .system:
+                title = localization.text("language.system")
+            case .simplifiedChinese, .english:
+                title = language.nativeDisplayName
+            }
+            let languageItem = NSMenuItem(title: title, action: #selector(selectLanguage(_:)), keyEquivalent: "")
+            languageItem.target = self
+            languageItem.representedObject = language.rawValue
+            languageItem.state = language == localization.language ? .on : .off
+            submenu.addItem(languageItem)
+        }
+        item.submenu = submenu
+        return item
+    }
+
+    private func versionMenuItem() -> NSMenuItem {
+        let shortVersion = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? localization.text("common.value.unknown")
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        let title = build.map {
+            String(
+                format: localization.text("app.version_with_build"),
+                locale: localization.locale,
+                arguments: [shortVersion, $0]
+            )
+        } ?? String(
+            format: localization.text("app.version"),
+            locale: localization.locale,
+            arguments: [shortVersion]
+        )
+        let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        return item
+    }
+
+    private func observeModel() {
+        StatusItemPresentation.publisher(
+            physicalConnected: model.$isConnected.eraseToAnyPublisher(),
+            phoneConnected: model.$isPhoneRemoteConnected.eraseToAnyPublisher(),
+            watchConnected: model.$isWatchRemoteConnected.eraseToAnyPublisher(),
+            webState: model.$webRemoteState.eraseToAnyPublisher(),
+            isStreaming: model.$isStreaming.eraseToAnyPublisher(),
+            voiceWarningLevel: model.$voiceSessionWarningLevel.eraseToAnyPublisher()
+        )
+        .receive(on: RunLoop.main)
+        .sink { [weak self] presentation in
+            // Consume the published snapshot, not properties that @Published has yet to set.
+            self?.statusItemPresentation = presentation
+            self?.refreshStatusItemPresentation()
+        }
+        .store(in: &subscriptions)
+
+        Publishers.CombineLatest4(
+            model.$connectionStatus,
+            model.$audioStatus,
+            model.$hidStatus,
+            model.$isStreaming
+        )
+        .receive(on: RunLoop.main)
+        .sink { [weak self] _ in
+            self?.refreshMenuStatus()
+        }
+        .store(in: &subscriptions)
+
+        model.privateFeature.$hudShouldBeVisible
+        .removeDuplicates()
+        .receive(on: RunLoop.main)
+        .sink { [weak self] isVisible in
+            self?.setPrivateFeatureHUDVisible(isVisible)
+        }
+        .store(in: &subscriptions)
+    }
+
+    private func setPrivateFeatureHUDVisible(_ isVisible: Bool) {
+        model.privateFeature.setHUDVisible(isVisible)
+    }
+
+    private func observeLocalization() {
+        localization.$locale
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.refreshStatusItemPresentation()
+                self.settingsWindowController?.window?.title = self.localization.text("app.name")
+                self.model.privateFeature.updateLocaleIdentifier(
+                    self.localization.locale.identifier
+                )
+                self.model.macroFeature.updateLocaleIdentifier(
+                    self.localization.locale.identifier
+                )
+                self.model.membershipFeature.updateLocaleIdentifier(
+                    self.localization.locale.identifier
+                )
+                self.configureApplicationMenu()
+                if self.statusItem != nil {
+                    self.rebuildStatusMenu()
+                }
+                self.updateInformation.reloadReleaseNotes(
+                    localeIdentifier: self.localization.locale.identifier
+                )
+            }
+            .store(in: &subscriptions)
+    }
+
+    private func observePhoneRemoteButtonTitles() {
+        Publishers.CombineLatest(
+            Publishers.CombineLatest4(
+                model.settings.$buttonBindings,
+                model.settings.$buttonShortcuts,
+                model.settings.$buttonApplicationProfileIDs,
+                model.settings.$customApplicationProfiles
+            ),
+            localization.$locale
+        )
+        .receive(on: RunLoop.main)
+        .sink { [weak self] values, _ in
+            guard let self else { return }
+            self.refreshPhoneRemoteButtonTitles(
+                bindings: values.0,
+                shortcuts: values.1,
+                applicationProfileIDs: values.2,
+                customApplicationProfiles: values.3
+            )
+        }
+        .store(in: &subscriptions)
+
+        model.macroFeature.buttonProfileChanges
+            .receive(on: RunLoop.main)
+            .sink { [weak self] in
+                self?.refreshPhoneRemoteButtonTitles()
+            }
+            .store(in: &subscriptions)
+    }
+
+    private func refreshPhoneRemoteButtonTitles(
+        bindings: [RemoteButton: ButtonAction]? = nil,
+        shortcuts: [RemoteButton: CustomKeyboardShortcut]? = nil,
+        applicationProfileIDs: [RemoteButton: UUID]? = nil,
+        customApplicationProfiles: [CustomApplicationProfile]? = nil
+    ) {
+        model.updatePhoneRemoteButtonTitles(
+            bindings: bindings ?? model.settings.buttonBindings,
+            shortcuts: shortcuts ?? model.settings.buttonShortcuts,
+            applicationProfileIDs: applicationProfileIDs ?? model.settings.buttonApplicationProfileIDs,
+            customApplicationProfiles: customApplicationProfiles ?? model.settings.customApplicationProfiles,
+            localization: localization
+        )
+    }
+
+    private func observeUpdatePreferences() {
+        model.settings.$checksForPreReleaseUpdates
+            .removeDuplicates()
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] isEnabled in
+                guard let self else { return }
+                updateCheckTask?.cancel()
+                resolvedUpdateFeedURLString = nil
+                updateInformation.reset()
+                let policy = UpdateCheckPolicy(checksForPreReleaseUpdates: isEnabled)
+                if updaterStarted {
+                    updaterController.updater.automaticallyChecksForUpdates =
+                        policy.allowsBackgroundUpdatePrompts
+                }
+                if policy.startsUpdaterAutomatically {
+                    startUpdaterIfNeeded()
+                    updaterController.updater.resetUpdateCycleAfterShortDelay()
+                    refreshUpdateInformation()
+                }
+            }
+            .store(in: &subscriptions)
+    }
+
+    private func observeAppIconPreference() {
+        model.settings.$appIconIdentifier
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] identifier in
+                self?.applyAppIcon(identifier, source: "preference")
+            }
+            .store(in: &subscriptions)
+    }
+
+    private func applyAppIcon(_ identifier: AppIconIdentifier, source: String) {
+        appIconController.apply(identifier, source: source)
+    }
+
+    private func reapplyCurrentAppIcon(source: String) {
+        applyAppIcon(model.settings.appIconIdentifier, source: source)
+    }
+
+    private func configureUpdater() {
+        let checksForPreReleaseUpdates = model.settings.checksForPreReleaseUpdates
+        guard checksForPreReleaseUpdates else {
+            startUpdaterIfNeeded()
+            return
+        }
+    }
+
+    private func startUpdaterIfNeeded() {
+        guard !updaterStarted else { return }
+        updaterController.updater.automaticallyChecksForUpdates =
+            UpdateCheckPolicy(
+                checksForPreReleaseUpdates: model.settings.checksForPreReleaseUpdates
+            ).allowsBackgroundUpdatePrompts
+        updaterController.startUpdater()
+        updaterStarted = true
+    }
+
+    func feedURLString(for updater: SPUUpdater) -> String? {
+        let includePreRelease = model.settings.checksForPreReleaseUpdates
+        if let testFeed = UpdateFeedResolver.testInjectedFeed(
+            environment: ProcessInfo.processInfo.environment,
+            assetName: updateFeedSelection.appcastAssetName,
+            includePreRelease: includePreRelease
+        ) {
+            return testFeed.url.absoluteString
+        }
+        if includePreRelease, let resolvedUpdateFeedURLString {
+            return resolvedUpdateFeedURLString
+        }
+        return updateFeedSelection.feedURLString(
+            checksForPreReleaseUpdates: includePreRelease
+        )
+    }
+
+    private func refreshMenuStatus() {
+        connectionItem.title = model.connectionStatus.text(using: localization)
+        audioItem.title = model.isStreaming
+            ? localization.text("connection.status.voice_active")
+            : model.audioStatus.text(using: localization)
+        hidItem.title = model.hidStatus.text(using: localization)
+    }
+
+    private func refreshStatusItemPresentation() {
+        guard let button = statusItem?.button else { return }
+        let description = LocalizedMessage(
+            statusItemPresentation.descriptionKey,
+            arguments: [localization.text("app.name")]
+        ).text(using: localization)
+        statusItemPresentation.apply(to: button, description: description)
+        updateStatusItemWarningBlinking(button: button)
+        guard appliedStatusItemPresentation != statusItemPresentation else { return }
+        statusItemOperationID &+= 1
+        AppLogger.shared.write(
+            "UI STATUS_ITEM operation_id=\(statusItemOperationID) phase=completed result=applied " +
+                "from=\(appliedStatusItemPresentation?.rawValue ?? "none") " +
+                "to=\(statusItemPresentation.rawValue) " +
+                "rendering=\(button.image == nil ? "text" : "image")"
+        )
+        appliedStatusItemPresentation = statusItemPresentation
+    }
+
+    private func updateStatusItemWarningBlinking(button: NSStatusBarButton) {
+        guard statusItemPresentation == .streamingWarning else {
+            stopStatusItemWarningBlinking()
+            button.alphaValue = 1
+            return
+        }
+        guard statusItemWarningBlinkTimer == nil else { return }
+        statusItemWarningBlinkVisible = true
+        button.alphaValue = 1
+        let timer = Timer(
+            timeInterval: 0.55,
+            target: self,
+            selector: #selector(handleStatusItemWarningBlink(_:)),
+            userInfo: button,
+            repeats: true
+        )
+        statusItemWarningBlinkTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    @objc private func handleStatusItemWarningBlink(_ timer: Timer) {
+        guard statusItemPresentation == .streamingWarning,
+              let button = timer.userInfo as? NSStatusBarButton
+        else {
+            stopStatusItemWarningBlinking()
+            return
+        }
+        statusItemWarningBlinkVisible.toggle()
+        button.alphaValue = statusItemWarningBlinkVisible ? 1 : 0.35
+    }
+
+    private func stopStatusItemWarningBlinking() {
+        statusItemWarningBlinkTimer?.invalidate()
+        statusItemWarningBlinkTimer = nil
+        statusItemWarningBlinkVisible = true
+    }
+
+    @objc private func handleStatusItemClick(_ sender: NSStatusBarButton) {
+        if NSApp.currentEvent?.type == .rightMouseUp {
+            showStatusMenu()
+        } else {
+            showSettings()
+        }
+    }
+
+    private func showStatusMenu() {
+        guard let statusItem, let statusMenu else { return }
+        refreshMenuStatus()
+        statusItem.menu = statusMenu
+        statusItem.button?.performClick(nil)
+        statusItem.menu = nil
+    }
+
+    @objc private func reconnect() {
+        model.reconnect()
+    }
+
+    @objc private func showSettings() {
+        showSettingsWindow()
+    }
+
+    private func showSettingsWindow(initialSection: SettingsSection? = nil) {
+        if settingsWindowController == nil {
+            settingsWindowController = makeSettingsWindowController(
+                initialSettingsSection: initialSection
+            )
+        }
+        guard let windowController = settingsWindowController,
+              let window = windowController.window else { return }
+        isSettingsWindowOpen = true
+        updateDockActivationPolicy()
+        windowController.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+    }
+
+    private func makeSettingsWindowController(
+        initialSettingsSection: SettingsSection? = nil
+    ) -> NSWindowController {
+        let hostingController = NSHostingController(
+            rootView: RemoteMicRootView(
+                model: model,
+                buttonProfileImportRequests: buttonProfileImportRequests,
+                updateInformation: updateInformation,
+                hardwareAnnouncements: hardwareAnnouncements,
+                checkForUpdates: { [weak self] in self?.checkForUpdates() },
+                refreshUpdateInformation: { [weak self] in
+                    self?.refreshUpdateInformation()
+                },
+                setDockIconVisible: { [weak self] isVisible in
+                    self?.setDockIconVisible(isVisible)
+                },
+                setStatusBarIconVisible: { [weak self] isVisible in
+                    self?.setStatusBarIconVisible(isVisible)
+                },
+                syncEntryPointVisibility: { [weak self] in
+                    self?.applyImportedEntryPointVisibility()
+                },
+                initialSettingsSection: initialSettingsSection
+            )
+            .environmentObject(localization)
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1020, height: 772),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = localization.text("app.name")
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.titlebarSeparatorStyle = .none
+        window.isMovableByWindowBackground = false
+        // A settings window must remain visible when the user switches to another app.
+        // Closing it remains an explicit red-button or Command-W action.
+        window.hidesOnDeactivate = false
+        window.delegate = self
+        window.contentViewController = hostingController
+        window.isReleasedWhenClosed = false
+        window.miniwindowImage = appIconController.catalog.image(
+            for: model.settings.appIconIdentifier
+        )
+        window.minSize = NSSize(width: 1020, height: 772)
+        window.setContentSize(NSSize(width: 1020, height: 772))
+        window.setFrameAutosaveName("RemoteMicSettings")
+        window.center()
+        return NSWindowController(window: window)
+    }
+
+    // MARK: - 登录窗口（启动门禁）
+
+    private func showLoginWindow(onAuthenticated: @escaping () -> Void) {
+        if loginWindowController == nil {
+            loginWindowController = makeLoginWindowController(onAuthenticated: onAuthenticated)
+        }
+        loginWindowController?.showWindow(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        loginWindowController?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    private func makeLoginWindowController(
+        onAuthenticated: @escaping () -> Void
+    ) -> NSWindowController {
+        let hostingController = NSHostingController(
+            rootView: AccountLoginView(store: accountAuthStore) { [weak self] in
+                AppLogger.shared.write("AUTH sign_in result=success")
+                self?.loginWindowController?.window?.orderOut(nil)
+                self?.loginWindowController = nil
+                onAuthenticated()
+            }
+            .environmentObject(localization)
+        )
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 560),
+            styleMask: [.titled, .closable, .fullSizeContentView],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = localization.text("app.name")
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.isMovableByWindowBackground = false
+        window.hidesOnDeactivate = false
+        window.contentViewController = hostingController
+        window.isReleasedWhenClosed = false
+        window.center()
+        return NSWindowController(window: window)
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              window === settingsWindowController?.window
+        else { return }
+        model.macroFeature.setEditorActive(false)
+        isSettingsWindowOpen = false
+        updateDockActivationPolicy()
+    }
+
+    func windowDidMiniaturize(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              window === settingsWindowController?.window
+        else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.reapplyCurrentAppIcon(source: "window_miniaturized")
+        }
+    }
+
+    func windowDidDeminiaturize(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow,
+              window === settingsWindowController?.window
+        else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.reapplyCurrentAppIcon(source: "window_deminiaturized")
+        }
+    }
+
+    func applicationDidHide(_ notification: Notification) {
+        model.macroFeature.setEditorActive(false)
+    }
+
+    @objc private func showLog() {
+        model.openLogFolder()
+    }
+
+    @objc private func showAbout() {
+        NSApp.activate(ignoringOtherApps: true)
+        let shortVersion = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? localization.text("common.value.unknown")
+        let alert = NSAlert()
+        alert.messageText = localization.text("app.name")
+        alert.informativeText = String(
+            format: localization.text("about.alert.description_with_version"),
+            locale: localization.locale,
+            arguments: [shortVersion]
+        )
+        alert.addButton(withTitle: localization.text("common.action.ok"))
+        alert.runModal()
+    }
+
+    @objc private func selectLanguage(_ sender: NSMenuItem) {
+        guard let rawValue = sender.representedObject as? String,
+              let language = AppLanguage(rawValue: rawValue)
+        else { return }
+        localization.select(language)
+    }
+
+    @objc private func checkForUpdates() {
+        performUpdateCheck(.userInitiated)
+    }
+
+    private func refreshUpdateInformation() {
+        performUpdateCheck(.information)
+    }
+
+    private func performUpdateCheck(_ purpose: UpdateCheckPurpose) {
+        updateCheckTask?.cancel()
+        updateCheckTask = Task { [weak self] in
+            guard let self else { return }
+            updateInformation.beginChecking()
+            let includePreRelease = model.settings.checksForPreReleaseUpdates
+            let testFeed = UpdateFeedResolver.testInjectedFeed(
+                environment: ProcessInfo.processInfo.environment,
+                assetName: updateFeedSelection.appcastAssetName,
+                includePreRelease: includePreRelease
+            )
+            resolvedUpdateFeedURLString = nil
+            if includePreRelease {
+                let resolution: UpdateFeedResolver.FeedResolution
+                if let testFeed {
+                    resolution = UpdateFeedResolver.FeedResolution(
+                        stable: nil,
+                        preview: testFeed
+                    )
+                } else if let stableURL = updateFeedSelection.validatedStableFeedURL,
+                          let previewURL = updateFeedSelection.validatedPreReleaseFeedURL {
+                    resolution = await UpdateFeedResolver.resolvePreviewFeed(
+                        stableURL: stableURL,
+                        previewURL: previewURL
+                    )
+                } else {
+                    resolution = UpdateFeedResolver.FeedResolution(stable: nil, preview: nil)
+                }
+                guard !Task.isCancelled else { return }
+                guard let selectedFeed = resolution.selected else {
+                    updateInformation.setUnavailable()
+                    AppLogger.shared.write(
+                        "UPDATE CHECK prerelease_enabled=true resolved=false " +
+                            "stable_version=unknown preview_version=unknown " +
+                            "selected_channel=unknown source=cloudflare_channel user_alert=false"
+                    )
+                    return
+                }
+                resolvedUpdateFeedURLString = selectedFeed.url.absoluteString
+                AppLogger.shared.write(
+                    "UPDATE CHECK prerelease_enabled=true resolved=true " +
+                        "stable_version=\(resolution.stable?.version ?? "unknown") " +
+                        "preview_version=\(resolution.preview?.version ?? "unknown") " +
+                        "selected_channel=\(selectedFeed.isPreRelease ? "preview" : "stable") " +
+                        "source=\(testFeed == nil ? "cloudflare_channel" : "ui_test")"
+                )
+            } else {
+                guard updateFeedSelection.feedURLString(checksForPreReleaseUpdates: false) != nil else {
+                    updateInformation.setUnavailable()
+                    AppLogger.shared.write(
+                        "UPDATE CHECK prerelease_enabled=false resolved=false " +
+                            "source=cloudflare_channel user_alert=false"
+                    )
+                    return
+                }
+                AppLogger.shared.write(
+                    "UPDATE CHECK prerelease_enabled=false resolved=true " +
+                        "selected_channel=stable source=cloudflare_channel"
+                )
+            }
+            startUpdaterIfNeeded()
+            guard !updaterController.updater.sessionInProgress else { return }
+            switch purpose {
+            case .information:
+                updateInformation.beginChecking()
+                updaterController.updater.checkForUpdateInformation()
+            case .userInitiated:
+                updaterController.checkForUpdates(nil)
+            }
+        }
+    }
+
+    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
+        updateInformation.setAvailable(
+            displayVersion: item.displayVersionString,
+            buildVersion: item.versionString,
+            archiveURL: item.fileURL,
+            fallbackDescription: item.itemDescription,
+            localeIdentifier: localization.locale.identifier
+        )
+    }
+
+    func updaterDidNotFindUpdate(_ updater: SPUUpdater) {
+        updateInformation.setUpToDate()
+    }
+
+    func updaterDidNotFindUpdate(_ updater: SPUUpdater, error: Error) {
+        let sparkleError = error as NSError
+        guard let latestItem = sparkleError.userInfo[SPULatestAppcastItemFoundKey] as? SUAppcastItem,
+              let currentVersion = Bundle.main.object(
+                  forInfoDictionaryKey: "CFBundleShortVersionString"
+              ) as? String,
+              let currentBuild = Bundle.main.object(
+                  forInfoDictionaryKey: "CFBundleVersion"
+              ) as? String,
+              let candidateBuild = Int(latestItem.versionString),
+              let installedBuild = Int(currentBuild),
+              candidateBuild < installedBuild,
+              UpdateVersion.isNewer(
+                  latestItem.displayVersionString,
+                  than: currentVersion
+              )
+        else {
+            updateInformation.setUpToDate()
+            return
+        }
+
+        updateInformation.setAvailable(
+            displayVersion: latestItem.displayVersionString,
+            buildVersion: latestItem.versionString,
+            archiveURL: latestItem.fileURL,
+            fallbackDescription: latestItem.itemDescription,
+            localeIdentifier: localization.locale.identifier
+        )
+        AppLogger.shared.write(
+            "UPDATE CHECK semantic_newer_but_sparkle_rejected " +
+                "display_version=\(latestItem.displayVersionString) " +
+                "candidate_build=\(latestItem.versionString) " +
+                "installed_build=\(currentBuild)"
+        )
+    }
+
+    func standardUserDriverShouldShowVersionHistory(for item: SUAppcastItem) -> Bool {
+        false
+    }
+
+    func updater(
+        _ updater: SPUUpdater,
+        didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
+        error: Error?
+    ) {
+        if error != nil, updateInformation.state == .checking {
+            updateInformation.setUnavailable()
+        }
+    }
+
+    private func showUpdateCompletedAlert() {
+        guard let window = settingsWindowController?.window else { return }
+        let version = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? localization.text("common.value.unknown")
+        let alert = NSAlert()
+        alert.messageText = localization.text("update.completed.title")
+        alert.informativeText = String(
+            format: localization.text("update.completed.message"),
+            locale: localization.locale,
+            arguments: [version]
+        )
+        alert.addButton(withTitle: localization.text("common.action.ok"))
+        NSApp.activate(ignoringOtherApps: true)
+        window.makeKeyAndOrderFront(nil)
+        alert.beginSheetModal(for: window, completionHandler: nil)
+    }
+
+    private func setDockIconVisible(_ isVisible: Bool) {
+        model.settings.showDockIcon = isVisible
+        updateDockActivationPolicy()
+        AppLogger.shared.write(
+            "UI ENTRY_POINT phase=completed result=passed source=dock_toggle " +
+                "show_dock=\(isVisible) show_status_bar=\(model.settings.showStatusBarIcon) " +
+                "both_hidden=\(!isVisible && !model.settings.showStatusBarIcon)"
+        )
+    }
+
+    private func setStatusBarIconVisible(_ isVisible: Bool) {
+        model.settings.showStatusBarIcon = isVisible
+        applyStatusBarIconVisibility(isVisible, source: "status_bar_toggle")
+    }
+
+    private func applyImportedEntryPointVisibility() {
+        updateDockActivationPolicy()
+        applyStatusBarIconVisibility(
+            model.settings.showStatusBarIcon,
+            source: "configuration_import"
+        )
+    }
+
+    private func updateDockActivationPolicy() {
+        NSApp.setActivationPolicy(SettingsWindowActivationPolicy.value(
+            showDockIcon: model.settings.showDockIcon,
+            isSettingsWindowOpen: isSettingsWindowOpen
+        ))
+        reapplyCurrentAppIcon(source: "activation_policy")
+    }
+
+    @objc private func openGitHub() {
+        NSWorkspace.shared.open(AppLinks.githubRepository)
+    }
+
+    @objc private func openWebsite() {
+        NSWorkspace.shared.open(localization.localizedWebsiteURL)
+    }
+
+    @objc private func closeKeyWindow() {
+        NSApp.keyWindow?.performClose(nil)
+    }
+
+    @objc private func quit() {
+        NSApp.terminate(nil)
+    }
+}

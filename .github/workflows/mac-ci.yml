@@ -1,0 +1,195 @@
+name: macOS CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, 'hotfix/**']
+
+concurrency:
+  # Keep every source SHA proof, including pending main/hotfix runs.
+  group: mac-ci-${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  classify_changes:
+    name: Classify changed files
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.changes.outputs.docs_only }}
+      release_control_plane_only: ${{ steps.changes.outputs.release_control_plane_only }}
+      product_change: ${{ steps.changes.outputs.product_change }}
+      tooling_only: ${{ steps.changes.outputs.tooling_only }}
+      repository_only: ${{ steps.changes.outputs.repository_only }}
+      release_checks: ${{ steps.changes.outputs.release_checks }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Classify changed paths
+        id: changes
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            {
+              printf '%s\n' docs_only=false release_control_plane_only=false tooling_only=false repository_only=false product_change=true release_checks=true
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            diff_range="$PR_BASE_SHA...HEAD"
+          else
+            before_sha="${{ github.event.before }}"
+            if [[ -z "$before_sha" || "$before_sha" == 0000000000000000000000000000000000000000 ]]; then
+              {
+                printf '%s\n' docs_only=false release_control_plane_only=false tooling_only=false repository_only=false product_change=true release_checks=true
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            diff_range="$before_sha..HEAD"
+          fi
+
+          base_sha="${diff_range%%.*}"
+          ./scripts/verify-release-control-plane-diff.sh --classify "$base_sha" HEAD >> "$GITHUB_OUTPUT"
+
+  public_test:
+    name: Public Swift tests and dual-architecture build
+    needs: classify_changes
+    runs-on: ${{ (needs.classify_changes.outputs.product_change == 'true' || needs.classify_changes.outputs.release_checks == 'true') && 'macos-15' || 'ubuntu-latest' }}
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
+      # Native tests ran on the same ARM host in both old architecture lanes.
+      # Retain the lower deployment target; Release builds still cover both targets.
+      RELEASE_VARIANT: intel
+      SAYALL_AI_PACKAGE_PATH: ""
+      SAYALL_PRIVATE_PLATFORM_MODE: public
+      SAYALL_ENABLE_PRIVATE_SWIFTPM: "0"
+      SAYALL_PRIVATE_PLATFORM_PACKAGE_PATH: ""
+      SAYALL_COMBINATION_ACTIONS_PATH: ""
+      SAYALL_BUTTON_PROFILES_PACKAGE_PATH: ""
+      SAYALL_MAC_REMOTE_PACKAGE_PATH: ""
+      SAYALL_SIRI_REMOTE_PACKAGE_PATH: ""
+      SAYALL_ENABLE_SIRI_REMOTE: "0"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+
+      - name: Check patch formatting
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            git diff --check "${{ github.event.pull_request.base.sha }}...HEAD"
+          elif [[ -n "${{ github.event.before }}" && "${{ github.event.before }}" != 0000000000000000000000000000000000000000 ]]; then
+            git diff --check "${{ github.event.before }}..HEAD"
+          fi
+
+      - name: Run documentation checks
+        if: needs.classify_changes.outputs.docs_only == 'true'
+        run: |
+          # 删除的文件不会存在于工作区：用 --diff-filter=d 排除它们，否则任何删除
+          # .md 或 Screenshots 的文档 PR 都会在这一步必然失败。
+          for file in $(git diff --diff-filter=d --name-only HEAD^ HEAD -- '*.md' 'Screenshots/*'); do
+            test -f "$file"
+          done
+          echo "Documentation-only change passed."
+
+      - name: Run tooling checks
+        if: needs.classify_changes.outputs.tooling_only == 'true'
+        run: echo "Manual developer tooling only; product and release checks are not applicable."
+
+      - name: Run repository checks
+        if: needs.classify_changes.outputs.repository_only == 'true'
+        env:
+          GOVERNANCE_BASE_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          GOVERNANCE_PR_BODY: ${{ github.event_name == 'pull_request' && github.event.pull_request.body || '' }}
+          GOVERNANCE_PR_IS_DRAFT: ${{ github.event_name == 'pull_request' && github.event.pull_request.draft || false }}
+        run: |
+          ./scripts/verify-repository-governance.sh "$GOVERNANCE_BASE_SHA"
+          echo "Repository-only change passed; product and release checks are not applicable."
+
+      - name: Enforce repository boundaries
+        if: needs.classify_changes.outputs.product_change == 'true'
+        run: ./scripts/check-repository-boundaries.sh
+
+      - name: Show toolchain
+        if: needs.classify_changes.outputs.product_change == 'true'
+        run: swift --version
+
+      - name: Verify release configuration
+        if: needs.classify_changes.outputs.release_checks == 'true'
+        run: ./scripts/verify-release-dependency-pins.sh tokens
+
+      - name: Run Swift tests
+        if: needs.classify_changes.outputs.product_change == 'true'
+        run: swift test --disable-keychain --skip BuildSigningTests
+
+      - name: Run core first-voice journey gate
+        if: needs.classify_changes.outputs.product_change == 'true'
+        run: |
+          swift test --disable-keychain --filter VoiceInputDestinationCoordinatorTests
+          swift test --disable-keychain --filter CoreVoiceInputJourneyTests
+
+      - name: Run release control-plane fixture
+        if: needs.classify_changes.outputs.release_checks == 'true'
+        env:
+          PRODUCT_CHANGE: ${{ needs.classify_changes.outputs.product_change }}
+        # Product changes reuse the test binary; control-only changes compile once.
+        run: |
+          command -v rg >/dev/null || HOMEBREW_NO_AUTO_UPDATE=1 brew install ripgrep
+          if [[ "$PRODUCT_CHANGE" == true ]]; then
+            swift test --disable-keychain --skip-build --filter BuildSigningTests
+          else
+            swift test --disable-keychain --filter BuildSigningTests
+          fi
+
+      - name: Run project self-test
+        if: needs.classify_changes.outputs.product_change == 'true'
+        run: SKIP_SWIFT_PACKAGE_BUILD=1 ./scripts/test.sh
+
+      - name: Build release configuration (Apple Silicon)
+        if: needs.classify_changes.outputs.product_change == 'true'
+        env:
+          RELEASE_VARIANT: apple-silicon
+        run: swift build --disable-keychain -c release --triple arm64-apple-macosx14.0
+
+      - name: Build release configuration (Intel Ventura)
+        if: needs.classify_changes.outputs.product_change == 'true'
+        env:
+          RELEASE_VARIANT: intel
+        run: swift build --disable-keychain -c release --triple x86_64-apple-macosx13.0
+
+  test:
+    name: Swift tests and build (${{ matrix.label }})
+    needs: [classify_changes, public_test]
+    if: always()
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        label: [Apple Silicon, Intel Ventura]
+    steps:
+      - name: Require every applicable macOS CI lane
+        shell: bash
+        env:
+          CLASSIFY_RESULT: ${{ needs.classify_changes.result }}
+          PUBLIC_RESULT: ${{ needs.public_test.result }}
+          RELEASE_CHECKS_REQUIRED: ${{ needs.classify_changes.outputs.release_checks }}
+          PRODUCT_CHANGE: ${{ needs.classify_changes.outputs.product_change }}
+        run: |
+          test "$CLASSIFY_RESULT" = success
+          test "$PUBLIC_RESULT" = success
+          [[ "$PRODUCT_CHANGE" == true || "$PRODUCT_CHANGE" == false ]] || exit 1
+          [[ "$RELEASE_CHECKS_REQUIRED" == true || "$RELEASE_CHECKS_REQUIRED" == false ]] || exit 1

@@ -1,0 +1,59 @@
+name: macOS Stable Promotion
+run-name: mac-stable-promote ${{ inputs.tag }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing public Preview tag to promote, for example v1.9.11
+        required: true
+        type: string
+
+concurrency:
+  # Every promotion mutates the single releases/latest pointer; serialize all
+  # candidate promotions, not just repeated attempts for one Tag.
+  group: mac-stable-promotion
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  promote:
+    name: Promote an existing Preview without rebuilding
+    if: ${{ github.ref_name == 'main' }}
+    runs-on: macos-15
+    timeout-minutes: 20
+    environment: mac-stable-release
+    steps:
+      - name: Validate promotion dispatch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          TRIGGER_COMMIT: ${{ github.sha }}
+          TRIGGER_REF_NAME: ${{ github.ref_name }}
+          TRIGGER_REF_TYPE: ${{ github.ref_type }}
+          TRIGGER_REPOSITORY: ${{ github.repository }}
+        run: |
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$TRIGGER_REF_NAME" = main
+          test "$TRIGGER_REF_TYPE" = branch
+          test "$TRIGGER_REPOSITORY" = HD838A/remote-mic-app
+          remote_main="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          test "$TRIGGER_COMMIT" = "$remote_main"
+
+      - name: Check out exact main release control plane
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Promote and verify the selected Preview
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ROOT: ${{ github.workspace }}
+          GH_BIN: gh
+        run: ./scripts/promote-preview-release.sh "${{ inputs.tag }}"

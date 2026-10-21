@@ -1,0 +1,40 @@
+name: Fork build artifact
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['feature/**', 'fork/**']
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build SayAll.app (ad-hoc)
+    runs-on: macos-15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build and package SayAll.app
+        env:
+          CODE_SIGN_IDENTITY: "-"
+          REQUIRE_SIRI_REMOTE_SIGNING: "0"
+          REQUIRE_DEVELOPER_ID_SIGNING: "0"
+          RELEASE_SWIFT_BUILD_TIMEOUT_SECONDS: "3600"
+          RELEASE_CODESIGN_TIMEOUT_SECONDS: "120"
+          RELEASE_STAGE_TIMEOUTS: "1"
+        run: scripts/build-app.sh
+
+      - name: Zip app bundle
+        run: |
+          cd dist
+          ditto -c -k --keepParent SayAll.app SayAll-arm64.zip
+          shasum -a 256 SayAll-arm64.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SayAll-app-arm64
+          path: dist/SayAll-arm64.zip
+          if-no-files-found: error
