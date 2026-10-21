@@ -92,8 +92,13 @@ jobs:
           cp SayAll-arm64.zip appcast_dir/
           /tmp/sparkle-bin/bin/generate_appcast \
             --ed-key-file "$RUNNER_TEMP/eddsa.priv" \
-            --download-url-prefix "https://github.com/${{ github.repository }}/releases/download/$TAG" \
+            --download-url-prefix "https://github.com/${{ github.repository }}/releases/download" \
             appcast_dir
+          # generate_appcast 会吃掉 prefix 最后一段且用实际文件名，统一修正 enclosure URL
+          sed -i '' "s|<enclosure url=\"[^\"]*/releases/|<enclosure url=\"https://github.com/${{ github.repository }}/releases/download/$TAG/|" appcast_dir/appcast.xml
+          grep -q "releases/download/$TAG/SayAll-arm64.zip" appcast_dir/appcast.xml || {
+            echo "appcast enclosure URL 修正失败"; cat appcast_dir/appcast.xml; exit 1
+          }
           gh release create "$TAG" SayAll-arm64.zip \
             --repo "${{ github.repository }}" \
             --title "SayAll ${{ steps.ver.outputs.short }} (build ${{ steps.ver.outputs.build }})" \
