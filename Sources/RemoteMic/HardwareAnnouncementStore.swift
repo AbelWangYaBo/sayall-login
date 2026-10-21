@@ -38,7 +38,7 @@ private struct HardwareAnnouncementEnvelope: Decodable {
 
 enum HardwareAnnouncementSource {
     static let defaultURL = URL(
-        string: "https://download.sayall.app/mac/announcements/hardware.json"
+        string: "https://raw.githubusercontent.com/AbelWangYaBo/sayall-login/main/config/announcements/hardware.json"
     )!
 
     static func resolve(

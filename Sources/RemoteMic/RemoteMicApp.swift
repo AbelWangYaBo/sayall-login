@@ -8,15 +8,18 @@ import SwiftUI
 struct UpdateFeedSelection {
     let stableFeedURLString: String?
 
+    // 本 fork 的发布通道：GitHub Releases 上的 appcast。
+    // 原 download.sayall.app 一律拒绝——防止自动更新用原版覆盖登录功能。
+    static let forkFeedHost = "github.com"
+    static let forkFeedPath = "/AbelWangYaBo/sayall-login/releases/latest/download/appcast.xml"
+
     init(stableFeedURLString: String?) {
         self.stableFeedURLString = stableFeedURLString
     }
 
     func feedURLString(checksForPreReleaseUpdates: Bool) -> String? {
-        guard let stableFeedURL else { return nil }
-        return checksForPreReleaseUpdates
-            ? preReleaseFeedURL?.absoluteString
-            : stableFeedURL.absoluteString
+        // fork 阶段不区分稳定/预览通道，统一指向 releases latest appcast。
+        stableFeedURL?.absoluteString
     }
 
     var appcastAssetName: String {
@@ -30,32 +33,24 @@ struct UpdateFeedSelection {
     }
 
     var validatedPreReleaseFeedURL: URL? {
-        preReleaseFeedURL
+        nil
     }
 
     private var stableFeedURL: URL? {
         guard let stableFeedURLString,
               let components = URLComponents(string: stableFeedURLString),
               components.scheme == "https",
-              components.host == "download.sayall.app",
+              components.host == Self.forkFeedHost,
               components.port == nil,
               components.user == nil,
               components.password == nil,
               components.query == nil,
               components.fragment == nil,
               let url = components.url,
-              ["appcast.xml", "appcast-intel.xml"].contains(url.lastPathComponent),
-              components.path == "/mac/channels/stable/\(url.lastPathComponent)"
+              url.lastPathComponent == "appcast.xml",
+              url.path == Self.forkFeedPath
         else { return nil }
         return url
-    }
-
-    private var preReleaseFeedURL: URL? {
-        guard let stableFeedURL,
-              var components = URLComponents(url: stableFeedURL, resolvingAgainstBaseURL: false)
-        else { return nil }
-        components.path = "/mac/channels/preview/\(stableFeedURL.lastPathComponent)"
-        return components.url
     }
 }
 
